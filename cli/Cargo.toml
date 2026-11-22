@@ -1,0 +1,24 @@
+[package]
+name = "worldport-cli"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+description = "Headless WorldPort converter, inspector and comparison tool"
+
+[[bin]]
+name = "worldport"
+path = "src/main.rs"
+
+[dependencies]
+worldport-core.workspace = true
+bedrock-nbt.workspace = true
+bedrock-world.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[lints.rust]
+unsafe_code = "warn"

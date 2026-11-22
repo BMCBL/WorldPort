@@ -1,0 +1,21 @@
+[package]
+name = "worldport-native"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+description = "WorldPort native module loaded by BMCBL's plugin native ABI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+worldport-core.workspace = true
+worldport-protocol.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "warn"

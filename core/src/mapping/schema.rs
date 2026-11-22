@@ -1,0 +1,305 @@
+//! Block state schemas for both editions.
+//!
+//! The Java schema comes from Mojang's datagen reports (blocked per version,
+//! stored gzipped under `mappings/data/java/<version>/blocks.json`). The Bedrock
+//! schema is the catalog embedded in `bedrock-world`, which is generated from
+//! `bedrock-samples` for the supported Bedrock release.
+
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::sync::OnceLock;
+
+use serde::Deserialize;
+
+use crate::error::{Result, WorldPortError};
+
+/// Property value type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PropertyKind {
+    /// `true`/`false`.
+    Bool,
+    /// Integer range such as `0..=15`.
+    Int,
+    /// Enum-like string values.
+    String,
+}
+
+/// One block property and the values it accepts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertySchema {
+    kind: PropertyKind,
+    values: Vec<String>,
+}
+
+impl PropertySchema {
+    /// Builds a property schema.
+    #[must_use]
+    pub fn new(kind: PropertyKind, values: Vec<String>) -> Self {
+        Self { kind, values }
+    }
+
+    /// Value type.
+    #[must_use]
+    pub const fn kind(&self) -> PropertyKind {
+        self.kind
+    }
+
+    /// Accepted values as strings.
+    #[must_use]
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    /// Whether a string value is accepted.
+    #[must_use]
+    pub fn accepts(&self, value: &str) -> bool {
+        self.values.iter().any(|allowed| allowed == value)
+    }
+}
+
+/// One block and its properties.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockSchema {
+    properties: BTreeMap<String, PropertySchema>,
+}
+impl BlockSchema {
+    /// Properties by name.
+    #[must_use]
+    pub const fn properties(&self) -> &BTreeMap<String, PropertySchema> {
+        &self.properties
+    }
+
+    /// One property.
+    #[must_use]
+    pub fn property(&self, name: &str) -> Option<&PropertySchema> {
+        self.properties.get(name)
+    }
+}
+
+/// All blocks of one edition at one version.
+#[derive(Clone, Debug)]
+pub struct BlockCatalog {
+    blocks: BTreeMap<String, BlockSchema>,
+}
+
+impl BlockCatalog {
+    /// Builds a catalog from an explicit block map (used by tests and generated tables).
+    #[must_use]
+    pub const fn from_blocks(blocks: BTreeMap<String, BlockSchema>) -> Self {
+        Self { blocks }
+    }
+
+    /// Blocks by full identifier (`minecraft:stone`).
+    #[must_use]
+    pub const fn blocks(&self) -> &BTreeMap<String, BlockSchema> {
+        &self.blocks
+    }
+
+    /// One block.
+    #[must_use]
+    pub fn block(&self, name: &str) -> Option<&BlockSchema> {
+        let key = if name.starts_with("minecraft:") {
+            name.to_string()
+        } else {
+            format!("minecraft:{name}")
+        };
+        self.blocks.get(&key)
+    }
+
+    /// Whether the catalog knows a block.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.block(name).is_some()
+    }
+
+    /// Number of blocks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Whether the catalog is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Java Edition blocks for one version.
+#[derive(Debug)]
+pub struct JavaCatalog {
+    version: String,
+    data_version: i32,
+    catalog: BlockCatalog,
+}
+
+impl JavaCatalog {
+    /// Loads the bundled Java catalog for a version label such as `26.2`.
+    pub fn bundled(version: &str) -> Result<&'static Self> {
+        // Two supported labels for now; add more as the mapping data grows.
+        static V26_2: OnceLock<Result<JavaCatalog>> = OnceLock::new();
+        match version {
+            "26.2" => V26_2
+                .get_or_init(|| JavaCatalog::parse(include_bytes!(
+                    "../../../mappings/data/java/26.2/blocks.json.gz"
+                )))
+                .as_ref()
+                .map_err(clone_error),
+            other => Err(WorldPortError::unsupported(format!(
+                "no bundled Java block catalog for version {other}"
+            ))),
+        }
+    }
+
+    fn parse(gzipped: &[u8]) -> Result<Self> {
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(gzipped)
+            .read_to_string(&mut json)
+            .map_err(|error| WorldPortError::other(format!("java catalog gzip: {error}")))?;
+        let raw: BTreeMap<String, RawJavaBlock> = serde_json::from_str(&json)
+            .map_err(|error| WorldPortError::other(format!("java catalog json: {error}")))?;
+        let mut blocks = BTreeMap::new();
+        for (name, block) in raw {
+            let mut properties = BTreeMap::new();
+            for (property, values) in block.properties {
+                let kind = if values.len() == 2
+                    && values.iter().any(|value| value == "true")
+                    && values.iter().any(|value| value == "false")
+                {
+                    PropertyKind::Bool
+                } else if values.iter().all(|value| value.parse::<i32>().is_ok()) {
+                    PropertyKind::Int
+                } else {
+                    PropertyKind::String
+                };
+                properties.insert(property, PropertySchema::new(kind, values));
+            }
+            blocks.insert(
+                name,
+                BlockSchema {
+                    properties,
+                },
+            );
+        }
+        Ok(Self {
+            version: "26.2".to_string(),
+            data_version: 4903,
+            catalog: BlockCatalog { blocks },
+        })
+    }
+
+    /// Version label.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Java `DataVersion` of this catalog.
+    #[must_use]
+    pub const fn data_version(&self) -> i32 {
+        self.data_version
+    }
+
+    /// Block lookup.
+    #[must_use]
+    pub const fn catalog(&self) -> &BlockCatalog {
+        &self.catalog
+    }
+
+    /// Clones the block map into an owned catalog.
+    #[must_use]
+    pub fn to_catalog(&self) -> BlockCatalog {
+        self.catalog.clone()
+    }
+}
+
+/// The Bedrock catalog embedded in `bedrock-world` (sentinel of the supported release).
+#[must_use]
+pub fn bedrock_catalog() -> BlockCatalog {
+    let schema = bedrock_world::block::catalog();
+    let mut blocks = BTreeMap::new();
+    for (name, block) in schema.blocks() {
+        let mut properties = BTreeMap::new();
+        for (property, property_schema) in block.states() {
+            let values: Vec<String> = property_schema
+                .values()
+                .iter()
+                .filter_map(json_value_to_string)
+                .collect();
+            // The embedded schema stores the persisted NBT type: Byte/Int/String.
+            let kind = match property_schema.kind() {
+                "Byte" if values.iter().all(|value| value == "0" || value == "1") => {
+                    PropertyKind::Bool
+                }
+                "Byte" | "Int" | "Short" | "Long" => PropertyKind::Int,
+                _ => PropertyKind::String,
+            };
+            properties.insert(property.clone(), PropertySchema::new(kind, values));
+        }
+        blocks.insert(name.clone(), BlockSchema { properties });
+    }
+    BlockCatalog { blocks }
+}
+
+/// Bedrock block-state storage version reported by the embedded catalog.
+#[must_use]
+pub fn bedrock_format_version() -> u32 {
+    bedrock_world::block::catalog().format_version()
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJavaBlock {
+    #[serde(default)]
+    properties: BTreeMap<String, Vec<String>>,
+}
+
+fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn clone_error(error: &WorldPortError) -> WorldPortError {
+    match error {
+        WorldPortError::Unsupported(message) => WorldPortError::Unsupported(message.clone()),
+        WorldPortError::Other(message) => WorldPortError::Other(message.clone()),
+        WorldPortError::Nbt(message) => WorldPortError::Nbt(message.clone()),
+        WorldPortError::InvalidWorld(message) => WorldPortError::InvalidWorld(message.clone()),
+        WorldPortError::Cancelled => WorldPortError::Cancelled,
+        WorldPortError::Io { path, source } => WorldPortError::Io {
+            path: path.clone(),
+            source: std::io::Error::new(source.kind(), source.to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_java_catalog_has_common_blocks() {
+        let catalog = JavaCatalog::bundled("26.2").expect("bundled catalog");
+        let stone = catalog.catalog().block("stone").expect("stone");
+        assert!(stone.property("axis").is_none());
+        let log = catalog.catalog().block("oak_log").expect("oak_log");
+        let axis = log.property("axis").expect("axis");
+        assert_eq!(axis.kind(), PropertyKind::String);
+        assert_eq!(
+            axis.values().iter().map(String::as_str).collect::<Vec<_>>(),
+            ["x", "y", "z"]
+        );
+    }
+
+    #[test]
+    fn bedrock_catalog_has_common_blocks() {
+        let catalog = bedrock_catalog();
+        assert!(catalog.contains("minecraft:stone"));
+        assert!(catalog.contains("minecraft:oak_planks"));
+        let candle = catalog.block("minecraft:candle").expect("candle");
+        assert!(candle.property("lit").is_some());
+    }
+}

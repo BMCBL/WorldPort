@@ -1,0 +1,691 @@
+//! Java → Bedrock conversion.
+//!
+//! Milestone M1 covers terrain, biomes and chunk records. Block entities,
+//! entities, players, maps and ticks follow in later milestones and are counted
+//! as skipped for now.
+
+use std::collections::BTreeMap;
+
+use bedrock_nbt::NbtTag;
+use bedrock_world::block::BlockEntity;
+use bedrock_world::chunk::palette::BlockState;
+use bedrock_world::world::CreateOptions;
+use bedrock_world::{ChunkPos, Dimension, Spawn};
+use indexmap::IndexMap;
+
+use crate::be::write::{
+    BedrockOutput, CHUNK_VERSION_VALUE, FINALIZED_STATE_POPULATED, SECTION_BLOCKS, SectionWrite,
+    chunk_keys, dimension_of, encode_biomes, encode_section, to_block_state,
+};
+use crate::convert::{ConversionOptions, ConversionPlan, Edition};
+use crate::error::Result;
+use crate::je::chunk::summarize;
+use crate::je::nbt as je_nbt;
+use crate::je::world::JavaWorld;
+use crate::je::{JeChunkPos, JeDimension};
+use crate::mapping::biomes::bedrock_biome_id;
+use crate::mapping::schema::{JavaCatalog, bedrock_catalog};
+use crate::mapping::{BlockMapper, MappedState};
+use crate::nbt::{NbtExt, TagValue};
+use crate::report::{ReportBuilder, WarningCode};
+
+/// Converts a Java world into a Bedrock world.
+pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<crate::report::ConversionReport> {
+    let mut world = JavaWorld::open(&plan.source)?;
+    let mut report = ReportBuilder::new(
+        "java",
+        "bedrock",
+        world.level_name(),
+        plan.target.display().to_string(),
+    );
+    report.set_versions(
+        format!("java {}", world.data_version()),
+        format!(
+            "bedrock 1.26.60 (block state {})",
+            crate::be::write::target_block_state_version()
+        ),
+    );
+
+    let java_version = java_catalog_version(world.data_version());
+    if java_version != "26.2" {
+        report.warn(
+            WarningCode::Lossy,
+            "java-version",
+            format!(
+                "no bundled Java block catalog for DataVersion {}; mapping with 26.2 names",
+                world.data_version()
+            ),
+        );
+    }
+    let java_catalog = JavaCatalog::bundled(java_version)?;
+    let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
+
+    report.begin_stage("create-world");
+    let be_options = create_options(&world)?;
+    let mut output = BedrockOutput::create(&plan.target, be_options)?;
+    report.end_stage();
+
+    report.begin_stage("terrain");
+    let mut converted_chunks = 0_u64;
+    for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
+        let positions = world.chunk_positions(dimension)?;
+        if positions.is_empty() {
+            continue;
+        }
+        options.report(crate::convert::Progress::new(
+            "terrain",
+            converted_chunks,
+            None,
+        ));
+        for positions in positions.chunks(256) {
+            for pos in positions {
+                options.check_cancelled()?;
+                let Some(chunk) = world.read_chunk(dimension, *pos)? else {
+                    report.warn(WarningCode::Skipped, pos.label(), "chunk vanished while reading");
+                    continue;
+                };
+                let summary = summarize(&chunk);
+                if !summary.status.ends_with("full") {
+                    report.warn(
+                        WarningCode::Skipped,
+                        summary.status.clone(),
+                        format!("chunk {} is not fully generated and was skipped", pos.label()),
+                    );
+                    continue;
+                }
+                convert_chunk(
+                    &mut output,
+                    &mut report,
+                    &mapper,
+                    &chunk,
+                    *pos,
+                    dimension,
+                )?;
+                converted_chunks += 1;
+                report.counters().chunks += 1;
+            }
+            options.report(crate::convert::Progress::new(
+                "terrain",
+                converted_chunks,
+                None,
+            ));
+        }
+    }
+    output.flush()?;
+    report.end_stage();
+
+    report.begin_stage("level.dat");
+    if plan.features.level_dat {
+        let root = level_dat_root(&world, &mut report)?;
+        output.write_level_dat(root)?;
+    }
+    report.end_stage();
+
+    report.begin_stage("finalize");
+    output.finish()?;
+    report.end_stage();
+    Ok(report.finish())
+}
+
+fn java_catalog_version(data_version: i32) -> &'static str {
+    // Only 26.2 (DataVersion 4903) ships bundled tables for now.
+    match data_version {
+        4903 => "26.2",
+        _ => "26.2",
+    }
+}
+
+fn create_options(world: &JavaWorld) -> Result<CreateOptions> {
+    let data = world.data();
+    let spawn = spawn_of(world);
+    Ok(CreateOptions {
+        level_name: world.level_name(),
+        seed: world.seed(),
+        spawn,
+        network_version: None,
+        storage_version: 9,
+        level_dat_version: 10,
+        game_mode: match data.get_int("GameType").unwrap_or(0) {
+            1 => bedrock_world::world::BedrockGameMode::Creative,
+            2 => bedrock_world::world::BedrockGameMode::Adventure,
+            _ => bedrock_world::world::BedrockGameMode::Survival,
+        },
+        difficulty: match difficulty_name(data) {
+            "peaceful" => bedrock_world::world::BedrockDifficulty::Peaceful,
+            "easy" => bedrock_world::world::BedrockDifficulty::Easy,
+            "hard" => bedrock_world::world::BedrockDifficulty::Hard,
+            _ => bedrock_world::world::BedrockDifficulty::Normal,
+        },
+        commands_enabled: data.get_bool("allowCommands").unwrap_or(false),
+        daylight_cycle: true,
+        last_opened_with_version: None,
+    })
+}
+
+fn difficulty_name(data: &NbtTag) -> &'static str {
+    if let Some(settings) = data.get("difficulty_settings")
+        && let Some(name) = settings.get_str("difficulty")
+    {
+        return match name {
+            "peaceful" => "peaceful",
+            "easy" => "easy",
+            "normal" => "normal",
+            "hard" => "hard",
+            _ => "normal",
+        };
+    }
+    match data.get_int("Difficulty") {
+        Some(0) => "peaceful",
+        Some(1) => "easy",
+        Some(2) => "normal",
+        _ => "hard",
+    }
+}
+
+fn spawn_of(world: &JavaWorld) -> Spawn {
+    let data = world.data();
+    // 26.x stores `spawn: { pos: [x,y,z], yaw, pitch, dimension }`.
+    if let Some(spawn) = data.get("spawn")
+        && let Some(NbtTag::IntArray(pos)) = spawn.get("pos")
+        && pos.len() >= 3
+    {
+        return Spawn {
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+        };
+    }
+    Spawn {
+        x: data.get_int("SpawnX").and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
+        y: data.get_int("SpawnY").and_then(|v| i32::try_from(v).ok()).unwrap_or(64),
+        z: data.get_int("SpawnZ").and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
+    }
+}
+
+fn convert_chunk(
+    output: &mut BedrockOutput,
+    report: &mut ReportBuilder,
+    mapper: &BlockMapper,
+    chunk: &NbtTag,
+    pos: JeChunkPos,
+    dimension: JeDimension,
+) -> Result<()> {
+    let be_pos = ChunkPos {
+        x: pos.x,
+        z: pos.z,
+        dimension: dimension_of(dimension),
+    };
+    let keys = chunk_keys(be_pos);
+    let mut mapped_cache: BTreeMap<(String, Vec<(String, String)>), MappedState> = BTreeMap::new();
+
+    // Sections, in the Bedrock subchunk grid.
+    let mut sections: Vec<SectionWrite> = Vec::new();
+    if let Some(list) = chunk.get_list("sections") {
+        for section in list {
+            let y = section
+                .get_int("Y")
+                .and_then(|value| i8::try_from(value).ok())
+                .unwrap_or(0);
+            if let Some(write) = convert_section(section, y, mapper, &mut mapped_cache, report) {
+                sections.push(write);
+            } else {
+                // Still record biomes for sections without blocks.
+                if let Some(biome) = convert_biomes(section) {
+                    sections.push(SectionWrite {
+                        y,
+                        primary: vec![0; SECTION_BLOCKS],
+                        primary_palette: vec![air_state()],
+                        liquid: None,
+                        liquid_palette: Vec::new(),
+                        biomes: biome,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut height_map = [0_i16; 256];
+    let mut quart_biomes: Vec<[u32; 64]> = Vec::new();
+    let min_y = sections.iter().map(|section| section.y).min().unwrap_or(-4);
+    let max_y = sections.iter().map(|section| section.y).max().unwrap_or(19);
+    for y in min_y..=max_y {
+        let biome = sections
+            .iter()
+            .find(|section| section.y == y)
+            .map(|section| section.biomes)
+            .unwrap_or([1_u32; 64]);
+        quart_biomes.push(biome);
+    }
+
+    for section in &sections {
+        let base_y = i32::from(section.y) * 16;
+        for x in 0..16_usize {
+            for z in 0..16_usize {
+                let mut top = 0_i32;
+                for y in 0..16_usize {
+                    let index = x * 256 + z * 16 + y;
+                    if section.primary.get(index).copied().unwrap_or(0) != 0 {
+                        top = base_y + y as i32 + 1;
+                    }
+                }
+                let column = z * 16 + x;
+                height_map[column] = height_map[column].max(i16::try_from(top).unwrap_or(i16::MAX));
+            }
+        }
+        let bytes = encode_section(section)?;
+        output.put_raw(keys.subchunk(section.y).encode(), bytes);
+        report.counters().sections += 1;
+        for index in &section.primary {
+            if *index != 0 {
+                report.counters().blocks += 1;
+            }
+        }
+    }
+
+    if !sections.is_empty() {
+        let bytes = encode_biomes(&height_map, &quart_biomes)?;
+        output.put_raw(keys.data3d.encode(), bytes);
+    }
+    output.put_raw(keys.version.encode(), bytes::Bytes::from(vec![CHUNK_VERSION_VALUE]));
+    output.put_raw(
+        keys.finalized.encode(),
+        bytes::Bytes::from(FINALIZED_STATE_POPULATED.to_le_bytes().to_vec()),
+    );
+
+    // Block entities: the state is convertible, the payload translation lands in M3.
+    if let Some(entities) = chunk.get_list("block_entities") {
+        for entity in entities {
+            let id = entity.get_str("id").unwrap_or("minecraft:unknown");
+            report.warn(
+                WarningCode::UnsupportedFeature,
+                "block-entity",
+                format!("block entity {id} payload is not converted yet (M3)"),
+            );
+        }
+        let _ = entities;
+        let _: Option<Vec<BlockEntity>> = None;
+    }
+
+    output.finish_chunk()
+}
+
+fn air_state() -> BlockState {
+    BlockState {
+        name: "minecraft:air".to_string(),
+        states: BTreeMap::new(),
+        version: Some(crate::be::write::target_block_state_version()),
+    }
+}
+
+fn convert_section(
+    section: &NbtTag,
+    y: i8,
+    mapper: &BlockMapper,
+    cache: &mut BTreeMap<(String, Vec<(String, String)>), MappedState>,
+    report: &mut ReportBuilder,
+) -> Option<SectionWrite> {
+    let block_states = section.get("block_states")?;
+    let palette = block_states.get_list("palette")?;
+    if palette.is_empty() {
+        return None;
+    }
+    let entries: Vec<(String, BTreeMap<String, String>)> = palette
+        .iter()
+        .map(|entry| {
+            let name = entry.get_str("Name").unwrap_or("minecraft:air").to_string();
+            let properties = entry
+                .get("Properties")
+                .and_then(|properties| properties.as_compound())
+                .map(|properties| {
+                    properties
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str_value().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, properties)
+        })
+        .collect();
+
+    let data = block_states.get_i64_array("data");
+    let bits = palette_bits(entries.len());
+    let indices = decode_indices(data, SECTION_BLOCKS, bits);
+
+    let mut primary_palette: Vec<BlockState> = vec![air_state()];
+    let mut primary_index_map: BTreeMap<u16, u16> = BTreeMap::new();
+    let mut primary = vec![0_u16; SECTION_BLOCKS];
+
+    let mut liquid_palette: Vec<BlockState> = vec![air_state(), water_state()];
+    let mut liquid = vec![0_u16; SECTION_BLOCKS];
+    let mut has_liquid = false;
+
+    let mut any_block = false;
+    for x in 0..16_usize {
+        for z in 0..16_usize {
+            for local_y in 0..16_usize {
+                let je_index = (local_y << 8) | (z << 4) | x;
+                let palette_index = indices.get(je_index).copied().unwrap_or(0) as usize;
+                let Some((name, properties)) = entries.get(palette_index) else {
+                    continue;
+                };
+                let be_offset = x * 256 + z * 16 + local_y;
+
+                let short = crate::mapping::short_name(name);
+                if short == "air" || short == "cave_air" || short == "void_air" {
+                    continue;
+                }
+                if short == "water" || short == "lava" {
+                    has_liquid = true;
+                    liquid[be_offset] = if short == "water" { 1 } else { 2 };
+                    if short == "lava" && liquid_palette.len() == 2 {
+                        liquid_palette.push(lava_state());
+                    }
+                    continue;
+                }
+
+                let waterlogged = properties.get("waterlogged").is_some_and(|value| value == "true");
+                let cache_key = (
+                    name.clone(),
+                    properties
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "waterlogged")
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<Vec<_>>(),
+                );
+                let mapped = if let Some(mapped) = cache.get(&cache_key) {
+                    mapped.clone()
+                } else {
+                    let mapped = match mapper.je_to_be(name, &properties) {
+                        Some(mapped) => mapped,
+                        None => {
+                            report.unmapped_block(
+                                format!("{name}{properties:?}"),
+                                format!("block {name} has no Bedrock mapping; air was written"),
+                            );
+                            MappedState {
+                                name: "minecraft:air".to_string(),
+                                properties: BTreeMap::new(),
+                                lossy: true,
+                            }
+                        }
+                    };
+                    cache.insert(cache_key, mapped.clone());
+                    mapped
+                };
+                if mapped.name == "minecraft:air" {
+                    continue;
+                }
+                if mapped.lossy {
+                    report.warn(
+                        WarningCode::Lossy,
+                        mapped.name.clone(),
+                        format!("{} lost states the Bedrock block cannot express", mapped.name),
+                    );
+                }
+                let state = to_block_state(&mapped, mapper.bedrock());
+                let palette_index = *primary_index_map.entry(palette_index as u16).or_insert_with(|| {
+                    primary_palette.push(state.clone());
+                    (primary_palette.len() - 1) as u16
+                });
+                any_block = true;
+                primary[be_offset] = palette_index;
+                if waterlogged {
+                    has_liquid = true;
+                    liquid[be_offset] = 1;
+                }
+            }
+        }
+    }
+
+    if !any_block && !has_liquid {
+        return None;
+    }
+    let biomes = convert_biomes(section)?;
+    Some(SectionWrite {
+        y,
+        primary,
+        primary_palette,
+        liquid: has_liquid.then_some(liquid),
+        liquid_palette,
+        biomes,
+    })
+}
+
+fn convert_biomes(section: &NbtTag) -> Option<[u32; 64]> {
+    let biomes = section.get("biomes")?;
+    let palette = biomes.get_list("palette")?;
+    let names: Vec<u32> = palette
+        .iter()
+        .map(|entry| {
+            let name = entry.as_str_value().unwrap_or("minecraft:plains");
+            bedrock_biome_id(name).unwrap_or(1)
+        })
+        .collect();
+    let mut result = [names.first().copied().unwrap_or(1); 64];
+    if names.len() > 1 {
+        let bits = biomes_bits(names.len());
+        if let Some(data) = biomes.get_i64_array("data") {
+            for (index, value) in decode_indices(Some(data), 64, bits).iter().enumerate() {
+                result[index] = names.get(*value as usize).copied().unwrap_or(1);
+            }
+        }
+    }
+    Some(result)
+}
+
+/// Java palette index width: at least 4 bits for blocks.
+fn palette_bits(len: usize) -> u32 {
+    let needed = usize::BITS - len.saturating_sub(1).leading_zeros();
+    needed.max(4)
+}
+
+/// Java biome palette index width: at least 1 bit when more than one entry.
+fn biomes_bits(len: usize) -> u32 {
+    let needed = usize::BITS - len.saturating_sub(1).leading_zeros();
+    needed.max(1)
+}
+
+/// Decodes Java's non-straddling packed long array.
+fn decode_indices(data: Option<&[i64]>, count: usize, bits: u32) -> Vec<u16> {
+    if bits == 0 || data.is_none() {
+        return vec![0; count];
+    }
+    let data = data.unwrap();
+    let per_long = (64 / bits) as usize;
+    let mask = (1_u64 << bits) - 1;
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let long_index = index / per_long;
+        let offset = (index % per_long) as u32 * bits;
+        let Some(word) = data.get(long_index) else {
+            values.push(0);
+            continue;
+        };
+        values.push((((*word as u64) >> offset) & mask) as u16);
+    }
+    values
+}
+
+fn water_state() -> BlockState {
+    let mut states = BTreeMap::new();
+    states.insert("liquid_depth".to_string(), NbtTag::Int(0));
+    BlockState {
+        name: "minecraft:water".to_string(),
+        states,
+        version: Some(crate::be::write::target_block_state_version()),
+    }
+}
+
+fn lava_state() -> BlockState {
+    let mut states = BTreeMap::new();
+    states.insert("liquid_depth".to_string(), NbtTag::Int(0));
+    BlockState {
+        name: "minecraft:lava".to_string(),
+        states,
+        version: Some(crate::be::write::target_block_state_version()),
+    }
+}
+
+fn level_dat_root(world: &JavaWorld, report: &mut ReportBuilder) -> Result<NbtTag> {
+    let data = world.data();
+    let spawn = spawn_of(world);
+    let mut root = IndexMap::new();
+    root.insert(
+        "LevelName".to_string(),
+        NbtTag::String(world.level_name()),
+    );
+    root.insert("RandomSeed".to_string(), NbtTag::Long(world.seed()));
+    root.insert("SpawnX".to_string(), NbtTag::Int(spawn.x));
+    root.insert("SpawnY".to_string(), NbtTag::Int(spawn.y));
+    root.insert("SpawnZ".to_string(), NbtTag::Int(spawn.z));
+    root.insert(
+        "GameType".to_string(),
+        NbtTag::Int(i32::try_from(data.get_int("GameType").unwrap_or(0)).unwrap_or(0)),
+    );
+    root.insert(
+        "Difficulty".to_string(),
+        NbtTag::Int(match difficulty_name(data) {
+            "peaceful" => 0,
+            "easy" => 1,
+            "normal" => 2,
+            _ => 3,
+        }),
+    );
+    root.insert(
+        "Time".to_string(),
+        NbtTag::Long(data.get_int("Time").unwrap_or(0)),
+    );
+    root.insert(
+        "currentTick".to_string(),
+        NbtTag::Long(world.total_ticks()),
+    );
+    root.insert(
+        "commandsEnabled".to_string(),
+        NbtTag::Byte(i8::from(data.get_bool("allowCommands").unwrap_or(false))),
+    );
+    root.insert(
+        "NetworkVersion".to_string(),
+        NbtTag::Int(1_260_600),
+    );
+    root.insert("StorageVersion".to_string(), NbtTag::Int(9));
+    root.insert("WorldVersion".to_string(), NbtTag::Int(1));
+    root.insert("MultiplayerGame".to_string(), NbtTag::Byte(1));
+    root.insert("LANBroadcast".to_string(), NbtTag::Byte(1));
+    root.insert("PlatformBroadcastIntent".to_string(), NbtTag::Int(3));
+    root.insert("XBLBroadcastIntent".to_string(), NbtTag::Int(3));
+    root.insert("isFromWorldTemplate".to_string(), NbtTag::Byte(0));
+    root.insert("isWorldTemplateOptionLocked".to_string(), NbtTag::Byte(0));
+    root.insert(
+        "LightningLevel".to_string(),
+        NbtTag::Float(if world.thundering() { 1.0 } else { 0.0 }),
+    );
+    root.insert(
+        "RainLevel".to_string(),
+        NbtTag::Float(if world.raining() { 1.0 } else { 0.0 }),
+    );
+    root.insert(
+        "LightningTime".to_string(),
+        NbtTag::Int(i32::try_from(world.thunder_time()).unwrap_or(i32::MAX)),
+    );
+    root.insert(
+        "RainTime".to_string(),
+        NbtTag::Int(i32::try_from(world.rain_time()).unwrap_or(i32::MAX)),
+    );
+    root.insert(
+        "lastOpenedWithVersion".to_string(),
+        NbtTag::List(vec![
+            NbtTag::Int(1),
+            NbtTag::Int(26),
+            NbtTag::Int(60),
+            NbtTag::Int(0),
+            NbtTag::Int(0),
+        ]),
+    );
+    for (name, value) in world.game_rules() {
+        let row = crate::mapping::game_rules::find_by_java(&name);
+        let key = crate::mapping::game_rules::bedrock_key(&name);
+        let Some(tag) = gamerule_tag(&value) else {
+            report.warn(
+                WarningCode::DroppedField,
+                key.clone(),
+                "gamerule value is not a boolean or integer",
+            );
+            continue;
+        };
+        // Inverted rules (elytra movement check) flip between editions.
+        let tag = match (row, tag) {
+            (Some((_, _, _, _, true)), NbtTag::Byte(value)) => NbtTag::Byte(i8::from(value == 0)),
+            (_, tag) => tag,
+        };
+        root.insert(key, tag);
+    }
+    Ok(NbtTag::Compound(root))
+}
+
+/// Normalises a Java gamerule value to a Bedrock flat tag.
+fn gamerule_tag(value: &NbtTag) -> Option<NbtTag> {
+    match value {
+        NbtTag::String(text) => {
+            if text == "true" || text == "false" {
+                Some(NbtTag::Byte(i8::from(text == "true")))
+            } else {
+                text.parse::<i32>().ok().map(NbtTag::Int)
+            }
+        }
+        NbtTag::Byte(value) => Some(NbtTag::Byte(*value)),
+        NbtTag::Short(value) => Some(NbtTag::Int(i32::from(*value))),
+        NbtTag::Int(value) => Some(NbtTag::Int(*value)),
+        NbtTag::Long(value) => Some(NbtTag::Int(i32::try_from(*value).ok()?)),
+        _ => None,
+    }
+}
+
+/// Result of mapping one Java chunk status to a Bedrock dimension.
+#[must_use]
+pub const fn bedrock_dimension(dimension: JeDimension) -> Dimension {
+    dimension_of(dimension)
+}
+
+/// Builds a Bedrock block entity from converted data (used by later milestones).
+#[must_use]
+pub fn passthrough_block_entity(id: &str, x: i32, y: i32, z: i32) -> BlockEntity {
+    crate::be::write::block_entity(id, x, y, z, IndexMap::new())
+}
+
+/// Placeholder to keep `je_nbt` in scope for later milestones.
+#[allow(dead_code)]
+fn _read_raw(path: &std::path::Path) -> Result<je_nbt::NamedTag> {
+    je_nbt::read_gzip(path)
+}
+
+/// Reports the target edition of this module.
+#[must_use]
+pub const fn target_edition() -> Edition {
+    Edition::Bedrock
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_java_packed_indices() {
+        // 4 bits per entry, 16 per long, first long holds indices 0x0..0xF.
+        let word = 0x0123_4567_89AB_CDEF_i64;
+        let values = decode_indices(Some(&[word]), 16, 4);
+        assert_eq!(values[0], 0xF);
+        assert_eq!(values[1], 0xE);
+        assert_eq!(values[15], 0x0);
+    }
+
+    #[test]
+    fn rounds_palette_bits_up() {
+        assert_eq!(palette_bits(1), 4);
+        assert_eq!(palette_bits(2), 4);
+        assert_eq!(palette_bits(17), 5);
+        assert_eq!(biomes_bits(2), 1);
+        assert_eq!(biomes_bits(5), 3);
+    }
+}

@@ -1,0 +1,86 @@
+[package]
+name = "bedrock-leveldb"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "High-performance pure Rust storage engine for Mojang's modified LevelDB"
+repository = "https://github.com/BE-Community-Dev/bedrock-leveldb"
+homepage = "https://github.com/BE-Community-Dev/bedrock-leveldb"
+documentation = "https://docs.rs/bedrock-leveldb"
+readme = "README.md"
+keywords = ["minecraft", "bedrock", "leveldb", "storage", "database"]
+categories = ["database-implementations", "filesystem"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "README.zh-CN.md",
+    "docs/**/*.md",
+    "CHANGELOG.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "tests/fixtures/README.md",
+    "benches/**/*.rs",
+]
+
+[lib]
+name = "bedrock_leveldb"
+path = "src/bedrock_leveldb.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["zlib", "snappy", "async"]
+async = ["dep:tokio"]
+zlib = ["dep:flate2"]
+snappy = ["dep:snap"]
+mmap = ["dep:memmap2"]
+repair-tools = []
+bench = []
+
+[dependencies]
+bytes = "1.10.1"
+# crc32c performs runtime ISA detection and software fallback; this does not
+# require a global target-cpu=native build.
+crc32c = "0.6.8"
+log = "0.4"
+fs2 = "0.4.3"
+memmap2 = { version = "0.9.9", optional = true }
+rayon = "1.11.0"
+snap = { version = "1.1.1", optional = true }
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync"], optional = true }
+
+# Native 64-bit server/desktop builds use zlib-ng. zlib-ng keeps runtime CPU
+# detection enabled by default, selecting AVX2/BMI2/SSE/NEON implementations only
+# when the running CPU supports them and otherwise falling back to generic code.
+# Other architectures retain the portable zlib-rs backend. No target-cpu=native
+# requirement is imposed on consumers.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+flate2 = { version = "1.1.5", default-features = false, features = ["zlib-ng"], optional = true }
+
+[target.'cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.10"
+xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
+
+[[bench]]
+name = "db"
+harness = false
+
+[[bench]]
+name = "fixture_snapshot"
+harness = false
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

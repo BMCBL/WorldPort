@@ -1,0 +1,23 @@
+# Build outputs
+/target
+/plugin/target
+**/*.rs.bk
+
+# Local conversion scratch space and reference checkouts
+/_out
+/_refs
+
+# Packaged plugin artifacts and native binaries
+/dist/*.bmcblx
+/dist/native/
+**/*.bmcblx
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Local tooling
+.cargo/
+*.log
+.DS_Store
+Thumbs.db

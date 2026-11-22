@@ -1,0 +1,14 @@
+[package]
+name = "worldport-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+description = "Command and event protocol between the WorldPort WebAssembly UI and its native module"
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+
+[lints.rust]
+unsafe_code = "warn"
