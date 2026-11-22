@@ -13,6 +13,15 @@ Local edits applied to the copies:
 
 - `fearless_simd.workspace = true` → `fearless_simd = "=1.1.0"` in
   `bedrock-nbt` and `bedrock-world` (the workspace root is not copied).
+- `bedrock-world/src/world/query.rs`: `World::chunk` reads per-chunk records with a
+  sequential scan. The table-parallel pipeline spawns a scope per chunk; many reader
+  threads scoped the shared scan pool concurrently and could deadlock, and a chunk
+  prefix is a handful of records where the pipeline only adds overhead.
+- `bedrock-world/src/world/query.rs`: added `World::chunk_snapshot`, which fetches the
+  fixed chunk tag set plus the 1.18+ subchunk range with one `get_many` call and parses
+  the biome record from the same batch.
+- `bedrock-world/src/scan/mod.rs`: `parse_data3d_with_min_y` is public so the snapshot
+  path can decode `Data3D` without a second storage lookup.
 
 Re-sync after the launcher's crates change:
 
