@@ -21,6 +21,7 @@ pub mod nbt;
 pub mod player;
 pub mod poi;
 pub mod report;
+pub mod structure;
 pub mod tick;
 
 pub use convert::{ConversionOptions, ConversionPlan, Edition, Features};

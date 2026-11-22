@@ -269,6 +269,13 @@ pub fn convert(
         }
     }
     report.end_stage();
+
+    report.begin_stage("structures");
+    options.report(Progress::new("structures", 0, None));
+    if plan.features.chunk_metadata {
+        write_structures(&world, &mut report)?;
+    }
+    report.end_stage();
     Ok(report.finish())
 }
 
@@ -965,6 +972,44 @@ fn uuid_string(uuid: [i32; 4]) -> String {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     )
+}
+
+/// Collects Bedrock hardcoded spawn areas and reports them.
+///
+/// Bedrock's only structure record is this binary box list; Java's equivalent
+/// (`structures.starts`) needs piece lists that Bedrock does not store, so the
+/// areas are reported rather than turned into fabricated structure starts. The
+/// reader walks chunk records directly instead of going through the terrain
+/// pass, because a monument or outpost can sit in a chunk with no converted
+/// blocks of its own.
+fn write_structures(world: &World, report: &mut ReportBuilder) -> Result<()> {
+    let positions = world.chunk_positions(Default::default())?;
+    // One batched lookup per 4096 chunks instead of a per-chunk prefix scan:
+    // the record key is fixed, so a point read is enough and the scan cost stays
+    // proportional to the number of chunks rather than to the table layout.
+    let mut areas = Vec::new();
+    for window in positions.chunks(4096) {
+        let keys: Vec<bytes::Bytes> = window
+            .iter()
+            .map(|pos| ChunkKey::new(*pos, ChunkRecordTag::HardcodedSpawners).encode())
+            .collect();
+        let values = world.storage().get_many(&keys)?;
+        for (pos, value) in window.iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            match crate::structure::read_bedrock_chunk(&value) {
+                Ok(found) => areas.extend(found),
+                Err(error) => report.warn(
+                    WarningCode::Skipped,
+                    format!("hardcoded-spawners:{},{}", pos.x, pos.z),
+                    format!("hardcoded spawn areas could not be decoded: {error}"),
+                ),
+            }
+        }
+    }
+    crate::structure::report_bedrock_areas(&areas, report);
+    Ok(())
 }
 
 /// Converts Bedrock village records into Java `poi/` region files.

@@ -110,6 +110,8 @@ pub struct Counters {
     pub ticks: u64,
     /// Village interests (beds, workstations, meeting points) written.
     pub village_interests: u64,
+    /// Structure areas found (Bedrock hardcoded spawn areas / Java starts).
+    pub structures: u64,
 }
 
 impl Counters {
@@ -125,6 +127,7 @@ impl Counters {
         self.biome_cells += other.biome_cells;
         self.ticks += other.ticks;
         self.village_interests += other.village_interests;
+        self.structures += other.structures;
     }
 }
 
