@@ -40,6 +40,39 @@ enum Command {
     Chunk(ChunkArgs),
     /// Compare two Java worlds chunk by chunk (round-trip verification).
     Compare(CompareArgs),
+    /// Print Bedrock entities as SNBT (debugging aid for M3).
+    Entities(EntitiesArgs),
+    /// Print Bedrock player records as SNBT (debugging aid for M3).
+    Players(PlayersArgs),
+    /// Write the synthetic test world used for M3 acceptance runs.
+    Fixtures(FixturesArgs),
+}
+
+#[derive(Debug, Args)]
+struct FixturesArgs {
+    /// Destination world directory (must not exist or be empty).
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PlayersArgs {
+    /// Bedrock world directory.
+    world: PathBuf,
+    /// How many players to print.
+    #[arg(long, default_value_t = 1)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct EntitiesArgs {
+    /// Bedrock world directory.
+    world: PathBuf,
+    /// How many entities to print.
+    #[arg(long, default_value_t = 3)]
+    limit: usize,
+    /// Print block entities instead of actors.
+    #[arg(long)]
+    block_entities: bool,
 }
 
 #[derive(Debug, Args)]
@@ -72,6 +105,9 @@ struct ChunkArgs {
     /// Print only the top-level keys.
     #[arg(long)]
     keys: bool,
+    /// Print the separate `entities/` chunk instead of the block chunk.
+    #[arg(long)]
+    entities: bool,
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +170,9 @@ struct ConvertArgs {
     /// Write the report as JSON to this path.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Stop after this many chunks (testing aid).
+    #[arg(long)]
+    limit_chunks: Option<usize>,
 }
 
 fn parse_edition(value: &str) -> Result<Edition, String> {
@@ -197,6 +236,13 @@ fn run() -> Result<()> {
         Command::Nbt(args) => dump_nbt(args),
         Command::Chunk(args) => dump_chunk(args),
         Command::Compare(args) => compare_worlds(args),
+        Command::Entities(args) => dump_entities(args),
+        Command::Players(args) => dump_players(args),
+        Command::Fixtures(args) => {
+            worldport_core::fixtures::write_world(&args.path)?;
+            println!("wrote fixture world to {}", args.path.display());
+            Ok(())
+        }
     }
 }
 
@@ -218,6 +264,14 @@ fn dump_chunk(args: ChunkArgs) -> Result<()> {
     };
     let pos = worldport_core::je::JeChunkPos::new(x, z);
     eprintln!("chunk {}", pos.label());
+    if args.entities {
+        let entities = world.read_entity_chunk(dimension, pos)?;
+        eprintln!("{} entities", entities.len());
+        for entity in &entities {
+            println!("{}", bedrock_nbt::snbt::to_string(entity)?);
+        }
+        return Ok(());
+    }
     let chunk = world
         .read_chunk(dimension, pos)?
         .with_context(|| format!("chunk {} not present", pos.label()))?;
@@ -248,6 +302,71 @@ fn dump_chunk(args: ChunkArgs) -> Result<()> {
     Ok(())
 }
 
+/// Bedrock actor payloads can carry `TAG_ByteString` (`StorageKey`), which has no
+/// SNBT form; convert it lossily for the debug dump.
+fn snbt_safe(tag: &bedrock_nbt::NbtTag) -> String {
+    fn clean(tag: &bedrock_nbt::NbtTag) -> bedrock_nbt::NbtTag {
+        use bedrock_nbt::NbtTag;
+        match tag {
+            NbtTag::ByteString(bytes) => NbtTag::String(String::from_utf8_lossy(bytes).into_owned()),
+            NbtTag::List(values) => NbtTag::List(values.iter().map(clean).collect()),
+            NbtTag::Compound(entries) => NbtTag::Compound(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), clean(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    bedrock_nbt::snbt::to_string(&clean(tag))
+        .unwrap_or_else(|error| format!("<snbt error: {error}>"))
+}
+
+fn dump_entities(args: EntitiesArgs) -> Result<()> {
+    let mut options = bedrock_world::world::OpenOptions::default();
+    options.read_only = true;
+    let world = bedrock_world::world::World::open(&args.world, options)?;
+    if args.block_entities {
+        let (entities, report) = world.scan_block_entities(Default::default())?;
+        eprintln!("{} block entities, {} parse errors", entities.len(), report.parse_errors.len());
+        for entity in entities.iter().take(args.limit) {
+            println!("{}", snbt_safe(&entity.nbt));
+        }
+    } else {
+        let (actors, report) = world.scan_entities(Default::default())?;
+        eprintln!("{} entities, {} parse errors", actors.len(), report.parse_errors.len());
+        for actor in actors.iter().take(args.limit) {
+            if let Some(key) = actor
+                .nbt
+                .get("internalComponents")
+                .and_then(|components| components.get("EntityStorageKeyComponent"))
+                .and_then(|component| component.get("StorageKey"))
+                && let bedrock_nbt::NbtTag::ByteString(bytes) = key
+            {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                eprintln!("storage key hex: {hex}");
+            }
+            println!("{}", snbt_safe(&actor.nbt));
+        }
+    }
+    Ok(())
+}
+
+fn dump_players(args: PlayersArgs) -> Result<()> {
+    let mut options = bedrock_world::world::OpenOptions::default();
+    options.read_only = true;
+    let world = bedrock_world::world::World::open(&args.world, options)?;
+    let ids = world.players()?;
+    eprintln!("{} players", ids.len());
+    for id in ids.iter().take(args.limit) {
+        if let Some(player) = world.player(id)? {
+            println!("{}", snbt_safe(&player.nbt));
+        }
+    }
+    Ok(())
+}
+
 fn compare_worlds(args: CompareArgs) -> Result<()> {
     let dimension = match args.dimension.as_str() {
         "overworld" => JeDimension::Overworld,
@@ -270,6 +389,8 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
     println!("differing    {} chunks", report.differing_chunks);
     println!("block diffs  {}", report.block_mismatches);
     println!("biome diffs  {}", report.biome_mismatches);
+    println!("entity diffs {}", report.entity_mismatches);
+    println!("BE diffs     {}", report.block_entity_mismatches);
     if !report.level_dat.is_empty() {
         println!("level.dat");
         for (field, left, right) in &report.level_dat {
@@ -286,8 +407,16 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
         println!("worst chunks");
         for chunk in report.worst_chunks.iter().take(5) {
             println!(
-                "  {}: {} block, {} biome",
-                chunk.chunk, chunk.block_mismatches, chunk.biome_mismatches
+                "  {}: {} block, {} biome, {} entity, {} block-entity",
+                chunk.chunk,
+                chunk.block_mismatches,
+                chunk.biome_mismatches,
+                chunk.entities.iter().map(|row| row.first.abs_diff(row.second)).sum::<u64>(),
+                chunk
+                    .block_entities
+                    .iter()
+                    .map(|row| row.first.abs_diff(row.second))
+                    .sum::<u64>(),
             );
             for row in chunk.blocks.iter().take(3) {
                 println!("    {} {} -> {}", row.state, row.first, row.second);
@@ -585,6 +714,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
     plan.jobs = args.jobs;
     plan.compression_level = args.compression;
     plan.overwrite = args.overwrite;
+    plan.chunk_limit = args.limit_chunks;
     let options = ConversionOptions::default();
     let report = worldport_core::convert::run(&plan, &options)?;
     let json = serde_json::to_string_pretty(&report)?;

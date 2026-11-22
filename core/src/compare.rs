@@ -39,6 +39,10 @@ pub struct ChunkDiff {
     pub block_mismatches: u64,
     /// Total biome cells that differ.
     pub biome_mismatches: u64,
+    /// Entity type counts that differ.
+    pub entities: Vec<StateDiff>,
+    /// Block entity id counts that differ.
+    pub block_entities: Vec<StateDiff>,
 }
 
 /// Whole-world comparison summary.
@@ -64,6 +68,10 @@ pub struct CompareReport {
     pub block_mismatches: u64,
     /// Total differing biome cells across all matched chunks.
     pub biome_mismatches: u64,
+    /// Total entity type mismatches across all matched chunks.
+    pub entity_mismatches: u64,
+    /// Total block entity id mismatches across all matched chunks.
+    pub block_entity_mismatches: u64,
     /// Largest per-chunk differences (capped).
     pub worst_chunks: Vec<ChunkDiff>,
     /// Global block state differences (capped).
@@ -178,9 +186,34 @@ pub fn compare_java(first: &JavaWorld, second: &JavaWorld, dimension: JeDimensio
                 }
             }
         }
+        let first_entities = entity_histogram(
+            &first_chunk,
+            &first.read_entity_chunk(dimension, *pos)?,
+        );
+        let second_entities = entity_histogram(
+            &second_chunk,
+            &second.read_entity_chunk(dimension, *pos)?,
+        );
+        eprintln!("DEBUG first={first_entities:?}");
+        eprintln!("DEBUG second={second_entities:?}");
+        diff.entities = histogram_diff(&first_entities, &second_entities);
+        diff.block_entities = histogram_diff(
+            &block_entity_histogram(&first_chunk),
+            &block_entity_histogram(&second_chunk),
+        );
+        for row in &diff.entities {
+            report.entity_mismatches += row.first.abs_diff(row.second);
+        }
+        for row in &diff.block_entities {
+            report.block_entity_mismatches += row.first.abs_diff(row.second);
+        }
         report.block_mismatches += diff.block_mismatches;
         report.biome_mismatches += diff.biome_mismatches;
-        if diff.block_mismatches != 0 || diff.biome_mismatches != 0 {
+        if diff.block_mismatches != 0
+            || diff.biome_mismatches != 0
+            || !diff.entities.is_empty()
+            || !diff.block_entities.is_empty()
+        {
             report.differing_chunks += 1;
             worst.push(diff);
         }
@@ -227,6 +260,51 @@ fn level_dat_diff(first: &JavaWorld, second: &JavaWorld) -> Vec<(String, String,
         }
     }
     rows
+}
+
+fn histogram_diff(first: &BTreeMap<String, u64>, second: &BTreeMap<String, u64>) -> Vec<StateDiff> {
+    let mut rows = Vec::new();
+    for (key, count) in first {
+        let other = second.get(key).copied().unwrap_or(0);
+        if other != *count {
+            rows.push(StateDiff {
+                state: key.clone(),
+                first: *count,
+                second: other,
+            });
+        }
+    }
+    for (key, count) in second {
+        if !first.contains_key(key) {
+            rows.push(StateDiff {
+                state: key.clone(),
+                first: 0,
+                second: *count,
+            });
+        }
+    }
+    rows
+}
+
+fn entity_histogram(chunk: &NbtTag, external: &[NbtTag]) -> BTreeMap<String, u64> {
+    let mut histogram = BTreeMap::new();
+    let inline = chunk.get_list("Entities").unwrap_or_default();
+    for entity in inline.iter().chain(external.iter()) {
+        if let Some(id) = entity.get_str("id") {
+            *histogram.entry(id.to_string()).or_insert(0) += 1;
+        }
+    }
+    histogram
+}
+
+fn block_entity_histogram(chunk: &NbtTag) -> BTreeMap<String, u64> {
+    let mut histogram = BTreeMap::new();
+    for entity in chunk.get_list("block_entities").unwrap_or_default() {
+        if let Some(id) = entity.get_str("id") {
+            *histogram.entry(id.to_string()).or_insert(0) += 1;
+        }
+    }
+    histogram
 }
 
 fn state_histogram(chunk: &NbtTag) -> BTreeMap<String, u64> {
