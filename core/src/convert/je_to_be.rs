@@ -105,7 +105,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
             converted_chunks,
             None,
         ));
-        for window in positions.chunks(512) {
+        for window in positions.chunks(256) {
             options.check_cancelled()?;
             let outcomes: Vec<Result<ChunkOutcome>> = pool.install(|| {
                 window
@@ -337,6 +337,12 @@ impl ChunkSink {
     }
 }
 
+thread_local! {
+    /// One region cache per worker thread: no locking, handles stay private.
+    static REGIONS: std::cell::RefCell<crate::je::RegionCache> =
+        std::cell::RefCell::new(crate::je::RegionCache::default());
+}
+
 /// Reads and converts one Java chunk on a worker thread.
 fn convert_position(
     world: &JavaWorld,
@@ -348,7 +354,8 @@ fn convert_position(
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<ChunkOutcome> {
     let mut report = ReportBuilder::new("java", "bedrock", "", "");
-    let Some(chunk) = world.read_chunk(dimension, pos)? else {
+    let chunk = REGIONS.with_borrow_mut(|cache| world.read_chunk_cached(cache, dimension, pos));
+    let Some(chunk) = chunk? else {
         report.warn(WarningCode::Skipped, pos.label(), "chunk vanished while reading");
         return Ok(ChunkOutcome {
             raw: Vec::new(),
@@ -516,7 +523,9 @@ fn convert_chunk(
         .get_list("Entities")
         .map(<[NbtTag]>::to_vec)
         .unwrap_or_default();
-    je_entities.extend(world.read_entity_chunk(dimension, pos)?);
+    je_entities.extend(REGIONS.with_borrow_mut(|cache| {
+        world.read_entity_chunk_cached(cache, dimension, pos)
+    })?);
     if !je_entities.is_empty() {
         for entity in &je_entities {
             let uid = uid_counter.fetch_add(1, Ordering::Relaxed);
@@ -783,15 +792,18 @@ fn decode_indices(data: Option<&[i64]>, count: usize, bits: u32) -> Vec<u16> {
     let data = data.unwrap();
     let per_long = (64 / bits) as usize;
     let mask = (1_u64 << bits) - 1;
-    let mut values = Vec::with_capacity(count);
-    for index in 0..count {
-        let long_index = index / per_long;
-        let offset = (index % per_long) as u32 * bits;
-        let Some(word) = data.get(long_index) else {
-            values.push(0);
-            continue;
-        };
-        values.push((((*word as u64) >> offset) & mask) as u16);
+    let mut values = vec![0_u16; count];
+    // Mirror of the writer: unpack one source word into its lanes instead of
+    // re-deriving the word index and shift for every single entry.
+    for (word_index, word) in data.iter().enumerate() {
+        let base = word_index * per_long;
+        let word = *word as u64;
+        for lane in 0..per_long {
+            let Some(slot) = values.get_mut(base + lane) else {
+                break;
+            };
+            *slot = ((word >> (lane as u32 * bits)) & mask) as u16;
+        }
     }
     values
 }

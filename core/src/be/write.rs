@@ -132,9 +132,15 @@ impl BedrockOutput {
         Ok(())
     }
 
-    /// Flushes and compacts, then returns the world path.
+    /// Flushes, compacts the LevelDB and returns the world path.
+    ///
+    /// Without compaction the output keeps one small SST per write batch plus a
+    /// memtable dump: the same 6,968-chunk world came out at 26 MiB versus
+    /// 3.5 MiB after compaction (Chunker compacts too), and a Bedrock client
+    /// has to merge those tables on first open.
     pub fn finish(mut self) -> Result<PathBuf> {
         self.flush()?;
+        self.world.compact_storage()?;
         let path = self.world.path().to_path_buf();
         Ok(path)
     }

@@ -83,14 +83,22 @@ pub fn decode_unnamed(data: &[u8]) -> Result<NbtTag> {
 
 /// Encodes a named root compound.
 pub fn encode(name: &str, tag: &NbtTag) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(512);
+    encode_into(&mut out, name, tag)?;
+    Ok(out)
+}
+
+/// Encodes a root tag into an existing buffer, which the caller can recycle
+/// across chunks to avoid one allocation per converted chunk.
+pub fn encode_into(out: &mut Vec<u8>, name: &str, tag: &NbtTag) -> Result<()> {
     if !matches!(tag, NbtTag::Compound(_)) {
         return Err(WorldPortError::nbt("root tag must be a compound"));
     }
-    let mut out = Vec::with_capacity(512);
+    out.clear();
     out.push(TAG_COMPOUND);
-    write_mutf8_string(&mut out, name)?;
-    write_payload(&mut out, tag)?;
-    Ok(out)
+    write_mutf8_string(out, name)?;
+    write_payload(out, tag)?;
+    Ok(())
 }
 
 /// Reads a gzip-compressed `level.dat`-style file.
