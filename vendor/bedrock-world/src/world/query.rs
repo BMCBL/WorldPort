@@ -481,7 +481,6 @@ where
         parse_world(level_dat, self.storage(), options)
     }
 
-    /// Scans the known records for one chunk using the selected retention options.
     /// Reads one chunk and its biome model with a single batched key lookup.
     ///
     /// [`Self::chunk`] scans every record under the chunk prefix, which walks
@@ -549,10 +548,8 @@ where
                             &value,
                             pos.y_range(ChunkVersion::New).0,
                         ),
-                        ChunkRecordTag::Data2D => {
-                            crate::scan::parse_legacy_data2d(&value).map_err(|error| error)
-                        }
-                        _ => crate::scan::parse_data2d_legacy(&value).map_err(|error| error),
+                        ChunkRecordTag::Data2D => crate::scan::parse_legacy_data2d(&value),
+                        _ => crate::scan::parse_data2d_legacy(&value),
                     }
                     .map_err(|error| {
                         BedrockWorldError::CorruptWorld(format!("biome data: {error}"))

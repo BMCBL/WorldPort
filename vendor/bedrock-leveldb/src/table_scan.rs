@@ -39,8 +39,7 @@ const MIN_RUN_BUFFER_POOL: usize = 2;
 /// current key, so the resident set is `table_count * run_bytes`. A 443 MB
 /// world has 200+ SST tables: at the 1 MiB per-run target that pinned ~1.4 GB
 /// of decoded blocks for a scan that only needs to look at keys. Shrinking the
-/// per-run target keeps the resident set bounded with no measurable time cost
-/// (39.2 s vs 37.6 s over a 108k-chunk world, i.e. within run-to-run noise).
+/// per-run target keeps the resident set bounded with no measurable time cost.
 const SCAN_RESIDENT_RUN_BUDGET: usize = 32 * 1024 * 1024;
 /// Smallest run worth scheduling (one LevelDB block plus a few neighbours).
 const MIN_RUN_TARGET_BYTES: u64 = 32 * 1024;
@@ -1715,7 +1714,7 @@ mod tests {
                 size: 50,
             },
         ];
-        let runs = plan_block_runs(&blocks).expect("plan runs");
+        let runs = plan_block_runs(&blocks, RUN_TARGET_ENCODED_BYTES).expect("plan runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].block_count, 3);
         assert_eq!(runs[0].encoded_len, 365);
@@ -1733,7 +1732,7 @@ mod tests {
                 size: 100,
             },
         ];
-        let runs = plan_block_runs(&blocks).expect("plan runs");
+        let runs = plan_block_runs(&blocks, RUN_TARGET_ENCODED_BYTES).expect("plan runs");
         assert_eq!(runs.len(), 2);
     }
 
