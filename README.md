@@ -149,7 +149,14 @@ Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command
     属于噪声，不保留）。
 
   JE 侧读取路径、扫描策略与打包内核的对比数据在 `core/examples/`：
-  `read_bench`、`chunk_read_bench`、`je_read_bench`、`pack_bench`。
+  `read_bench`、`chunk_read_bench`、`je_read_bench`、`pack_bench`、`batch_bench`。
+
+  **测量口径（重要）**：上表是端到端耗时，两个转换器实际处理的区块数并不相同
+  （JE→BE：WorldPort 只转 6,968 个完全生成区块，Chunker 记录 7,312 个；BE→JE：
+  108,484 vs 111,744），因此应读作「同输入的实际耗时比」而不是「算法性能倍数」。
+  `scripts/bench.ps1` 现在报中位数墙钟 + 多次运行的最大峰值工作集，并标注
+  `PeakWorkingSet64` 是 Windows 工作集而非跨平台 RSS。做严格对比需要固定版本、
+  输入、目标格式、实际区块数与功能范围，且同机同负载连续运行。
 - ✅ M6 插件：
   - `native/` 实现 `bmcbl_native_entry` ABI（1.0）：单实例、64 KiB 命令 / 256 KiB 事件批次、
     事件环 + 序号 + gap 标记、`cancel_command` 直接置取消标志（不受命令队列阻塞）、
