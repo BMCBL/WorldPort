@@ -320,8 +320,6 @@ fn read_chunk(
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
     let (chunk, biome_data) = world.chunk_snapshot(pos)?;
     let biomes = biome_data.map(|data| data.storages);
-    let mut mapped_cache: BTreeMap<(String, Vec<(String, String)>), Option<MappedState>> =
-        BTreeMap::new();
     let mut sections: Vec<NbtTag> = Vec::new();
     let mut height_map_blocking = [0_i16; 256];
     let mut height_map_surface = [0_i16; 256];
@@ -401,7 +399,6 @@ fn read_chunk(
                             mapped = map_palette_state(
                                 mapper,
                                 report,
-                                &mut mapped_cache,
                                 &mut palette,
                                 state,
                                 liquid_index.is_some(),
@@ -576,7 +573,6 @@ fn read_chunk(
 fn map_palette_state(
     mapper: &BlockMapper,
     report: &mut ReportBuilder,
-    cache: &mut BTreeMap<(String, Vec<(String, String)>), Option<MappedState>>,
     palette: &mut Vec<NbtTag>,
     state: &bedrock_world::BlockState,
     waterlogged: bool,
@@ -598,31 +594,25 @@ fn map_palette_state(
     if waterlogged {
         properties.insert("waterlogged".to_string(), "true".to_string());
     }
-    let Some(je) = map_state(mapper, report, cache, &state.name, &properties, policy)? else {
-        return Ok(0);
+    let mapped = map_state(mapper, report, &state.name, &properties, policy)?;
+    Ok(push_palette(palette, mapped))
+}
+
+fn push_palette(palette: &mut Vec<NbtTag>, mapped: Option<MappedState>) -> u32 {
+    let Some(je) = mapped else {
+        return 0;
     };
     palette.push(palette_entry(&je));
-    Ok(u32::try_from(palette.len()).unwrap_or(u32::MAX))
+    u32::try_from(palette.len()).unwrap_or(u32::MAX)
 }
 
 fn map_state(
     mapper: &BlockMapper,
     report: &mut ReportBuilder,
-    cache: &mut BTreeMap<(String, Vec<(String, String)>), Option<MappedState>>,
     name: &str,
     properties: &BTreeMap<String, String>,
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<Option<MappedState>> {
-    let key = (
-        name.to_string(),
-        properties
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Vec<_>>(),
-    );
-    if let Some(mapped) = cache.get(&key) {
-        return Ok(mapped.clone());
-    }
     let mapped = mapper.be_to_je(name, properties);
     if mapped.is_none() {
         if policy == crate::convert::UnknownDataPolicy::Error {
@@ -635,7 +625,6 @@ fn map_state(
             format!("block {name} has no Java mapping; air was written"),
         );
     }
-    cache.insert(key, mapped.clone());
     Ok(mapped)
 }
 
