@@ -1,11 +1,12 @@
-//! Bakes the Java block catalog into a compact binary at compile time.
+//! Bakes every bundled Java block catalog into a compact binary at compile time.
 //!
-//! The source of truth stays `mappings/data/java/<version>/blocks.json.gz`, but
-//! the runtime never parses JSON: this build script reads it once, writes a
-//! length-prefixed binary, compresses it with LZ4 (block format, size prefix),
-//! and the crate embeds the result with `include_bytes!`. At runtime the blob is
-//! decompressed once into memory (see `mapping::schema`).
+//! `mappings/je_versions.json` lists the supported versions and their
+//! DataVersions. For each one this script reads
+//! `mappings/data/java/<version>/blocks.json.gz`, writes a length-prefixed
+//! binary, compresses it with LZ4 and emits a Rust table that embeds the blobs
+//! with `include_bytes!`. The runtime never parses JSON (see `mapping::schema`).
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -14,42 +15,69 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let root = manifest.parent().expect("workspace root");
-    let source = root.join("mappings/data/java/26.2/blocks.json.gz");
-    println!("cargo:rerun-if-changed={}", source.display());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let versions_file = root.join("mappings/je_versions.json");
+    println!("cargo:rerun-if-changed={}", versions_file.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    let payload = match fs::read(&source) {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    let versions: BTreeMap<String, i32> = match fs::read_to_string(&versions_file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    {
+        Some(versions) => versions,
+        None => {
             println!(
-                "cargo:warning=WorldPort: cannot read {} ({error}); Java catalogs will be unavailable",
-                source.display()
+                "cargo:warning=WorldPort: cannot read {}; Java catalogs will be unavailable",
+                versions_file.display()
             );
-            write_placeholder();
-            return;
+            BTreeMap::new()
         }
-    };
-    let mut json = String::new();
-    if let Err(error) = flate2::read::GzDecoder::new(payload.as_slice()).read_to_string(&mut json) {
-        println!("cargo:warning=WorldPort: gzip decode failed: {error}");
-        write_placeholder();
-        return;
-    }
-    let parsed: serde_json::Value = match serde_json::from_str(&json) {
-        Ok(value) => value,
-        Err(error) => {
-            println!("cargo:warning=WorldPort: blocks.json parse failed: {error}");
-            write_placeholder();
-            return;
-        }
-    };
-    let Some(blocks) = parsed.as_object() else {
-        println!("cargo:warning=WorldPort: blocks.json is not an object");
-        write_placeholder();
-        return;
     };
 
-    let mut binary = Vec::with_capacity(512 * 1024);
+    let mut table = String::from(
+        "/// `(version label, DataVersion, baked LZ4 blob)` for every bundled catalog.\n\
+         pub const JAVA_CATALOGS: &[(&str, i32, &[u8])] = &[\n",
+    );
+    let mut baked = 0_usize;
+    for (version, data_version) in &versions {
+        let source = root
+            .join("mappings/data/java")
+            .join(version)
+            .join("blocks.json.gz");
+        println!("cargo:rerun-if-changed={}", source.display());
+        let Some(binary) = bake(&source) else {
+            continue;
+        };
+        let compressed = lz4_flex::block::compress_prepend_size(&binary);
+        let slug = version.replace('.', "_");
+        let file = format!("java_catalog_{slug}.bin.lz4");
+        fs::write(out_dir.join(&file), &compressed).expect("write baked catalog");
+        table.push_str(&format!(
+            "    (\"{version}\", {data_version}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))),\n"
+        ));
+        baked += 1;
+        println!(
+            "cargo:warning=WorldPort: baked Java {version} -> {} bytes ({} compressed)",
+            binary.len(),
+            compressed.len()
+        );
+    }
+    table.push_str("];\n");
+    fs::write(out_dir.join("java_catalogs.rs"), table).expect("write catalog table");
+    if baked == 0 {
+        println!("cargo:warning=WorldPort: no Java block catalogs were baked");
+    }
+}
+
+fn bake(source: &Path) -> Option<Vec<u8>> {
+    let payload = fs::read(source).ok()?;
+    let mut json = String::new();
+    flate2::read::GzDecoder::new(payload.as_slice())
+        .read_to_string(&mut json)
+        .ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let blocks = parsed.as_object()?;
+    let mut binary = Vec::with_capacity(256 * 1024);
     binary.extend_from_slice(b"WPCB");
     binary.extend_from_slice(&u32::try_from(blocks.len()).unwrap_or(u32::MAX).to_le_bytes());
     for (name, block) in blocks {
@@ -96,33 +124,11 @@ fn main() {
             }
         }
     }
-
-    let compressed = lz4_flex::block::compress_prepend_size(&binary);
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    fs::write(out_dir.join("java_catalog_26_2.bin.lz4"), &compressed).expect("write baked catalog");
-    println!(
-        "cargo:warning=WorldPort: baked {} blocks -> {} bytes ({} compressed)",
-        blocks.len(),
-        binary.len(),
-        compressed.len()
-    );
+    Some(binary)
 }
 
 fn write_str(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
     out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_le_bytes());
     out.extend_from_slice(bytes);
-}
-
-fn write_placeholder() {
-    // Empty catalog: `WPCB` + zero blocks, still LZ4 framed so the reader path is identical.
-    let mut binary = Vec::new();
-    binary.extend_from_slice(b"WPCB");
-    binary.extend_from_slice(&0_u32.to_le_bytes());
-    let compressed = lz4_flex::block::compress_prepend_size(&binary);
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let _ = fs::create_dir_all(&out_dir);
-    fs::write(out_dir.join("java_catalog_26_2.bin.lz4"), compressed)
-        .expect("write placeholder catalog");
-    let _ = Path::new("");
 }

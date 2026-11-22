@@ -132,25 +132,100 @@ pub struct JavaCatalog {
     catalog: BlockCatalog,
 }
 
-impl JavaCatalog {
-    /// Loads the bundled Java catalog for a version label such as `26.2`.
-    pub fn bundled(version: &str) -> Result<&'static Self> {
-        // Two supported labels for now; add more as the mapping data grows.
-        static V26_2: OnceLock<Result<JavaCatalog>> = OnceLock::new();
-        match version {
-            "26.2" => V26_2
-                .get_or_init(|| {
-                    JavaCatalog::parse_baked(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/java_catalog_26_2.bin.lz4"
-                    )))
-                })
-                .as_ref()
-                .map_err(clone_error),
-            other => Err(WorldPortError::unsupported(format!(
-                "no bundled Java block catalog for version {other}"
-            ))),
+/// Every bundled catalog, parsed once.
+fn catalogs() -> &'static Vec<JavaCatalog> {
+    static CATALOGS: OnceLock<Vec<JavaCatalog>> = OnceLock::new();
+    CATALOGS.get_or_init(|| {
+        let mut catalogs = Vec::new();
+        for (version, data_version, blob) in baked::JAVA_CATALOGS {
+            match JavaCatalog::parse_baked(blob) {
+                Ok(mut catalog) => {
+                    catalog.version = (*version).to_string();
+                    catalog.data_version = *data_version;
+                    // Guard against incomplete source data: a catalog without the
+                    // basic blocks would prune legitimate terrain.
+                    if catalog.catalog.contains("minecraft:stone")
+                        && catalog.catalog.contains("minecraft:dirt")
+                    {
+                        catalogs.push(catalog);
+                    } else {
+                        tracing::warn!(
+                            %version,
+                            "bundled Java block catalog is incomplete and was ignored"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%version, %error, "bundled Java block catalog failed to load");
+                }
+            }
         }
+        catalogs.sort_by_key(|catalog| catalog.data_version);
+        catalogs
+    })
+}
+
+mod baked {
+    include!(concat!(env!("OUT_DIR"), "/java_catalogs.rs"));
+}
+
+impl JavaCatalog {
+    /// Loads the bundled catalog for an exact version label such as `1.21.4`.
+    pub fn bundled(version: &str) -> Result<&'static Self> {
+        catalogs()
+            .iter()
+            .find(|catalog| catalog.version == version)
+            .ok_or_else(|| {
+                WorldPortError::unsupported(format!(
+                    "no bundled Java block catalog for version {version}"
+                ))
+            })
+    }
+
+    /// Picks the closest bundled catalog for a DataVersion: an exact match when
+    /// present, otherwise the newest catalog not newer than the target.
+    pub fn for_data_version(data_version: i32) -> Result<&'static Self> {
+        let catalogs = catalogs();
+        let exact = catalogs
+            .iter()
+            .find(|catalog| catalog.data_version == data_version);
+        if let Some(catalog) = exact {
+            return Ok(catalog);
+        }
+        let at_or_below = catalogs
+            .iter()
+            .filter(|catalog| catalog.data_version <= data_version)
+            .max_by_key(|catalog| catalog.data_version);
+        at_or_below.or_else(|| catalogs.first()).ok_or_else(|| {
+            WorldPortError::unsupported("no bundled Java block catalogs are available")
+        })
+    }
+
+    /// Version labels bundled into this build, oldest first.
+    #[must_use]
+    pub fn bundled_versions() -> Vec<(&'static str, i32)> {
+        catalogs()
+            .iter()
+            .map(|catalog| (catalog.version.as_str(), catalog.data_version))
+            .collect()
+    }
+
+    /// Resolves a version label (`1.21.4`) or DataVersion string to a catalog.
+    pub fn for_version_or_data_version(value: &str) -> Result<&'static Self> {
+        let trimmed = value.trim();
+        if let Some(catalog) = catalogs()
+            .iter()
+            .find(|catalog| catalog.version == trimmed)
+        {
+            return Ok(catalog);
+        }
+        if let Ok(data_version) = trimmed.parse::<i32>() {
+            return Self::for_data_version(data_version);
+        }
+        Err(WorldPortError::unsupported(format!(
+            "unknown Java version {trimmed}; bundled: {:?}",
+            Self::bundled_versions()
+        )))
     }
 
     /// Decodes the compile-time baked catalog (`build.rs` → LZ4 + length-prefixed binary).
@@ -184,8 +259,8 @@ impl JavaCatalog {
             blocks.insert(name, BlockSchema { properties });
         }
         Ok(Self {
-            version: "26.2".to_string(),
-            data_version: 4903,
+            version: String::new(),
+            data_version: 0,
             catalog: BlockCatalog { blocks },
         })
     }
