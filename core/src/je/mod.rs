@@ -7,7 +7,7 @@ pub mod nbt;
 pub mod player;
 pub mod world;
 
-pub use world::{JavaWorld, WorldLayout};
+pub use world::{JavaWorld, RegionCache, WorldLayout};
 
 /// Java's three vanilla dimensions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
