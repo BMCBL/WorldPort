@@ -106,6 +106,11 @@ impl JavaTarget {
     fn map_dimension_string(&self) -> bool {
         self.data_version >= MAP_DIMENSION_STRING_DATA_VERSION
     }
+
+    /// Java stores POI regions under `<dimension>/poi/` for every layout.
+    fn poi_dir(&self, root: &Path, dimension: JeDimension) -> PathBuf {
+        self.dimension_dir(root, dimension).join("poi")
+    }
 }
 
 /// Converts a Bedrock world into a Java world.
@@ -151,6 +156,13 @@ pub fn convert(
     report.begin_stage("players");
     options.report(Progress::new("players", 0, None));
     let player_uuid = write_players(&plan.target, &world, &target, &mut report)?;
+    report.end_stage();
+
+    report.begin_stage("poi");
+    options.report(Progress::new("poi", 0, None));
+    if plan.features.village_interests {
+        write_poi(&plan.target, &world, &target, plan, &mut report)?;
+    }
     report.end_stage();
 
     report.begin_stage("level.dat");
@@ -953,6 +965,83 @@ fn uuid_string(uuid: [i32; 4]) -> String {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     )
+}
+
+/// Converts Bedrock village records into Java `poi/` region files.
+///
+/// Bedrock keeps interests per villager, Java per block position, so the
+/// conversion regroups and deduplicates them; see `poi::bedrock`.
+fn write_poi(
+    root: &Path,
+    world: &World,
+    target: &JavaTarget,
+    plan: &ConversionPlan,
+    report: &mut ReportBuilder,
+) -> Result<()> {
+    let villages = world.villages(Default::default())?;
+    if villages.is_empty() {
+        return Ok(());
+    }
+    let conversion = crate::poi::convert(&villages, plan.pruning.blocks, report)?;
+    if conversion.records() == 0 {
+        if conversion.unsupported > 0 {
+            report.warn(
+                WarningCode::Lossy,
+                "village-interests",
+                format!(
+                    "{} Bedrock interests have no Java POI type; no POI records were written",
+                    conversion.unsupported
+                ),
+            );
+        }
+        return Ok(());
+    }
+
+    // Bedrock village records do not carry a dimension: village keys are global
+    // and the interests inside a village are all in one dimension. The world's
+    // village data here is overworld-only, which matches where the records came
+    // from; interests outside the overworld would need a per-village dimension
+    // lookup that the Bedrock format does not store.
+    let poi_dir = target.poi_dir(root, JeDimension::Overworld);
+    crate::poi::java::ensure_dir(&poi_dir)?;
+
+    // Group chunk positions by region file so each region is written once.
+    let mut by_region: BTreeMap<(i32, i32), Vec<(u8, u8, crate::poi::PoiChunk)>> = BTreeMap::new();
+    for ((chunk_x, chunk_z), chunk) in &conversion.chunks {
+        let region_x = chunk_x.div_euclid(32);
+        let region_z = chunk_z.div_euclid(32);
+        let local_x = u8::try_from(chunk_x.rem_euclid(32)).unwrap_or(0);
+        let local_z = u8::try_from(chunk_z.rem_euclid(32)).unwrap_or(0);
+        by_region
+            .entry((region_x, region_z))
+            .or_default()
+            .push((local_x, local_z, chunk.clone()));
+    }
+    let compression = Compression::new(plan.compression_level.min(9));
+    for ((region_x, region_z), entries) in by_region {
+        crate::poi::java::validate_region_entries(&entries)?;
+        let path = crate::poi::java::region_path(&poi_dir, region_x, region_z);
+        crate::poi::java::write_region(&path, entries, target.data_version, compression)?;
+    }
+    report.counters().village_interests = conversion.written;
+    if conversion.unsupported > 0 {
+        report.warn(
+            WarningCode::Lossy,
+            "village-interests-unsupported",
+            format!(
+                "{} Bedrock interests (beehives, lodestones, lightning rods, portals) have no Java POI type",
+                conversion.unsupported
+            ),
+        );
+    }
+    if conversion.malformed > 0 {
+        report.warn(
+            WarningCode::Skipped,
+            "village-interests-malformed",
+            format!("{} village POI records could not be parsed", conversion.malformed),
+        );
+    }
+    Ok(())
 }
 
 fn write_java_level(

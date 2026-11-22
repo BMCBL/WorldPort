@@ -41,6 +41,8 @@ pub struct Features {
     pub ticks: bool,
     /// Per-chunk metadata such as hardcoded spawn areas.
     pub chunk_metadata: bool,
+    /// Village interests (beds, workstations, meeting points).
+    pub village_interests: bool,
 }
 
 impl Default for Features {
@@ -55,6 +57,7 @@ impl Default for Features {
             level_dat: true,
             ticks: true,
             chunk_metadata: true,
+            village_interests: true,
         }
     }
 }

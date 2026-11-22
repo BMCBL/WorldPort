@@ -398,6 +398,7 @@ fn features(features: &Features) -> CoreFeatures {
         level_dat: features.level_dat,
         ticks: features.ticks,
         chunk_metadata: features.chunk_metadata,
+        village_interests: features.village_interests,
     }
 }
 

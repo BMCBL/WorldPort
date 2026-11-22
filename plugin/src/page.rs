@@ -213,6 +213,11 @@ fn content_panel(state: &State) -> View {
                 "feature-ticks",
             ))),
     );
+    body = body.child(row().full_width().child(View::node(checkbox(
+        "村庄兴趣点（床 / 工作站 / 集合点）",
+        features.village_interests,
+        "feature-village-interests",
+    ))));
     body = body.child(compact_action(
         if state.show_advanced {
             "收起高级选项"

@@ -87,6 +87,65 @@ POI instance shapes:");
             }
         }
     }
+    // Meeting points: how many distinct positions vs how many villager listings.
+    let mut meeting_positions = std::collections::BTreeSet::new();
+    let mut meeting_listings = 0_usize;
+    let mut meeting_shapes = std::collections::BTreeMap::new();
+    for entry in &villages {
+        if entry.key.kind != VillageRecordKind::Poi {
+            continue;
+        }
+        for root in &entry.roots {
+            let Ok(villagers) = bedrock_world::village::parse_poi_record(root) else {
+                continue;
+            };
+            for villager in &villagers {
+                for instance in villager.live() {
+                    if instance.kind == Some(bedrock_world::village::InterestKind::MeetingPoint) {
+                        meeting_listings += 1;
+                        meeting_positions.insert(instance.position);
+                        *meeting_shapes
+                            .entry((instance.owner_count, instance.capacity))
+                            .or_insert(0usize) += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Bed semantics: a bed is claimed by one villager; check (owners,capacity).
+    let mut bed_shapes = std::collections::BTreeMap::new();
+    let mut bed_positions = std::collections::BTreeSet::new();
+    let mut bed_listings = 0_usize;
+    for entry in &villages {
+        if entry.key.kind != VillageRecordKind::Poi {
+            continue;
+        }
+        for root in &entry.roots {
+            let Ok(villagers) = bedrock_world::village::parse_poi_record(root) else {
+                continue;
+            };
+            for villager in &villagers {
+                for instance in villager.live() {
+                    if instance.kind == Some(bedrock_world::village::InterestKind::Bed) {
+                        bed_listings += 1;
+                        bed_positions.insert(instance.position);
+                        *bed_shapes
+                            .entry((instance.owner_count, instance.capacity))
+                            .or_insert(0usize) += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "beds: {bed_listings} listings, {} distinct positions, (owners,capacity) {bed_shapes:?}",
+        bed_positions.len()
+    );
+    println!(
+        "
+meeting: {meeting_listings} listings, {} distinct positions, (owners,capacity) {meeting_shapes:?}",
+        meeting_positions.len()
+    );
     println!("
 POI model: {live} live instances, {unmapped} unmapped");
     for (kind, count) in model_kinds {

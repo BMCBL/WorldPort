@@ -108,6 +108,8 @@ pub struct Counters {
     pub biome_cells: u64,
     /// Scheduled ticks written.
     pub ticks: u64,
+    /// Village interests (beds, workstations, meeting points) written.
+    pub village_interests: u64,
 }
 
 impl Counters {
@@ -122,6 +124,7 @@ impl Counters {
         self.sections += other.sections;
         self.biome_cells += other.biome_cells;
         self.ticks += other.ticks;
+        self.village_interests += other.village_interests;
     }
 }
 

@@ -436,6 +436,7 @@ fn handle_action(
         "feature-maps" => state.features.maps = value == "true",
         "feature-level-dat" => state.features.level_dat = value == "true",
         "feature-ticks" => state.features.ticks = value == "true",
+        "feature-village-interests" => state.features.village_interests = value == "true",
         "advanced" => state.show_advanced = !state.show_advanced,
         "jobs" => state.jobs = value.parse().unwrap_or(0),
         "compression" => state.compression = value.parse().unwrap_or(6),
@@ -476,6 +477,7 @@ fn handle_action(
                     "maps" => state.features.maps = target,
                     "level-dat" => state.features.level_dat = target,
                     "ticks" => state.features.ticks = target,
+                    "village-interests" => state.features.village_interests = target,
                     _ => return Ok(false),
                 }
             }
