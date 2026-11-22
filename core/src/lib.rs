@@ -19,6 +19,7 @@ pub mod map_item;
 pub mod mapping;
 pub mod nbt;
 pub mod player;
+pub mod poi;
 pub mod report;
 pub mod tick;
 
