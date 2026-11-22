@@ -93,6 +93,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         .build()
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted_chunks = 0_u64;
+    let mut interests = crate::poi::InterestInventory::default();
     let uid_counter = AtomicI64::new(1);
     let current_tick = world.total_ticks();
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
@@ -133,6 +134,13 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     output.put_actor(pos, uid, payload);
                 }
                 report.merge(outcome.report);
+                interests.total += outcome.interests.total;
+                for (name, count) in outcome.interests.by_name {
+                    *interests.by_name.entry(name).or_default() += count;
+                }
+                for (kind, count) in outcome.interests.by_kind {
+                    *interests.by_kind.entry(kind).or_default() += count;
+                }
                 if outcome.converted {
                     converted_chunks += 1;
                     report.counters().chunks += 1;
@@ -147,6 +155,13 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         }
     }
     output.flush()?;
+    report.end_stage();
+
+    report.begin_stage("village-interests");
+    options.report(Progress::new("village-interests", 0, None));
+    if plan.features.village_interests {
+        crate::poi::report_inventory(&interests, &mut report);
+    }
     report.end_stage();
 
     report.begin_stage("maps");
@@ -318,6 +333,8 @@ struct ChunkOutcome {
     actors: Vec<(ChunkPos, ActorUid, NbtTag)>,
     report: ReportBuilder,
     converted: bool,
+    /// Village-interest blocks found in this chunk.
+    interests: crate::poi::InterestInventory,
 }
 
 /// Per-chunk write buffer; the driver replays it into [`BedrockOutput`].
@@ -362,6 +379,7 @@ fn convert_position(
             actors: Vec::new(),
             report,
             converted: false,
+            interests: Default::default(),
         });
     };
     let summary = summarize(&chunk);
@@ -376,9 +394,11 @@ fn convert_position(
             actors: Vec::new(),
             report,
             converted: false,
+            interests: Default::default(),
         });
     }
     let mut sink = ChunkSink::default();
+    let mut interests = crate::poi::InterestInventory::default();
     convert_chunk(
         &mut sink,
         &mut report,
@@ -390,12 +410,14 @@ fn convert_position(
         uid_counter,
         current_tick,
         policy,
+        &mut interests,
     )?;
     Ok(ChunkOutcome {
         raw: sink.raw,
         actors: sink.actors,
         report,
         converted: true,
+        interests,
     })
 }
 
@@ -410,6 +432,7 @@ fn convert_chunk(
     uid_counter: &AtomicI64,
     current_tick: i64,
     policy: crate::convert::UnknownDataPolicy,
+    interests: &mut crate::poi::InterestInventory,
 ) -> Result<()> {
     let be_pos = ChunkPos {
         x: pos.x,
@@ -427,14 +450,22 @@ fn convert_chunk(
                 .get_int("Y")
                 .and_then(|value| i8::try_from(value).ok())
                 .unwrap_or(0);
-            if let Some(write) = convert_section(
+            let outcome = convert_section(
                 section,
                 y,
                 mapper,
                 &mut mapped_cache,
                 report,
                 policy,
-            )? {
+            )?;
+            interests.total += outcome.interests.total;
+            for (name, count) in outcome.interests.by_name {
+                *interests.by_name.entry(name).or_default() += count;
+            }
+            for (kind, count) in outcome.interests.by_kind {
+                *interests.by_kind.entry(kind).or_default() += count;
+            }
+            if let Some(write) = outcome.write {
                 sections.push(write);
             } else {
                 // Still record biomes for sections without blocks.
@@ -593,6 +624,13 @@ fn air_state() -> BlockState {
     }
 }
 
+/// Section conversion result: the storage write (when non-empty) plus the
+/// village-interest blocks found in the section.
+struct SectionOutcome {
+    write: Option<SectionWrite>,
+    interests: crate::poi::InterestInventory,
+}
+
 fn convert_section(
     section: &NbtTag,
     y: i8,
@@ -600,15 +638,24 @@ fn convert_section(
     cache: &mut BTreeMap<(String, Vec<(String, String)>), MappedState>,
     report: &mut ReportBuilder,
     policy: crate::convert::UnknownDataPolicy,
-) -> Result<Option<SectionWrite>> {
+) -> Result<SectionOutcome> {
     let Some(block_states) = section.get("block_states") else {
-        return Ok(None);
+        return Ok(SectionOutcome {
+            write: None,
+            interests: Default::default(),
+        });
     };
     let Some(palette) = block_states.get_list("palette") else {
-        return Ok(None);
+        return Ok(SectionOutcome {
+            write: None,
+            interests: Default::default(),
+        });
     };
     if palette.is_empty() {
-        return Ok(None);
+        return Ok(SectionOutcome {
+            write: None,
+            interests: Default::default(),
+        });
     }
     let entries: Vec<(String, BTreeMap<String, String>)> = palette
         .iter()
@@ -641,6 +688,14 @@ fn convert_section(
     let mut liquid_palette: Vec<BlockState> = vec![air_state(), water_state()];
     let mut liquid = vec![0_u16; SECTION_BLOCKS];
     let mut has_liquid = false;
+
+    // Village interests: classify each palette entry once, then weight by how
+    // many blocks use it. Bedrock rebuilds villages from loaded chunks, so the
+    // conversion only has to report what it left behind.
+    let mut interests = crate::poi::InterestInventory::default();
+    let mut interest_kinds: Vec<Option<crate::poi::BlockInterest>> =
+        entries.iter().map(|(name, _)| crate::poi::classify(name)).collect();
+    let mut palette_usage = vec![0_u32; entries.len()];
 
     let mut any_block = false;
     for x in 0..16_usize {
@@ -675,6 +730,9 @@ fn convert_section(
                     continue;
                 }
 
+                if let Some(usage) = palette_usage.get_mut(palette_index) {
+                    *usage = usage.saturating_add(1);
+                }
                 let waterlogged = properties.get("waterlogged").is_some_and(|value| value == "true");
                 let cache_key = (
                     name.clone(),
@@ -734,20 +792,38 @@ fn convert_section(
         }
     }
 
+    for (index, usage) in palette_usage.iter().enumerate() {
+        let Some(interest) = interest_kinds.get_mut(index).and_then(Option::take) else {
+            continue;
+        };
+        for _ in 0..*usage {
+            interests.record(interest);
+        }
+    }
+
     if !any_block && !has_liquid {
-        return Ok(None);
+        return Ok(SectionOutcome {
+            write: None,
+            interests,
+        });
     }
     let Some(biomes) = convert_biomes(section) else {
-        return Ok(None);
+        return Ok(SectionOutcome {
+            write: None,
+            interests,
+        });
     };
-    Ok(Some(SectionWrite {
-        y,
-        primary,
-        primary_palette,
-        liquid: has_liquid.then_some(liquid),
-        liquid_palette,
-        biomes,
-    }))
+    Ok(SectionOutcome {
+        write: Some(SectionWrite {
+            y,
+            primary,
+            primary_palette,
+            liquid: has_liquid.then_some(liquid),
+            liquid_palette,
+            biomes,
+        }),
+        interests,
+    })
 }
 
 fn convert_biomes(section: &NbtTag) -> Option<[u32; 64]> {
