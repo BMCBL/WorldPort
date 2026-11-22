@@ -4,7 +4,7 @@
 //! `level.dat`. Entities, players, maps and ticks follow in M3.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bedrock_nbt::NbtTag;
 use bedrock_world::world::{OpenOptions, World};

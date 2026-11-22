@@ -11,6 +11,26 @@
 //!
 //! `waterlogged` never crosses the boundary as a state: Bedrock stores the fluid
 //! in a second block layer, so the chunk writer consumes it instead.
+//!
+//! # Mapping references
+//!
+//! Orientation rules follow the vanilla block-state semantics as encoded by two
+//! independent MIT references, so they are not guessed:
+//!
+//! - Chunker's `BedrockStateTypes` / `BedrockStateGroups` (Hive Games): the
+//!   authoritative tables for `FACING_DIRECTION_LEGACY` (0=down, 1=up,
+//!   2=north, 3=south, 4=west, 5=east), `WEIRDO_DIRECTION` (0=east, 1=west,
+//!   2=south, 3=north), `FLIPPED_FACING_DIRECTION` (pistons, end rods),
+//!   `CARDINAL_DIRECTION_LEGACY` (0=south, 1=west, 2=north, 3=east),
+//!   `CARDINAL_DIRECTION_LEGACY_INVERTED` (decorated pot),
+//!   `CARDINAL_DIRECTION_DOOR` (Java facing rotated one step), `DOOR_DIRECTION`,
+//!   `HINGE`/`HALF`, `BUTTON`, `LEVER_DIRECTION_POWER` and `CORNER`.
+//! - Minecraft Wiki block-state pages for the same properties (Bedrock
+//!   `weirdo_direction` = the side the full block sits on, etc.).
+//!
+//! Known gaps that need in-game confirmation: skull/banner dye data lives in
+//! block-entity NBT (M3), potted plants have no per-plant Bedrock id, and
+//! pistons cannot store `extended` (Bedrock derives it from the arm block).
 
 use std::collections::BTreeMap;
 
@@ -340,11 +360,18 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
     let get = |key: &str| properties.get(key).map(String::as_str);
 
     // Doors: Bedrock keeps `upper_block_bit`/`door_hinge_bit`; oak uses `wooden_door`.
+    // `cardinal_direction` is rotated one quarter-turn from Java facing, and both
+    // the 1.21.60+ and legacy properties are emitted so the schema keeps the right one.
     if short.ends_with("_door") {
         let target = if short == "oak_door" { "wooden_door" } else { short };
         let mut mapped = MappedState::new(namespaced(target));
         if let Some(facing) = get("facing") {
-            mapped = mapped.with("minecraft:cardinal_direction", facing);
+            if let Some(cardinal) = door_cardinal_to_string(facing) {
+                mapped = mapped.with("minecraft:cardinal_direction", cardinal);
+            }
+            if let Some(legacy) = door_direction_number(facing) {
+                mapped = mapped.with("direction", legacy);
+            }
         }
         mapped = mapped.with("upper_block_bit", bit(get("half") == Some("upper")));
         mapped = mapped.with("door_hinge_bit", bit(get("hinge") == Some("right")));
@@ -356,8 +383,8 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
     if short.ends_with("_trapdoor") {
         let target = if short == "oak_trapdoor" { "trapdoor" } else { short };
         let mut mapped = MappedState::new(namespaced(target));
-        if let Some(facing) = get("facing").and_then(cardinal_direction_number) {
-            mapped = mapped.with("direction", facing);
+        if let Some(direction) = get("facing").and_then(weirdo_direction_number) {
+            mapped = mapped.with("direction", direction);
         }
         mapped = mapped.with("upside_down_bit", bit(get("half") == Some("top")));
         mapped = mapped.with("open_bit", bit(get("open") == Some("true")));
@@ -370,6 +397,9 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         let mut mapped = MappedState::new(namespaced(target));
         if let Some(facing) = get("facing") {
             mapped = mapped.with("minecraft:cardinal_direction", facing);
+            if let Some(legacy) = cardinal_legacy_to_number(facing) {
+                mapped = mapped.with("direction", legacy);
+            }
         }
         mapped = mapped.with("in_wall_bit", bit(get("in_wall") == Some("true")));
         mapped = mapped.with("open_bit", bit(get("open") == Some("true")));
@@ -401,6 +431,66 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
     if short.ends_with("_slab") && get("type") == Some("double") {
         let base = short.strip_suffix("_slab")?;
         return Some(MappedState::new(namespaced(&format!("{base}_double_slab"))));
+    }
+
+    // Pistons and end rods mirror the horizontal facing in Bedrock.
+    if matches!(short, "piston" | "sticky_piston" | "piston_head" | "moving_piston") {
+        let target = match short {
+            "piston_head" => "piston_arm_collision",
+            "moving_piston" => "moving_block",
+            other => other,
+        };
+        let mut mapped = MappedState::new(namespaced(target));
+        if let Some(direction) = get("facing").and_then(flipped_facing_to_number) {
+            mapped = mapped.with("facing_direction", direction);
+        }
+        return Some(mapped.lossy());
+    }
+    if short == "end_rod" {
+        let mut mapped = MappedState::new("minecraft:end_rod");
+        if let Some(direction) = get("facing").and_then(flipped_facing_to_number) {
+            mapped = mapped.with("facing_direction", direction);
+        }
+        return Some(mapped);
+    }
+    if short == "hopper" {
+        let mut mapped = MappedState::new("minecraft:hopper");
+        if let Some(direction) = get("facing").and_then(hopper_facing_number) {
+            mapped = mapped.with("facing_direction", direction);
+        }
+        mapped = mapped.with("toggle_bit", bit(get("enabled") != Some("false")));
+        return Some(mapped.lossy());
+    }
+    if short == "fire" || short == "soul_fire" {
+        let mut mapped = MappedState::new(namespaced(short));
+        mapped = mapped.with("age", get("age").unwrap_or("0"));
+        for key in ["east", "north", "south", "up", "west"] {
+            mapped = mapped.with(
+                format!("minecraft:connection_{key}"),
+                bit(get(key) == Some("true")),
+            );
+            mapped = mapped.with(key, bit(get(key) == Some("true")));
+        }
+        return Some(mapped.lossy());
+    }
+    if short == "lever" {
+        let mut mapped = MappedState::new("minecraft:lever");
+        if let Some(direction) = lever_direction(
+            get("face").unwrap_or("wall"),
+            get("facing").unwrap_or("north"),
+        ) {
+            mapped = mapped.with("lever_direction", direction);
+        }
+        mapped = mapped.with("open_bit", bit(get("powered") == Some("true")));
+        return Some(mapped.lossy());
+    }
+    if short == "decorated_pot" {
+        let mut mapped = MappedState::new("minecraft:decorated_pot");
+        if let Some(direction) = get("facing").and_then(pot_direction_number) {
+            mapped = mapped.with("direction", direction);
+        }
+        mapped = mapped.with("cracked", bit(get("cracked") == Some("true")));
+        return Some(mapped);
     }
 
     // Light blocks encode the level in the identifier.
@@ -502,11 +592,15 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
     // Java's `facing`; Bedrock has no shape state.
     if short.ends_with("_stairs") {
         let mut mapped = MappedState::new(namespaced(short));
-        if let Some(direction) = get("facing").and_then(stairs_direction_number) {
+        if let Some(direction) = get("facing").and_then(weirdo_direction_number) {
             mapped = mapped.with("weirdo_direction", direction);
         }
         if let Some(half) = get("half") {
             mapped = mapped.with("upside_down_bit", bit(half == "top"));
+        }
+        if let Some(shape) = get("shape") {
+            // 1.26.50+ stores the shape; older targets drop it in `fit_to_schema`.
+            mapped = mapped.with("minecraft:corner", corner_from_shape(shape));
         }
         return Some(mapped.lossy());
     }
@@ -543,7 +637,12 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
             } else {
                 "unpowered_repeater"
             }));
-            mapped = mapped.with("minecraft:cardinal_direction", get("facing")?);
+            if let Some(facing) = get("facing") {
+                mapped = mapped.with("minecraft:cardinal_direction", facing);
+                if let Some(legacy) = cardinal_legacy_to_number(facing) {
+                    mapped = mapped.with("direction", legacy);
+                }
+            }
             let delay = get("delay")
                 .and_then(|delay| delay.parse::<i32>().ok())
                 .unwrap_or(1);
@@ -557,7 +656,12 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
             } else {
                 "unpowered_comparator"
             }));
-            mapped = mapped.with("minecraft:cardinal_direction", get("facing")?);
+            if let Some(facing) = get("facing") {
+                mapped = mapped.with("minecraft:cardinal_direction", facing);
+                if let Some(legacy) = cardinal_legacy_to_number(facing) {
+                    mapped = mapped.with("direction", legacy);
+                }
+            }
             mapped = mapped.with(
                 "output_subtract_bit",
                 bit(get("mode") == Some("subtract")),
@@ -721,6 +825,79 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         return Some(mapped);
     }
 
+    // Stairs: corner state (1.26.50+) and weirdo_direction.
+    if short.ends_with("_stairs") {
+        let mut mapped = MappedState::new(namespaced(short));
+        if let Some(facing) = get("weirdo_direction").and_then(weirdo_direction_from_number) {
+            mapped = mapped.with("facing", facing);
+        }
+        mapped = mapped.with(
+            "half",
+            if get("upside_down_bit") == Some("1") { "top" } else { "bottom" },
+        );
+        mapped = mapped.with("shape", shape_from_corner(get("minecraft:corner").unwrap_or("none")));
+        mapped = mapped.with("waterlogged", bool_str(get("waterlogged") == Some("1")));
+        return Some(mapped.lossy());
+    }
+
+    // Pistons and end rods mirror the horizontal facing on the Bedrock side.
+    if matches!(short, "piston" | "sticky_piston" | "piston_arm_collision" | "moving_block") {
+        let mut mapped = MappedState::new(namespaced(short));
+        if let Some(facing) = get("facing_direction").and_then(flipped_facing_from_number) {
+            mapped = mapped.with("facing", facing);
+        }
+        mapped = mapped.with("extended", "false");
+        return Some(mapped.lossy());
+    }
+    if short == "end_rod" {
+        let mut mapped = MappedState::new("minecraft:end_rod");
+        if let Some(facing) = get("facing_direction").and_then(flipped_facing_from_number) {
+            mapped = mapped.with("facing", facing);
+        }
+        return Some(mapped);
+    }
+    if short == "hopper" {
+        let mut mapped = MappedState::new("minecraft:hopper");
+        let facing = match get("facing_direction") {
+            Some("0" | "1") | None => "down",
+            Some("2") => "north",
+            Some("3") => "south",
+            Some("4") => "west",
+            Some("5") => "east",
+            Some(_) => "down",
+        };
+        mapped = mapped.with("facing", facing);
+        mapped = mapped.with("enabled", bool_str(get("toggle_bit") != Some("1")));
+        return Some(mapped.lossy());
+    }
+    if short == "fire" || short == "soul_fire" {
+        let mut mapped = MappedState::new(namespaced(short));
+        mapped = mapped.with("age", get("age").unwrap_or("0"));
+        for key in ["east", "north", "south", "up", "west"] {
+            let namespaced_key = format!("minecraft:connection_{key}");
+            let value = get(&namespaced_key).or_else(|| get(key)).unwrap_or("0");
+            mapped = mapped.with(key, number_to_bool(value));
+        }
+        return Some(mapped.lossy());
+    }
+    if short == "lever" {
+        let mut mapped = MappedState::new("minecraft:lever");
+        if let Some((face, facing)) = get("lever_direction").and_then(lever_from_direction) {
+            mapped = mapped.with("face", face);
+            mapped = mapped.with("facing", facing);
+        }
+        mapped = mapped.with("powered", number_to_bool(get("open_bit").unwrap_or("0")));
+        return Some(mapped.lossy());
+    }
+    if short == "decorated_pot" {
+        let mut mapped = MappedState::new("minecraft:decorated_pot");
+        if let Some(facing) = get("direction").and_then(pot_direction_from_number) {
+            mapped = mapped.with("facing", facing);
+        }
+        mapped = mapped.with("cracked", number_to_bool(get("cracked").unwrap_or("0")));
+        return Some(mapped);
+    }
+
     match short {
         "trip_wire" => {
             let mut mapped = MappedState::new("minecraft:tripwire");
@@ -771,10 +948,12 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         }
         "unpowered_repeater" | "powered_repeater" => {
             let mut mapped = MappedState::new("minecraft:repeater");
-            mapped = mapped.with(
-                "facing",
-                get("minecraft:cardinal_direction").or_else(|| get("direction"))?,
-            );
+            let facing = if let Some(cardinal) = get("minecraft:cardinal_direction") {
+                cardinal
+            } else {
+                get("direction").and_then(cardinal_legacy_from_number)?
+            };
+            mapped = mapped.with("facing", facing);
             let delay = get("repeater_delay")
                 .and_then(|delay| delay.parse::<i32>().ok())
                 .unwrap_or(0);
@@ -785,10 +964,12 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         }
         "unpowered_comparator" | "powered_comparator" => {
             let mut mapped = MappedState::new("minecraft:comparator");
-            mapped = mapped.with(
-                "facing",
-                get("minecraft:cardinal_direction").or_else(|| get("direction"))?,
-            );
+            let facing = if let Some(cardinal) = get("minecraft:cardinal_direction") {
+                cardinal
+            } else {
+                get("direction").and_then(cardinal_legacy_from_number)?
+            };
+            mapped = mapped.with("facing", facing);
             mapped = mapped.with(
                 "mode",
                 if get("output_subtract_bit") == Some("1") {
@@ -952,7 +1133,12 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         | "waxed_copper_door" | "waxed_exposed_copper_door" | "waxed_weathered_copper_door"
         | "waxed_oxidized_copper_door" => {
             let mut mapped = MappedState::new(namespaced(short));
-            if let Some(facing) = get("minecraft:cardinal_direction").or_else(|| get("direction")) {
+            let facing = if let Some(cardinal) = get("minecraft:cardinal_direction") {
+                door_cardinal_from_string(cardinal)
+            } else {
+                get("direction").and_then(door_direction_from_number)
+            };
+            if let Some(facing) = facing {
                 mapped = mapped.with("facing", facing);
             }
             mapped = mapped.with(
@@ -975,7 +1161,7 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         | "waxed_exposed_copper_trapdoor" | "waxed_weathered_copper_trapdoor"
         | "waxed_oxidized_copper_trapdoor" => {
             let mut mapped = MappedState::new(namespaced(short));
-            if let Some(facing) = get("direction").and_then(cardinal_from_number) {
+            if let Some(facing) = get("direction").and_then(weirdo_direction_from_number) {
                 mapped = mapped.with("facing", facing);
             }
             mapped = mapped.with(
@@ -991,7 +1177,12 @@ fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         | "cherry_fence_gate" | "bamboo_fence_gate" | "crimson_fence_gate"
         | "warped_fence_gate" | "pale_oak_fence_gate" => {
             let mut mapped = MappedState::new(namespaced(short));
-            if let Some(facing) = get("minecraft:cardinal_direction").or_else(|| get("direction")) {
+            let facing = if let Some(cardinal) = get("minecraft:cardinal_direction") {
+                Some(cardinal)
+            } else {
+                get("direction").and_then(cardinal_legacy_from_number)
+            };
+            if let Some(facing) = facing {
                 mapped = mapped.with("facing", facing);
             }
             mapped = mapped.with("in_wall", bool_str(get("in_wall_bit") == Some("1")));
@@ -1318,13 +1509,198 @@ fn half_to_target(target: &str, value: &str) -> String {
     }
 }
 
-fn stairs_direction_number(facing: &str) -> Option<&'static str> {
+fn weirdo_direction_number(facing: &str) -> Option<&'static str> {
     // weirdo_direction is the side the full block sits on: 0=east 1=west 2=south 3=north.
     match facing {
         "east" => Some("0"),
         "west" => Some("1"),
         "south" => Some("2"),
         "north" => Some("3"),
+        _ => None,
+    }
+}
+
+/// `weirdo_direction` / trapdoor `direction` is the side the full block sits on.
+fn weirdo_direction_from_number(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("east"),
+        "1" => Some("west"),
+        "2" => Some("south"),
+        "3" => Some("north"),
+        _ => None,
+    }
+}
+
+/// Piston and end-rod `facing_direction` are horizontally mirrored versus the
+/// plain FACING_ALL order (verified against Chunker's `FLIPPED_FACING_DIRECTION`).
+fn flipped_facing_to_number(facing: &str) -> Option<&'static str> {
+    match facing {
+        "down" => Some("0"),
+        "up" => Some("1"),
+        "south" => Some("2"),
+        "north" => Some("3"),
+        "east" => Some("4"),
+        "west" => Some("5"),
+        _ => None,
+    }
+}
+
+fn flipped_facing_from_number(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("down"),
+        "1" => Some("up"),
+        "2" => Some("south"),
+        "3" => Some("north"),
+        "4" => Some("east"),
+        "5" => Some("west"),
+        _ => None,
+    }
+}
+
+/// Doors rotate `cardinal_direction` one quarter-turn from Java's `facing`
+/// (Chunker `CARDINAL_DIRECTION_DOOR`): Java north is Bedrock east.
+fn door_cardinal_to_string(facing: &str) -> Option<&'static str> {
+    match facing {
+        "north" => Some("east"),
+        "east" => Some("south"),
+        "south" => Some("west"),
+        "west" => Some("north"),
+        _ => None,
+    }
+}
+
+fn door_cardinal_from_string(value: &str) -> Option<&'static str> {
+    match value {
+        "east" => Some("north"),
+        "south" => Some("east"),
+        "west" => Some("south"),
+        "north" => Some("west"),
+        _ => None,
+    }
+}
+
+/// Legacy door `direction` (0..3) per Chunker `DOOR_DIRECTION`.
+fn door_direction_number(facing: &str) -> Option<&'static str> {
+    match facing {
+        "east" => Some("0"),
+        "south" => Some("1"),
+        "west" => Some("2"),
+        "north" => Some("3"),
+        _ => None,
+    }
+}
+
+fn door_direction_from_number(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("east"),
+        "1" => Some("south"),
+        "2" => Some("west"),
+        "3" => Some("north"),
+        _ => None,
+    }
+}
+
+/// Legacy `direction` (0..3) used by repeaters, comparators, fence gates and
+/// end portal frames: 0=south 1=west 2=north 3=east.
+fn cardinal_legacy_to_number(facing: &str) -> Option<&'static str> {
+    match facing {
+        "south" => Some("0"),
+        "west" => Some("1"),
+        "north" => Some("2"),
+        "east" => Some("3"),
+        _ => None,
+    }
+}
+
+fn cardinal_legacy_from_number(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("south"),
+        "1" => Some("west"),
+        "2" => Some("north"),
+        "3" => Some("east"),
+        _ => None,
+    }
+}
+
+/// Decorated pots use the inverted cardinal order: 0=north 1=east 2=south 3=west.
+fn pot_direction_number(facing: &str) -> Option<&'static str> {
+    match facing {
+        "north" => Some("0"),
+        "east" => Some("1"),
+        "south" => Some("2"),
+        "west" => Some("3"),
+        _ => None,
+    }
+}
+
+fn pot_direction_from_number(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("north"),
+        "1" => Some("east"),
+        "2" => Some("south"),
+        "3" => Some("west"),
+        _ => None,
+    }
+}
+
+/// Bedrock 1.26.50+ stores the stair shape as `minecraft:corner`.
+fn corner_from_shape(shape: &str) -> &'static str {
+    match shape {
+        "inner_left" => "inner_left",
+        "inner_right" => "inner_right",
+        "outer_left" => "outer_left",
+        "outer_right" => "outer_right",
+        _ => "none",
+    }
+}
+
+fn shape_from_corner(corner: &str) -> &'static str {
+    match corner {
+        "inner_left" => "inner_left",
+        "inner_right" => "inner_right",
+        "outer_left" => "outer_left",
+        "outer_right" => "outer_right",
+        _ => "straight",
+    }
+}
+
+/// Hopper `facing_direction`: 0 and 1 both mean "down".
+fn hopper_facing_number(facing: &str) -> Option<&'static str> {
+    match facing {
+        "down" => Some("0"),
+        "north" => Some("2"),
+        "south" => Some("3"),
+        "west" => Some("4"),
+        "east" => Some("5"),
+        _ => None,
+    }
+}
+
+/// Lever directions (Bedrock 1.13+ `lever_direction`) and their Java face/facing.
+fn lever_from_direction(direction: &str) -> Option<(&'static str, &'static str)> {
+    match direction {
+        "down_east_west" => Some(("ceiling", "east")),
+        "east" => Some(("wall", "east")),
+        "west" => Some(("wall", "west")),
+        "south" => Some(("wall", "south")),
+        "north" => Some(("wall", "north")),
+        "up_east_west" => Some(("floor", "east")),
+        "down_north_south" => Some(("ceiling", "north")),
+        "up_north_south" => Some(("floor", "north")),
+        _ => None,
+    }
+}
+
+fn lever_direction(face: &str, facing: &str) -> Option<&'static str> {
+    match (face, facing) {
+        ("ceiling", "east") => Some("down_east_west"),
+        ("ceiling", "north") => Some("down_north_south"),
+        ("floor", "east") => Some("up_east_west"),
+        ("floor", "north") => Some("up_north_south"),
+        ("wall", "east") => Some("east"),
+        ("wall", "west") => Some("west"),
+        ("wall", "south") => Some("south"),
+        ("wall", "north") => Some("north"),
         _ => None,
     }
 }
@@ -1373,6 +1749,11 @@ fn facing_from_bedrock_number(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Bedrock states that exist in the game but are missing from the embedded
+/// catalog sample (`bedrock-samples` 1.26.60 does not list the stair corner yet,
+/// while 1.26.50+ writes it).
+const CATALOG_GAPS: &[&str] = &["minecraft:corner"];
+
 /// Drops undeclared properties and fills required ones with the schema default.
 fn fit_to_schema(mut mapped: MappedState, target: &BlockCatalog) -> MappedState {
     let Some(schema) = target.block(&mapped.name) else {
@@ -1385,7 +1766,9 @@ fn fit_to_schema(mut mapped: MappedState, target: &BlockCatalog) -> MappedState 
         return mapped;
     }
     let before = mapped.properties.len();
-    mapped.properties.retain(|key, _| declared.contains_key(key));
+    mapped
+        .properties
+        .retain(|key, _| declared.contains_key(key) || CATALOG_GAPS.contains(&key.as_str()));
     if mapped.properties.len() != before {
         mapped.lossy = true;
     }
@@ -1532,7 +1915,8 @@ mod tests {
     }
 
     #[test]
-    fn oak_door_maps_to_wooden_door() {
+    fn oak_door_maps_to_wooden_door_with_rotated_cardinal() {
+        // Chunker CARDINAL_DIRECTION_DOOR: Java east is Bedrock south.
         let mapped = mapper()
             .je_to_be(
                 "minecraft:oak_door",
@@ -1548,8 +1932,12 @@ mod tests {
         assert_eq!(mapped.name, "minecraft:wooden_door");
         assert_eq!(
             mapped.properties.get("minecraft:cardinal_direction").map(String::as_str),
-            Some("east")
+            Some("south")
         );
+        // The 1.26.60 door schema only declares the cardinal property, so the
+        // legacy `direction` candidate is filtered out; the helper still maps
+        // Java east to legacy 0 for older targets (DOOR_DIRECTION: 0=east).
+        assert_eq!(door_direction_number("east"), Some("0"));
         assert_eq!(
             mapped.properties.get("upper_block_bit").map(String::as_str),
             Some("1")
@@ -1558,6 +1946,173 @@ mod tests {
             mapped.properties.get("door_hinge_bit").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn door_orientation_round_trips() {
+        let mapper = mapper();
+        for facing in ["north", "east", "south", "west"] {
+            let be = mapper
+                .je_to_be(
+                    "minecraft:oak_door",
+                    &props(&[
+                        ("facing", facing),
+                        ("half", "lower"),
+                        ("hinge", "left"),
+                        ("open", "false"),
+                    ]),
+                )
+                .expect("door maps");
+            let cardinal = be
+                .properties
+                .get("minecraft:cardinal_direction")
+                .cloned()
+                .unwrap_or_else(|| "north".to_string());
+            let back = mapper
+                .be_to_je(
+                    &be.name,
+                    &props(&[
+                        ("minecraft:cardinal_direction", &cardinal),
+                        ("upper_block_bit", "0"),
+                        ("door_hinge_bit", "0"),
+                        ("open_bit", "0"),
+                    ]),
+                )
+                .expect("door maps back");
+            assert_eq!(
+                back.properties.get("facing").map(String::as_str),
+                Some(facing),
+                "door facing must survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn trapdoor_uses_weirdo_direction() {
+        let mapper = mapper();
+        let be = mapper
+            .je_to_be(
+                "minecraft:oak_trapdoor",
+                &props(&[("facing", "north"), ("half", "bottom"), ("open", "false")]),
+            )
+            .expect("trapdoor maps");
+        assert_eq!(be.name, "minecraft:trapdoor");
+        assert_eq!(be.properties.get("direction").map(String::as_str), Some("3"));
+        let back = mapper
+            .be_to_je("minecraft:trapdoor", &props(&[("direction", "3")]))
+            .expect("trapdoor maps back");
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("north"));
+    }
+
+    #[test]
+    fn piston_facing_is_horizontally_flipped() {
+        let mapper = mapper();
+        let be = mapper
+            .je_to_be(
+                "minecraft:piston",
+                &props(&[("facing", "east"), ("extended", "false")]),
+            )
+            .expect("piston maps");
+        assert_eq!(
+            be.properties.get("facing_direction").map(String::as_str),
+            Some("4")
+        );
+        let back = mapper
+            .be_to_je("minecraft:piston", &props(&[("facing_direction", "4")]))
+            .expect("piston maps back");
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("east"));
+    }
+
+    #[test]
+    fn end_rod_flips_horizontals() {
+        let mapper = mapper();
+        let be = mapper
+            .je_to_be("minecraft:end_rod", &props(&[("facing", "north")]))
+            .expect("end rod maps");
+        assert_eq!(
+            be.properties.get("facing_direction").map(String::as_str),
+            Some("3")
+        );
+        let back = mapper
+            .be_to_je("minecraft:end_rod", &props(&[("facing_direction", "3")]))
+            .expect("end rod maps back");
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("north"));
+    }
+
+    #[test]
+    fn stairs_corner_maps_to_shape() {
+        let mapper = mapper();
+        let be = mapper
+            .je_to_be(
+                "minecraft:oak_stairs",
+                &props(&[("facing", "north"), ("half", "bottom"), ("shape", "inner_left")]),
+            )
+            .expect("stairs map");
+        assert_eq!(
+            be.properties.get("minecraft:corner").map(String::as_str),
+            Some("inner_left")
+        );
+        let back = mapper
+            .be_to_je(
+                "minecraft:oak_stairs",
+                &props(&[
+                    ("weirdo_direction", "3"),
+                    ("upside_down_bit", "0"),
+                    ("minecraft:corner", "inner_left"),
+                ]),
+            )
+            .expect("stairs map back");
+        assert_eq!(back.properties.get("shape").map(String::as_str), Some("inner_left"));
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("north"));
+    }
+
+    #[test]
+    fn lever_direction_round_trips() {
+        let mapper = mapper();
+        let be = mapper
+            .je_to_be(
+                "minecraft:lever",
+                &props(&[("face", "wall"), ("facing", "west"), ("powered", "true")]),
+            )
+            .expect("lever maps");
+        assert_eq!(
+            be.properties.get("lever_direction").map(String::as_str),
+            Some("west")
+        );
+        assert_eq!(be.properties.get("open_bit").map(String::as_str), Some("1"));
+        let back = mapper
+            .be_to_je(
+                "minecraft:lever",
+                &props(&[("lever_direction", "west"), ("open_bit", "1")]),
+            )
+            .expect("lever maps back");
+        assert_eq!(back.properties.get("face").map(String::as_str), Some("wall"));
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("west"));
+        assert_eq!(back.properties.get("powered").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn legacy_repeater_direction_starts_at_south() {
+        let mapper = mapper();
+        let back = mapper
+            .be_to_je(
+                "minecraft:unpowered_repeater",
+                &props(&[("direction", "0"), ("repeater_delay", "0")]),
+            )
+            .expect("legacy repeater maps");
+        assert_eq!(back.properties.get("facing").map(String::as_str), Some("south"));
+        assert_eq!(back.properties.get("delay").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn hopper_treats_both_legacy_down_values_as_down() {
+        let mapper = mapper();
+        for value in ["0", "1"] {
+            let back = mapper
+                .be_to_je("minecraft:hopper", &props(&[("facing_direction", value)]))
+                .expect("hopper maps");
+            assert_eq!(back.properties.get("facing").map(String::as_str), Some("down"));
+        }
     }
 
     #[test]

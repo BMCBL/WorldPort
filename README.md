@@ -65,7 +65,13 @@ cargo build --profile native-release -p worldport-cli
   `inspect`/`nbt`/`chunk` 工具。
 - ✅ M1：JE→BE 地形、生物群系、`level.dat`（种子/出生点/时间/天气/游戏规则）、
   v9 子区块与含水液体层；在提供的调试世界上端到端跑通。
-- ⏳ M2：BE→JE 地形 + 语义对比工具。
+- ✅ 映射表在**编译期**烘焙成紧凑二进制（8.2 MB JSON → 99 KB 二进制 → 15.8 KB LZ4），
+  运行时一次性解压进内存，不再解析 JSON（见 `core/build.rs`）。
+- ✅ M2：BE→JE 地形、群系、`level.dat`（26.x 分离式数据回写）+ `compare` 语义对比工具；
+  回环实测：群系 0 差异、方块状态 96.9% 完全一致（差异集中在 Bedrock 不存储的墙连接、
+  方块实体槽位等已知项）。
+- ✅ 朝向映射按官方 wiki 语义 + Chunker 的 `BedrockStateTypes` 取值表校正（门旋转 90°、
+  活板门 weirdo_direction、活塞/末地烛水平翻转、楼梯 corner、拉杆/中继器旧版 direction）。
 - ⏳ M3：实体/物品/玩家/地图/tick。
 - ⏳ M4：版本升降级与剔除。
 - ⏳ M5：性能对比（同一输入跑 Chunker CLI）。
@@ -73,7 +79,9 @@ cargo build --profile native-release -p worldport-cli
 
 ## 数据与许可
 
-- [Chunker](https://github.com/HiveGamesOSS/Chunker)（MIT）：转换流程参考、生物群系 ID 表。
+- [Chunker](https://github.com/HiveGamesOSS/Chunker)（MIT)：转换流程参考、生物群系 ID 表、
+  方块朝向/状态取值表（`BedrockStateTypes`/`BedrockStateGroups`，与官方 wiki 语义一致）。
+- [Minecraft Wiki](https://minecraft.wiki)：Bedrock/Java 方块状态与 `weirdo_direction` 等语义校验。
 - Mojang `bedrock-samples`：Bedrock 方块状态清单（经 `bedrock-world` 内置 schema）。
 - `misode/mcmeta`：Java 版方块注册表（`mappings/data/java/<version>/blocks.json`）。
 - BMCBL `crates/`：Bedrock 存储实现（`vendor/`，见 `vendor/SYNC.md`）。
