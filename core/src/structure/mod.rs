@@ -152,6 +152,42 @@ pub fn write_bedrock_chunk(areas: &[StructureArea]) -> crate::error::Result<Vec<
     Ok(bytes.to_vec())
 }
 
+/// Extracts a structure's world bounds from a Java `StructureStart` compound.
+///
+/// Java stores `{ id, ChunkX, ChunkZ, Children: [ { BB: [minX,minY,minZ,maxX,maxY,maxZ], ... } ] }`.
+/// The bounds are the union of the piece boxes; a start with no usable
+/// `Children` yields `None`, because its extent is unknown and guessing one
+/// would create a spawn area the game never had.
+#[must_use]
+pub fn java_start_bounds(start: &bedrock_nbt::NbtTag) -> Option<([i32; 3], [i32; 3])> {
+    let bedrock_nbt::NbtTag::Compound(root) = start else {
+        return None;
+    };
+    let Some(bedrock_nbt::NbtTag::List(children)) = root.get("Children") else {
+        return None;
+    };
+    let mut min = [i32::MAX; 3];
+    let mut max = [i32::MIN; 3];
+    let mut any = false;
+    for child in children {
+        let bedrock_nbt::NbtTag::Compound(child) = child else {
+            continue;
+        };
+        let Some(bedrock_nbt::NbtTag::IntArray(bounds)) = child.get("BB") else {
+            continue;
+        };
+        if bounds.len() < 6 {
+            continue;
+        }
+        any = true;
+        for axis in 0..3 {
+            min[axis] = min[axis].min(bounds[axis]);
+            max[axis] = max[axis].max(bounds[axis + 3]);
+        }
+    }
+    any.then_some((min, max))
+}
+
 /// Reports what a Bedrock→Java conversion did with hardcoded spawn areas.
 ///
 /// `starts` stays empty on purpose: a Java `StructureStart` needs valid piece
@@ -310,6 +346,69 @@ mod tests {
     fn empty_chunk_value_decodes_to_no_areas() {
         let encoded = write_bedrock_chunk(&[]).expect("encode");
         assert!(read_bedrock_chunk(&encoded).expect("decode").is_empty());
+    }
+
+    fn start_with(pieces: &[[i32; 6]]) -> bedrock_nbt::NbtTag {
+        use indexmap::IndexMap;
+        let children = pieces
+            .iter()
+            .map(|bounds| {
+                let mut map = IndexMap::new();
+                map.insert(
+                    "BB".to_string(),
+                    bedrock_nbt::NbtTag::IntArray(bounds.to_vec()),
+                );
+                bedrock_nbt::NbtTag::Compound(map)
+            })
+            .collect();
+        let mut root = IndexMap::new();
+        root.insert(
+            "id".to_string(),
+            bedrock_nbt::NbtTag::String("minecraft:monument".to_string()),
+        );
+        root.insert("Children".to_string(), bedrock_nbt::NbtTag::List(children));
+        bedrock_nbt::NbtTag::Compound(root)
+    }
+
+    #[test]
+    fn java_start_bounds_union_the_piece_boxes() {
+        // Two pieces of one monument; the area must cover both.
+        let start = start_with(&[
+            [-100, 40, 200, -80, 60, 220],
+            [-80, 38, 220, -60, 58, 240],
+        ]);
+        let (min, max) = java_start_bounds(&start).expect("bounds");
+        assert_eq!(min, [-100, 38, 200]);
+        assert_eq!(max, [-60, 60, 240]);
+    }
+
+    #[test]
+    fn java_start_without_pieces_has_no_bounds() {
+        // No `Children`: the extent is unknown, so no area may be invented.
+        let start = start_with(&[]);
+        assert_eq!(java_start_bounds(&start), None);
+    }
+
+    #[test]
+    fn java_start_bounds_ignore_malformed_pieces() {
+        use indexmap::IndexMap;
+        let mut short = IndexMap::new();
+        short.insert(
+            "BB".to_string(),
+            bedrock_nbt::NbtTag::IntArray(vec![0, 0, 0]),
+        );
+        let mut root = IndexMap::new();
+        root.insert(
+            "Children".to_string(),
+            bedrock_nbt::NbtTag::List(vec![
+                bedrock_nbt::NbtTag::Compound(short),
+                bedrock_nbt::NbtTag::String("not a piece".to_string()),
+            ]),
+        );
+        assert_eq!(
+            java_start_bounds(&bedrock_nbt::NbtTag::Compound(root)),
+            None
+        );
     }
 
     #[test]

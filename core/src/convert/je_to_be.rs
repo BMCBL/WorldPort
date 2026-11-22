@@ -157,6 +157,13 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     output.flush()?;
     report.end_stage();
 
+    report.begin_stage("structures");
+    options.report(Progress::new("structures", 0, None));
+    if plan.features.chunk_metadata {
+        write_structures(&mut output, &world, &mut report)?;
+    }
+    report.end_stage();
+
     report.begin_stage("village-interests");
     options.report(Progress::new("village-interests", 0, None));
     if plan.features.village_interests {
@@ -191,6 +198,69 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     output.finish()?;
     report.end_stage();
     Ok(report.finish())
+}
+
+/// Writes Bedrock hardcoded spawn areas for Java structures that have one.
+///
+/// Bedrock records only the spawn box, so a Java structure becomes a
+/// `HardcodedSpawners` record covering its piece bounds. Structures Bedrock has
+/// no hardcoded area for (villages, ancient cities, ...) keep their blocks and
+/// are reported instead of being given a fabricated area.
+fn write_structures(
+    output: &mut BedrockOutput,
+    world: &JavaWorld,
+    report: &mut ReportBuilder,
+) -> Result<()> {
+    let mut convertible: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let mut unsupported: std::collections::BTreeMap<String, u64> = Default::default();
+    for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
+        let be_dimension = dimension_of(dimension);
+        for pos in world.chunk_positions(dimension)? {
+            let Ok(Some(chunk)) = world.read_chunk(dimension, pos) else {
+                continue;
+            };
+            let Some(starts) = chunk.get("structures").and_then(|value| value.get("starts"))
+            else {
+                continue;
+            };
+            let Some(starts) = starts.as_compound() else {
+                continue;
+            };
+            let mut areas = Vec::new();
+            for (id, start) in starts {
+                let Some(kind) = crate::structure::StructureKind::from_java_id(id) else {
+                    *unsupported.entry(id.clone()).or_default() += 1;
+                    continue;
+                };
+                let Some((min, max)) = crate::structure::java_start_bounds(start) else {
+                    // No piece bounds: nothing to place.
+                    *unsupported.entry(format!("{id} (no pieces)")).or_default() += 1;
+                    continue;
+                };
+                areas.push(crate::structure::StructureArea { kind, min, max });
+                *convertible.entry(kind.java_id()).or_default() += 1;
+            }
+            if areas.is_empty() {
+                continue;
+            }
+            let value = crate::structure::write_bedrock_chunk(&areas)?;
+            output.put_raw(
+                ChunkKey::new(
+                    ChunkPos {
+                        x: pos.x,
+                        z: pos.z,
+                        dimension: be_dimension,
+                    },
+                    ChunkRecordTag::HardcodedSpawners,
+                )
+                .encode(),
+                Bytes::from(value),
+            );
+            report.counters().structures += areas.len() as u64;
+        }
+    }
+    crate::structure::report_java_structures(&convertible, &unsupported, report);
+    Ok(())
 }
 
 /// Converts Java map files into Bedrock `map_<id>` records.

@@ -183,7 +183,30 @@ fn write_chunk(root: &Path) -> Result<()> {
         ("isLightOn", NbtTag::Byte(0)),
         (
             "structures",
-            compound([("starts", empty_compound()), ("References", empty_compound())]),
+            // One ocean monument start with a single piece, so the
+            // Java->Bedrock hardcoded-spawn-area path has something to convert.
+            compound([
+                (
+                    "starts",
+                    compound([(
+                        "minecraft:monument",
+                        compound([
+                            ("id", tag_string("minecraft:monument")),
+                            ("ChunkX", NbtTag::Int(0)),
+                            ("ChunkZ", NbtTag::Int(0)),
+                            (
+                                "Children",
+                                tag_list(vec![compound([(
+                                    "BB",
+                                    NbtTag::IntArray(vec![-8, 40, -8, 8, 60, 8]),
+                                )])]),
+                            ),
+                            ("References", empty_compound()),
+                        ]),
+                    )]),
+                ),
+                ("References", empty_compound()),
+            ]),
         ),
         (
             "block_ticks",
