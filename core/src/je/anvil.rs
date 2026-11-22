@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
+use rayon::prelude::*;
 
 use crate::error::{Result, WorldPortError, io_result};
 
@@ -290,6 +291,17 @@ where
             .truncate(true)
             .open(path),
     )?;
+    // Compress every chunk of the region in parallel; the sector layout below
+    // has to be sequential because offsets depend on the previous sizes.
+    let compressed: Vec<(u8, u8, Vec<u8>)> = entries
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(local_x, local_z, payload)| {
+            compress(RegionCompression::Zlib, &payload, level)
+                .map(|bytes| (local_x, local_z, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut writer = BufWriter::with_capacity(1 << 20, file);
     writer
         .write_all(&[0_u8; HEADER_BYTES as usize])
@@ -297,13 +309,12 @@ where
     let mut locations = [Location::default(); SLOTS];
     let timestamp = unix_now_seconds();
     let mut next_sector = 2_u32;
-    for (local_x, local_z, payload) in entries {
+    for (local_x, local_z, compressed) in compressed {
         if local_x >= 32 || local_z >= 32 {
             return Err(WorldPortError::other(format!(
                 "local chunk position out of range: {local_x},{local_z}"
             )));
         }
-        let compressed = compress(RegionCompression::Zlib, &payload, level)?;
         let length = u32::try_from(compressed.len() + 1)
             .map_err(|_| WorldPortError::other("chunk payload exceeds 4 GiB"))?;
         let span = u64::from(length) + 4;

@@ -5,6 +5,7 @@
 //! as skipped for now.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use bedrock_nbt::NbtTag;
 use bedrock_world::block::BlockEntity;
@@ -12,7 +13,9 @@ use bedrock_world::{ActorUid, ChunkKey, ChunkPos, ChunkRecordTag};
 use bedrock_world::chunk::palette::BlockState;
 use bedrock_world::world::CreateOptions;
 use bedrock_world::{Dimension, Spawn};
+use bytes::Bytes;
 use indexmap::IndexMap;
+use rayon::prelude::*;
 
 use crate::be::write::{
     BedrockOutput, CHUNK_VERSION_VALUE, FINALIZED_STATE_POPULATED, SECTION_BLOCKS, SectionWrite,
@@ -81,8 +84,13 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     report.end_stage();
 
     report.begin_stage("terrain");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(plan.jobs)
+        .build()
+        .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted_chunks = 0_u64;
-    let mut uid_counter: i64 = 1;
+    let uid_counter = AtomicI64::new(1);
+    let current_tick = world.total_ticks();
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
         let positions = world.chunk_positions(dimension)?;
         if positions.is_empty() {
@@ -93,36 +101,39 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
             converted_chunks,
             None,
         ));
-        for positions in positions.chunks(256) {
-            for pos in positions {
-                options.check_cancelled()?;
-                let Some(chunk) = world.read_chunk(dimension, *pos)? else {
-                    report.warn(WarningCode::Skipped, pos.label(), "chunk vanished while reading");
-                    continue;
-                };
-                let summary = summarize(&chunk);
-                if !summary.status.ends_with("full") {
-                    report.warn(
-                        WarningCode::Skipped,
-                        summary.status.clone(),
-                        format!("chunk {} is not fully generated and was skipped", pos.label()),
-                    );
-                    continue;
+        for window in positions.chunks(512) {
+            options.check_cancelled()?;
+            let outcomes: Vec<Result<ChunkOutcome>> = pool.install(|| {
+                window
+                    .par_iter()
+                    .map(|pos| {
+                        options.check_cancelled()?;
+                        convert_position(
+                            &world,
+                            &mapper,
+                            dimension,
+                            *pos,
+                            &uid_counter,
+                            current_tick,
+                            plan.pruning.blocks,
+                        )
+                    })
+                    .collect()
+            });
+            for outcome in outcomes {
+                let outcome = outcome?;
+                for (key, value) in outcome.raw {
+                    output.put_raw(key, value);
                 }
-                convert_chunk(
-                    &mut output,
-                    &mut report,
-                    &mapper,
-                    &world,
-                    &chunk,
-                    *pos,
-                    dimension,
-                    &mut uid_counter,
-                    world.total_ticks(),
-                    plan.pruning.blocks,
-                )?;
-                converted_chunks += 1;
-                report.counters().chunks += 1;
+                for (pos, uid, payload) in outcome.actors {
+                    output.put_actor(pos, uid, payload);
+                }
+                report.merge(outcome.report);
+                if outcome.converted {
+                    converted_chunks += 1;
+                    report.counters().chunks += 1;
+                    output.finish_chunk()?;
+                }
             }
             options.report(crate::convert::Progress::new(
                 "terrain",
@@ -293,15 +304,95 @@ fn spawn_of(world: &JavaWorld) -> Spawn {
     }
 }
 
+/// Records one converted chunk contributes, committed in input order.
+struct ChunkOutcome {
+    raw: Vec<(Bytes, Bytes)>,
+    actors: Vec<(ChunkPos, ActorUid, NbtTag)>,
+    report: ReportBuilder,
+    converted: bool,
+}
+
+/// Per-chunk write buffer; the driver replays it into [`BedrockOutput`].
+#[derive(Default)]
+struct ChunkSink {
+    raw: Vec<(Bytes, Bytes)>,
+    actors: Vec<(ChunkPos, ActorUid, NbtTag)>,
+}
+
+impl ChunkSink {
+    fn put_raw(&mut self, key: Bytes, value: Bytes) {
+        self.raw.push((key, value));
+    }
+
+    fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) {
+        self.actors.push((pos, uid, payload));
+    }
+}
+
+/// Reads and converts one Java chunk on a worker thread.
+fn convert_position(
+    world: &JavaWorld,
+    mapper: &BlockMapper,
+    dimension: JeDimension,
+    pos: JeChunkPos,
+    uid_counter: &AtomicI64,
+    current_tick: i64,
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<ChunkOutcome> {
+    let mut report = ReportBuilder::new("java", "bedrock", "", "");
+    let Some(chunk) = world.read_chunk(dimension, pos)? else {
+        report.warn(WarningCode::Skipped, pos.label(), "chunk vanished while reading");
+        return Ok(ChunkOutcome {
+            raw: Vec::new(),
+            actors: Vec::new(),
+            report,
+            converted: false,
+        });
+    };
+    let summary = summarize(&chunk);
+    if !summary.status.ends_with("full") {
+        report.warn(
+            WarningCode::Skipped,
+            summary.status.clone(),
+            format!("chunk {} is not fully generated and was skipped", pos.label()),
+        );
+        return Ok(ChunkOutcome {
+            raw: Vec::new(),
+            actors: Vec::new(),
+            report,
+            converted: false,
+        });
+    }
+    let mut sink = ChunkSink::default();
+    convert_chunk(
+        &mut sink,
+        &mut report,
+        mapper,
+        world,
+        &chunk,
+        pos,
+        dimension,
+        uid_counter,
+        current_tick,
+        policy,
+    )?;
+    Ok(ChunkOutcome {
+        raw: sink.raw,
+        actors: sink.actors,
+        report,
+        converted: true,
+    })
+}
+
 fn convert_chunk(
-    output: &mut BedrockOutput,
+    sink: &mut ChunkSink,
     report: &mut ReportBuilder,
     mapper: &BlockMapper,
     world: &JavaWorld,
     chunk: &NbtTag,
     pos: JeChunkPos,
     dimension: JeDimension,
-    uid_counter: &mut i64,
+    uid_counter: &AtomicI64,
     current_tick: i64,
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<()> {
@@ -375,7 +466,7 @@ fn convert_chunk(
             }
         }
         let bytes = encode_section(section)?;
-        output.put_raw(keys.subchunk(section.y).encode(), bytes);
+        sink.put_raw(keys.subchunk(section.y).encode(), bytes);
         report.counters().sections += 1;
         for index in &section.primary {
             if *index != 0 {
@@ -386,10 +477,10 @@ fn convert_chunk(
 
     if !sections.is_empty() {
         let bytes = encode_biomes(&height_map, &quart_biomes)?;
-        output.put_raw(keys.data3d.encode(), bytes);
+        sink.put_raw(keys.data3d.encode(), bytes);
     }
-    output.put_raw(keys.version.encode(), bytes::Bytes::from(vec![CHUNK_VERSION_VALUE]));
-    output.put_raw(
+    sink.put_raw(keys.version.encode(), bytes::Bytes::from(vec![CHUNK_VERSION_VALUE]));
+    sink.put_raw(
         keys.finalized.encode(),
         bytes::Bytes::from(FINALIZED_STATE_POPULATED.to_le_bytes().to_vec()),
     );
@@ -406,7 +497,7 @@ fn convert_chunk(
     if !block_entities.is_empty() {
         let bytes = bedrock_nbt::serialize_consecutive_roots(&block_entities)
             .map_err(|error| WorldPortError::nbt(format!("block entities: {error}")))?;
-        output.put_raw(
+        sink.put_raw(
             ChunkKey::new(be_pos, ChunkRecordTag::BlockEntity).encode(),
             bytes::Bytes::from(bytes),
         );
@@ -420,13 +511,12 @@ fn convert_chunk(
     je_entities.extend(world.read_entity_chunk(dimension, pos)?);
     if !je_entities.is_empty() {
         for entity in &je_entities {
-            let uid = *uid_counter;
-            *uid_counter += 1;
+            let uid = uid_counter.fetch_add(1, Ordering::Relaxed);
             let Some(payload) = crate::entity::java_to_bedrock(entity, uid, report) else {
                 continue;
             };
             let actor_pos = crate::entity::chunk_of(&payload).unwrap_or((be_pos.x, be_pos.z));
-            output.put_actor(
+            sink.put_actor(
                 ChunkPos {
                     x: actor_pos.0,
                     z: actor_pos.1,
@@ -468,14 +558,14 @@ fn convert_chunk(
         if let Some(record) = record {
             let bytes = bedrock_nbt::serialize_root(&record)
                 .map_err(|error| WorldPortError::nbt(format!("ticks: {error}")))?;
-            output.put_raw(
+            sink.put_raw(
                 ChunkKey::new(be_pos, ChunkRecordTag::PendingTicks).encode(),
                 bytes::Bytes::from(bytes),
             );
         }
     }
 
-    output.finish_chunk()
+    Ok(())
 }
 
 fn air_state() -> BlockState {

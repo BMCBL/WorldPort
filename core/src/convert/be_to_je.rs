@@ -13,6 +13,7 @@ use bedrock_world::{
 };
 use flate2::Compression;
 use indexmap::IndexMap;
+use rayon::prelude::*;
 
 use crate::convert::{ConversionOptions, ConversionPlan, Progress};
 use crate::error::{Result, WorldPortError, io_result};
@@ -163,16 +164,23 @@ pub fn convert(
     report.end_stage();
 
     report.begin_stage("terrain");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(plan.jobs)
+        .build()
+        .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted = 0_u64;
+    // One key scan for every dimension; filtering three times would walk the
+    // whole database three times.
+    let all_positions = world.chunk_positions(Default::default())?;
     for (dimension, je_dimension) in [
         (Dimension::Overworld, JeDimension::Overworld),
         (Dimension::Nether, JeDimension::Nether),
         (Dimension::End, JeDimension::End),
     ] {
-        let mut positions: Vec<ChunkPos> = world
-            .chunk_positions(Default::default())?
-            .into_iter()
+        let mut positions: Vec<ChunkPos> = all_positions
+            .iter()
             .filter(|pos| pos.dimension == dimension)
+            .copied()
             .collect();
         positions.sort_by_key(|pos| (pos.x, pos.z));
         if let Some(limit) = plan.chunk_limit {
@@ -186,61 +194,94 @@ pub fn convert(
         // written once, otherwise later windows would truncate earlier writes.
         let mut by_region: BTreeMap<(i32, i32), Vec<(u8, u8, Vec<u8>)>> = BTreeMap::new();
         let mut entity_regions: BTreeMap<(i32, i32), Vec<(u8, u8, Vec<u8>)>> = BTreeMap::new();
-        for pos in &positions {
+        for window in positions.chunks(512) {
             options.check_cancelled()?;
-            let je_pos = JeChunkPos::new(pos.x, pos.z);
-            let Some((nbt, entities)) = read_chunk(
-                &world,
-                *pos,
-                &mapper,
-                &target,
-                plan.pruning.blocks,
-                &mut report,
-            )? else {
-                report.warn(
-                    WarningCode::Skipped,
-                    je_pos.label(),
-                    "chunk has no convertible section",
-                );
-                continue;
-            };
-            let payload = je_nbt::encode("", &nbt)?;
-            let (lx, lz) = je_pos.local();
-            // 1.17+ stores entities in their own region files.
-            if !entities.is_empty() {
-                let entity_chunk = compound([
-                    ("Entities", tag_list(entities)),
-                    ("DataVersion", NbtTag::Int(target.data_version)),
-                    ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
-                ]);
-                let entity_payload = je_nbt::encode("", &entity_chunk)?;
-                entity_regions
-                    .entry(je_pos.region())
-                    .or_default()
-                    .push((lx, lz, entity_payload));
+            let outcomes: Vec<Result<(Option<ConvertedChunk>, ReportBuilder)>> = pool.install(|| {
+                window
+                    .par_iter()
+                    .map(|pos| {
+                        options.check_cancelled()?;
+                        convert_position(&world, *pos, &mapper, &target, plan.pruning.blocks)
+                    })
+                    .collect()
+            });
+            for (pos, outcome) in window.iter().zip(outcomes) {
+                let (chunk, worker) = outcome?;
+                report.merge(worker);
+                let je_pos = JeChunkPos::new(pos.x, pos.z);
+                let Some(chunk) = chunk else {
+                    report.warn(
+                        WarningCode::Skipped,
+                        je_pos.label(),
+                        "chunk has no convertible section",
+                    );
+                    continue;
+                };
+                let (lx, lz) = je_pos.local();
+                // 1.17+ stores entities in their own region files.
+                if let Some(entity_payload) = chunk.entities {
+                    entity_regions
+                        .entry(je_pos.region())
+                        .or_default()
+                        .push((lx, lz, entity_payload));
+                }
+                by_region.entry(je_pos.region()).or_default().push((lx, lz, chunk.payload));
+                converted += 1;
+                report.counters().chunks += 1;
             }
-            by_region.entry(je_pos.region()).or_default().push((lx, lz, payload));
-            converted += 1;
-            report.counters().chunks += 1;
-            if converted % 512 == 0 {
-                options.report(Progress::new("terrain", converted, None));
-            }
+            options.report(Progress::new("terrain", converted, None));
         }
         let dimension_dir = target.dimension_dir(&plan.target, je_dimension);
-        let region_dir = dimension_dir.join("region");
-        for ((region_x, region_z), entries) in by_region {
-            let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
-            write_region_file(&path, entries, compression_level(plan))?;
-        }
-        let entity_dir = dimension_dir.join("entities");
-        for ((region_x, region_z), entries) in entity_regions {
-            let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
-            write_region_file(&path, entries, compression_level(plan))?;
-        }
+        // Compress and write regions on the same pool so `--jobs` applies.
+        pool.install(|| -> Result<()> {
+            let region_dir = dimension_dir.join("region");
+            for ((region_x, region_z), entries) in by_region {
+                let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
+                write_region_file(&path, entries, compression_level(plan))?;
+            }
+            let entity_dir = dimension_dir.join("entities");
+            for ((region_x, region_z), entries) in entity_regions {
+                let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
+                write_region_file(&path, entries, compression_level(plan))?;
+            }
+            Ok(())
+        })?;
         options.report(Progress::new("terrain", converted, None));
     }
     report.end_stage();
     Ok(report.finish())
+}
+
+/// One chunk encoded for the Java region writer.
+struct ConvertedChunk {
+    payload: Vec<u8>,
+    entities: Option<Vec<u8>>,
+}
+
+/// Reads and encodes one Bedrock chunk on a worker thread.
+fn convert_position(
+    world: &World,
+    pos: ChunkPos,
+    mapper: &BlockMapper,
+    target: &JavaTarget,
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<(Option<ConvertedChunk>, ReportBuilder)> {
+    let mut report = ReportBuilder::new("", "", "", "");
+    let Some((nbt, entities)) = read_chunk(world, pos, mapper, target, policy, &mut report)? else {
+        return Ok((None, report));
+    };
+    let payload = je_nbt::encode("", &nbt)?;
+    let entities = if entities.is_empty() {
+        None
+    } else {
+        let entity_chunk = compound([
+            ("Entities", tag_list(entities)),
+            ("DataVersion", NbtTag::Int(target.data_version)),
+            ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
+        ]);
+        Some(je_nbt::encode("", &entity_chunk)?)
+    };
+    Ok((Some(ConvertedChunk { payload, entities }), report))
 }
 
 fn compression_level(plan: &ConversionPlan) -> Compression {
@@ -256,11 +297,10 @@ fn read_chunk(
     policy: crate::convert::UnknownDataPolicy,
     report: &mut ReportBuilder,
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
-    let chunk = world.chunk(pos)?;
+    let (chunk, biome_data) = world.chunk_snapshot(pos)?;
+    let biomes = biome_data.map(|data| data.storages);
     let mut mapped_cache: BTreeMap<(String, Vec<(String, String)>), Option<MappedState>> =
         BTreeMap::new();
-
-    let biomes = world.biome_storages(pos)?;
     let mut sections: Vec<NbtTag> = Vec::new();
     let mut height_map_blocking = [0_i16; 256];
     let mut height_map_surface = [0_i16; 256];
@@ -305,11 +345,18 @@ fn read_chunk(
         }
 
         let mut palette: Vec<NbtTag> = vec![compound([("Name", tag_string("minecraft:air"))])];
-        let mut palette_index: BTreeMap<u16, u16> = BTreeMap::new();
         let mut indices = vec![0_u16; 4096];
         let mut section_has_blocks = false;
 
         if let Some((states, packed)) = primary {
+            // A section repeats a handful of palette entries: map each unique
+            // (state, waterlogged) pair once instead of cloning the name and
+            // properties for every one of the 4096 blocks. Slots hold
+            // `u32::MAX` until resolved and `palette index + 1` afterwards
+            // (`0` = air or dropped), so the hot loop only touches a small vec.
+            let liquid_len = liquid.map_or(0, |(states, _)| states.len());
+            let stride = liquid_len + 1;
+            let mut mapped_slots = vec![u32::MAX; states.len() * stride];
             for x in 0..16_usize {
                 for z in 0..16_usize {
                     for local_y in 0..16_usize {
@@ -320,43 +367,32 @@ fn read_chunk(
                         let Some(state) = states.get(usize::from(state_index)) else {
                             continue;
                         };
-                        if state.name == "minecraft:air" {
+                        let liquid_index = liquid
+                            .and_then(|(liquid_states, liquid_packed)| {
+                                let index = liquid_packed.get(offset).copied()?;
+                                let liquid_state = liquid_states.get(usize::from(index))?;
+                                (liquid_state.name == "minecraft:water").then_some(index)
+                            });
+                        let slot = usize::from(state_index) * stride
+                            + liquid_index.map_or(0, |index| usize::from(index) + 1);
+                        let mut mapped = mapped_slots[slot];
+                        if mapped == u32::MAX {
+                            mapped = map_palette_state(
+                                mapper,
+                                report,
+                                &mut mapped_cache,
+                                &mut palette,
+                                state,
+                                liquid_index.is_some(),
+                                policy,
+                            )?;
+                            mapped_slots[slot] = mapped;
+                        }
+                        if mapped == 0 {
                             continue;
                         }
-                        if !crate::mapping::is_vanilla(&state.name) {
-                            report.warn(
-                                WarningCode::Pruned,
-                                state.name.clone(),
-                                format!("non-vanilla block {} was pruned", state.name),
-                            );
-                            continue;
-                        }
-                        // Merge the liquid layer into `waterlogged` where Java has it.
-                        let mut properties = state_properties(state);
-                        if let Some((liquid_states, liquid_packed)) = liquid
-                            && let Some(liquid_index) = liquid_packed.get(offset).copied()
-                            && let Some(liquid_state) = liquid_states.get(usize::from(liquid_index))
-                            && liquid_state.name == "minecraft:water"
-                        {
-                            properties.insert("waterlogged".to_string(), "true".to_string());
-                        }
-                        let je = map_state(
-                            mapper,
-                            report,
-                            &mut mapped_cache,
-                            &state.name,
-                            &properties,
-                            policy,
-                        )?;
-                        let Some(je) = je else {
-                            continue;
-                        };
-                        let entry = palette_entry(&je);
-                        let index = *palette_index.entry(state_index).or_insert_with(|| {
-                            palette.push(entry.clone());
-                            (palette.len() - 1) as u16
-                        });
-                        indices[(local_y << 8) | (z << 4) | x] = index;
+                        indices[(local_y << 8) | (z << 4) | x] =
+                            u16::try_from(mapped - 1).unwrap_or(0);
                         section_has_blocks = true;
                         report.counters().blocks += 1;
                         let world_y = i32::from(section_y) * 16 + local_y as i32;
@@ -510,6 +546,42 @@ fn read_chunk(
     }
 
     Ok(Some((NbtTag::Compound(root), java_entities)))
+}
+
+/// Maps one Bedrock palette entry to a Java palette slot.
+///
+/// Returns `palette index + 1`, or `0` when the block is air, non-vanilla or
+/// unmapped. Warnings are reported once per unique state instead of per block.
+fn map_palette_state(
+    mapper: &BlockMapper,
+    report: &mut ReportBuilder,
+    cache: &mut BTreeMap<(String, Vec<(String, String)>), Option<MappedState>>,
+    palette: &mut Vec<NbtTag>,
+    state: &bedrock_world::BlockState,
+    waterlogged: bool,
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<u32> {
+    if state.name == "minecraft:air" {
+        return Ok(0);
+    }
+    if !crate::mapping::is_vanilla(&state.name) {
+        report.warn(
+            WarningCode::Pruned,
+            state.name.clone(),
+            format!("non-vanilla block {} was pruned", state.name),
+        );
+        return Ok(0);
+    }
+    // Merge the liquid layer into `waterlogged` where Java has it.
+    let mut properties = state_properties(state);
+    if waterlogged {
+        properties.insert("waterlogged".to_string(), "true".to_string());
+    }
+    let Some(je) = map_state(mapper, report, cache, &state.name, &properties, policy)? else {
+        return Ok(0);
+    };
+    palette.push(palette_entry(&je));
+    Ok(u32::try_from(palette.len()).unwrap_or(u32::MAX))
 }
 
 fn map_state(
@@ -1077,15 +1149,19 @@ fn write_java_level(
         );
         write_split(&data_dir, "world_gen_settings", world_gen, target.data_version)?;
 
-        let fire_allowed = level
+        // Bedrock omits `dofiretick` unless it was toggled; a missing key means
+        // fire spreads, which matches the Java default, so only an explicit
+        // value is carried over (it would otherwise show up as an added rule).
+        if let Some(fire_allowed) = level
             .root
             .get("dofiretick")
             .and_then(TagValue::as_i64_value)
-            .is_some_and(|value| value != 0);
-        rules.insert(
-            "minecraft:fire_spread_radius_around_player".to_string(),
-            NbtTag::Int(if fire_allowed { 128 } else { 0 }),
-        );
+        {
+            rules.insert(
+                "minecraft:fire_spread_radius_around_player".to_string(),
+                NbtTag::Int(if fire_allowed != 0 { 128 } else { 0 }),
+            );
+        }
         write_split(&data_dir, "game_rules", rules, target.data_version)?;
 
         let mut weather = IndexMap::new();
