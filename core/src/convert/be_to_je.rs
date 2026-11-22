@@ -4,7 +4,7 @@
 //! `level.dat`. Entities, players, maps and ticks follow in M3.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bedrock_nbt::NbtTag;
 use bedrock_world::world::{OpenOptions, World};
@@ -25,10 +25,87 @@ use crate::mapping::{BlockMapper, MappedState};
 use crate::nbt::{NbtExt, TagValue, compound, empty_compound, tag_list, tag_string};
 use crate::report::{ReportBuilder, WarningCode};
 
-/// Target Java `DataVersion` written into every chunk and `level.dat`.
-pub const TARGET_DATA_VERSION: i32 = 4903;
-/// Target Java version label.
-pub const TARGET_VERSION_NAME: &str = "26.2";
+/// Oldest Java target whose chunk layout this writer emits (1.18 sections).
+pub const MIN_TARGET_DATA_VERSION: i32 = 2860;
+/// 1.21 moved vanilla dimensions into `dimensions/<namespace>/<path>/`.
+const DIMENSIONS_LAYOUT_DATA_VERSION: i32 = 3953;
+/// 26.1 split `level.dat` into `data/minecraft/*.dat`, `players/data` and `data/minecraft/maps`.
+const SPLIT_DATA_VERSION: i32 = 4786;
+/// 1.16 moved map `dimension` from a byte to a string id.
+const MAP_DIMENSION_STRING_DATA_VERSION: i32 = 2586;
+
+/// Everything that depends on the Java target version.
+struct JavaTarget {
+    data_version: i32,
+    catalog: &'static crate::mapping::schema::JavaCatalog,
+    dimensions_layout: bool,
+    split_data: bool,
+}
+
+impl JavaTarget {
+    fn resolve(plan: &ConversionPlan) -> Result<Self> {
+        let catalog = match plan.target_version.as_deref() {
+            Some(value) => crate::mapping::schema::JavaCatalog::for_version_or_data_version(value)?,
+            None => crate::mapping::schema::JavaCatalog::for_data_version(i32::MAX)?,
+        };
+        let data_version = catalog.data_version();
+        if data_version < MIN_TARGET_DATA_VERSION {
+            return Err(WorldPortError::unsupported(format!(
+                "Java target {} is too old: only 1.18+ chunk layouts are written",
+                catalog.version()
+            )));
+        }
+        Ok(Self {
+            data_version,
+            catalog,
+            dimensions_layout: data_version >= DIMENSIONS_LAYOUT_DATA_VERSION,
+            split_data: data_version >= SPLIT_DATA_VERSION,
+        })
+    }
+
+    fn dimension_dir(&self, root: &Path, dimension: JeDimension) -> PathBuf {
+        if self.dimensions_layout {
+            root.join("dimensions")
+                .join("minecraft")
+                .join(dimension.folder_name())
+        } else {
+            let legacy = dimension.legacy_folder_name();
+            if legacy.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(legacy)
+            }
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.data_version >= DIMENSIONS_LAYOUT_DATA_VERSION {
+            "minecraft:full"
+        } else {
+            "full"
+        }
+    }
+
+    fn players_dir(&self, root: &Path) -> PathBuf {
+        if self.split_data {
+            root.join("players").join("data")
+        } else {
+            root.join("playerdata")
+        }
+    }
+
+    fn maps_dir(&self, root: &Path) -> PathBuf {
+        if self.split_data {
+            root.join("data").join("minecraft").join("maps")
+        } else {
+            root.join("data")
+        }
+    }
+
+    fn map_dimension_string(&self) -> bool {
+        self.data_version >= MAP_DIMENSION_STRING_DATA_VERSION
+    }
+}
 
 /// Converts a Bedrock world into a Java world.
 pub fn convert(
@@ -56,23 +133,33 @@ pub fn convert(
         level_name.clone(),
         plan.target.display().to_string(),
     );
-    report.set_versions("bedrock 1.26.60", format!("java {TARGET_VERSION_NAME}"));
-
-    let java_catalog = JavaCatalog::bundled(TARGET_VERSION_NAME)?;
-    let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
+    let target = JavaTarget::resolve(plan)?;
+    let mapper = BlockMapper::new(target.catalog.to_catalog(), bedrock_catalog());
+    report.set_versions(
+        "bedrock 1.26.60",
+        format!("java {} ({})", target.catalog.version(), target.data_version),
+    );
 
     report.begin_stage("maps");
     if plan.features.maps {
-        write_maps(&plan.target, &world, &mut report)?;
+        write_maps(&plan.target, &world, &target, &mut report)?;
     }
     report.end_stage();
 
     report.begin_stage("players");
-    let player_uuid = write_players(&plan.target, &world, &mut report)?;
+    let player_uuid = write_players(&plan.target, &world, &target, &mut report)?;
     report.end_stage();
 
     report.begin_stage("level.dat");
-    write_java_level(&plan.target, &world, &level_name, player_uuid, plan, &mut report)?;
+    write_java_level(
+        &plan.target,
+        &world,
+        &level_name,
+        player_uuid,
+        plan,
+        &target,
+        &mut report,
+    )?;
     report.end_stage();
 
     report.begin_stage("terrain");
@@ -102,7 +189,14 @@ pub fn convert(
         for pos in &positions {
             options.check_cancelled()?;
             let je_pos = JeChunkPos::new(pos.x, pos.z);
-            let Some((nbt, entities)) = read_chunk(&world, *pos, &mapper, &mut report)? else {
+            let Some((nbt, entities)) = read_chunk(
+                &world,
+                *pos,
+                &mapper,
+                &target,
+                plan.pruning.blocks,
+                &mut report,
+            )? else {
                 report.warn(
                     WarningCode::Skipped,
                     je_pos.label(),
@@ -116,7 +210,7 @@ pub fn convert(
             if !entities.is_empty() {
                 let entity_chunk = compound([
                     ("Entities", tag_list(entities)),
-                    ("DataVersion", NbtTag::Int(TARGET_DATA_VERSION)),
+                    ("DataVersion", NbtTag::Int(target.data_version)),
                     ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
                 ]);
                 let entity_payload = je_nbt::encode("", &entity_chunk)?;
@@ -132,22 +226,13 @@ pub fn convert(
                 options.report(Progress::new("terrain", converted, None));
             }
         }
-        let region_dir = plan
-            .target
-            .join("dimensions")
-            .join("minecraft")
-            .join(je_dimension.folder_name())
-            .join("region");
+        let dimension_dir = target.dimension_dir(&plan.target, je_dimension);
+        let region_dir = dimension_dir.join("region");
         for ((region_x, region_z), entries) in by_region {
             let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
             write_region_file(&path, entries, compression_level(plan))?;
         }
-        let entity_dir = plan
-            .target
-            .join("dimensions")
-            .join("minecraft")
-            .join(je_dimension.folder_name())
-            .join("entities");
+        let entity_dir = dimension_dir.join("entities");
         for ((region_x, region_z), entries) in entity_regions {
             let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
             write_region_file(&path, entries, compression_level(plan))?;
@@ -167,6 +252,8 @@ fn read_chunk(
     world: &World,
     pos: ChunkPos,
     mapper: &BlockMapper,
+    target: &JavaTarget,
+    policy: crate::convert::UnknownDataPolicy,
     report: &mut ReportBuilder,
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
     let chunk = world.chunk(pos)?;
@@ -253,7 +340,14 @@ fn read_chunk(
                         {
                             properties.insert("waterlogged".to_string(), "true".to_string());
                         }
-                        let je = map_state(mapper, report, &mut mapped_cache, &state.name, &properties);
+                        let je = map_state(
+                            mapper,
+                            report,
+                            &mut mapped_cache,
+                            &state.name,
+                            &properties,
+                            policy,
+                        )?;
                         let Some(je) = je else {
                             continue;
                         };
@@ -334,13 +428,16 @@ fn read_chunk(
     }
 
     let mut root = IndexMap::new();
-    root.insert("DataVersion".to_string(), NbtTag::Int(TARGET_DATA_VERSION));
+    root.insert(
+        "DataVersion".to_string(),
+        NbtTag::Int(target.data_version),
+    );
     root.insert("xPos".to_string(), NbtTag::Int(pos.x));
     root.insert("zPos".to_string(), NbtTag::Int(pos.z));
     root.insert("yPos".to_string(), NbtTag::Int(-4));
     root.insert(
         "Status".to_string(),
-        NbtTag::String("minecraft:full".to_string()),
+        NbtTag::String(target.status().to_string()),
     );
     root.insert("sections".to_string(), tag_list(sections));
     root.insert(
@@ -392,7 +489,9 @@ fn read_chunk(
         && let Ok(entities) = bedrock_nbt::parse_consecutive_roots(&record.value)
     {
         for entity in &entities {
-            if let Some(converted) = crate::block_entity::bedrock_to_java(entity, report) {
+            if let Some(converted) =
+                crate::block_entity::bedrock_to_java(entity, report, target.data_version)
+            {
                 block_entities.push(converted);
             }
         }
@@ -403,7 +502,9 @@ fn read_chunk(
     // to the separate `entities/` region file by the caller, matching 1.17+.
     let mut java_entities: Vec<NbtTag> = Vec::new();
     for record in world.actors(pos)? {
-        if let Some(entity) = crate::entity::bedrock_to_java(&record.entity.nbt, report) {
+        if let Some(entity) =
+            crate::entity::bedrock_to_java(&record.entity.nbt, report, target.data_version)
+        {
             java_entities.push(entity);
         }
     }
@@ -417,7 +518,8 @@ fn map_state(
     cache: &mut BTreeMap<(String, Vec<(String, String)>), Option<MappedState>>,
     name: &str,
     properties: &BTreeMap<String, String>,
-) -> Option<MappedState> {
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<Option<MappedState>> {
     let key = (
         name.to_string(),
         properties
@@ -426,17 +528,22 @@ fn map_state(
             .collect::<Vec<_>>(),
     );
     if let Some(mapped) = cache.get(&key) {
-        return mapped.clone();
+        return Ok(mapped.clone());
     }
     let mapped = mapper.be_to_je(name, properties);
     if mapped.is_none() {
+        if policy == crate::convert::UnknownDataPolicy::Error {
+            return Err(WorldPortError::unsupported(format!(
+                "block {name}{properties:?} has no Java mapping"
+            )));
+        }
         report.unmapped_block(
             format!("{name}{properties:?}"),
             format!("block {name} has no Java mapping; air was written"),
         );
     }
     cache.insert(key, mapped.clone());
-    mapped
+    Ok(mapped)
 }
 
 fn state_properties(state: &bedrock_world::BlockState) -> BTreeMap<String, String> {
@@ -628,7 +735,12 @@ fn block_entity_id(id: &str) -> String {
 /// Converts Bedrock players into `playerdata/<uuid>.dat` files.
 ///
 /// Returns the UUID of the first real player so `level.dat` can point at it.
-fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Result<Option<[i32; 4]>> {
+fn write_players(
+    root: &Path,
+    world: &World,
+    target: &JavaTarget,
+    report: &mut ReportBuilder,
+) -> Result<Option<[i32; 4]>> {
     let ids = world.players()?;
     let mut chosen: Option<[i32; 4]> = None;
     for id in &ids {
@@ -644,11 +756,9 @@ fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Re
             .map(|key| key.to_vec())
             .unwrap_or_default();
         let uuid = crate::player::offline_uuid(&key);
-        let java = crate::player::bedrock_to_java(&player.nbt, uuid, TARGET_DATA_VERSION);
-        // 26.x moved player files to `players/data/`.
+        let java = crate::player::bedrock_to_java(&player.nbt, uuid, target.data_version);
         let path = target
-            .join("players")
-            .join("data")
+            .players_dir(root)
             .join(format!("{}.dat", uuid_string(uuid)));
         je_nbt::write_gzip(&path, "", &java)?;
         report.counters().players += 1;
@@ -665,7 +775,12 @@ fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Re
 }
 
 /// Converts Bedrock `map_<id>` records into `data/minecraft/maps/map_<id>.dat`.
-fn write_maps(target: &Path, world: &World, report: &mut ReportBuilder) -> Result<()> {
+fn write_maps(
+    root: &Path,
+    world: &World,
+    target: &JavaTarget,
+    report: &mut ReportBuilder,
+) -> Result<()> {
     use bedrock_world::storage::{StorageReadOptions, StorageVisitorControl};
     let mut maps = Vec::new();
     world.storage().for_each_prefix(
@@ -687,7 +802,7 @@ fn write_maps(target: &Path, world: &World, report: &mut ReportBuilder) -> Resul
     if maps.is_empty() {
         return Ok(());
     }
-    let dir = target.join("data").join("minecraft").join("maps");
+    let dir = target.maps_dir(root);
     // Java map ids are 32-bit; Bedrock ids are 64-bit, so ids that do not fit are
     // renumbered densely. Items referencing a renumbered map keep their old id.
     let mut used: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
@@ -711,7 +826,12 @@ fn write_maps(target: &Path, world: &World, report: &mut ReportBuilder) -> Resul
         }
         used.insert(new_id);
         max_id = max_id.max(new_id);
-        crate::map_item::write_java_map(&dir, map, TARGET_DATA_VERSION)?;
+        crate::map_item::write_java_map(
+            &dir,
+            map,
+            target.data_version,
+            target.map_dimension_string(),
+        )?;
         report.counters().maps += 1;
     }
     if renumbered > 0 {
@@ -740,57 +860,50 @@ fn uuid_string(uuid: [i32; 4]) -> String {
 }
 
 fn write_java_level(
-    target: &Path,
+    world_root: &Path,
     world: &World,
     level_name: &str,
     player_uuid: Option<[i32; 4]>,
     plan: &ConversionPlan,
+    target: &JavaTarget,
     report: &mut ReportBuilder,
 ) -> Result<()> {
     let level = world.read_level_dat()?;
-    let data_dir = target.join("data").join("minecraft");
-    io_result(&data_dir, std::fs::create_dir_all(&data_dir))?;
+    let data_dir = world_root.join("data").join("minecraft");
+    if target.split_data {
+        io_result(&data_dir, std::fs::create_dir_all(&data_dir))?;
+    }
 
-    let mut root = IndexMap::new();
-    root.insert("DataVersion".to_string(), NbtTag::Int(TARGET_DATA_VERSION));
-    root.insert("LevelName".to_string(), NbtTag::String(level_name.to_string()));
-    root.insert(
-        "Version".to_string(),
-        compound([
-            ("Id", NbtTag::Int(TARGET_DATA_VERSION)),
-            ("Name", tag_string(TARGET_VERSION_NAME)),
-            ("Series", tag_string("main")),
-            ("Snapshot", NbtTag::Byte(0)),
-        ]),
-    );
     let spawn = [
         level.root.get_int("SpawnX").unwrap_or(0) as i32,
         level.root.get_int("SpawnY").unwrap_or(64) as i32,
         level.root.get_int("SpawnZ").unwrap_or(0) as i32,
     ];
+    let difficulty = match level.root.get_int("Difficulty").unwrap_or(2) {
+        0 => "peaceful",
+        1 => "easy",
+        3 => "hard",
+        _ => "normal",
+    };
+    let rain = level.root.get_int("RainLevel").unwrap_or(0) != 0;
+    let thunder = level.root.get_int("LightningLevel").unwrap_or(0) != 0;
+    let rain_time = level.root.get_int("RainTime").unwrap_or(0) as i32;
+    let thunder_time = level.root.get_int("LightningTime").unwrap_or(0) as i32;
+    let current_tick = level.root.get_int("currentTick").unwrap_or(0);
+
+    let mut root = IndexMap::new();
     root.insert(
-        "spawn".to_string(),
-        compound([
-            ("pos", NbtTag::IntArray(spawn.to_vec())),
-            ("pitch", NbtTag::Float(0.0)),
-            ("yaw", NbtTag::Float(0.0)),
-            ("dimension", tag_string("minecraft:overworld")),
-        ]),
+        "DataVersion".to_string(),
+        NbtTag::Int(target.data_version),
     );
+    root.insert("LevelName".to_string(), NbtTag::String(level_name.to_string()));
     root.insert(
-        "difficulty_settings".to_string(),
+        "Version".to_string(),
         compound([
-            (
-                "difficulty",
-                tag_string(match level.root.get_int("Difficulty").unwrap_or(2) {
-                    0 => "peaceful",
-                    1 => "easy",
-                    3 => "hard",
-                    _ => "normal",
-                }),
-            ),
-            ("hardcore", NbtTag::Byte(0)),
-            ("locked", NbtTag::Byte(0)),
+            ("Id", NbtTag::Int(target.data_version)),
+            ("Name", tag_string(target.catalog.version())),
+            ("Series", tag_string("main")),
+            ("Snapshot", NbtTag::Byte(0)),
         ]),
     );
     root.insert(
@@ -815,97 +928,49 @@ fn write_java_level(
     );
     root.insert("version".to_string(), NbtTag::Int(19133));
 
-    let level_dat_path = target.join("level.dat");
-    je_nbt::write_gzip(&level_dat_path, "", &compound([("Data", NbtTag::Compound(root))]))?;
-
-    // Split world data files, matching the 26.x layout.
-    let mut world_gen = IndexMap::new();
-    world_gen.insert(
-        "seed".to_string(),
-        NbtTag::Long(level.root.get_int("RandomSeed").unwrap_or(0)),
-    );
-    world_gen.insert("generate_structures".to_string(), NbtTag::Byte(1));
-    world_gen.insert("bonus_chest".to_string(), NbtTag::Byte(0));
-    world_gen.insert(
-        "dimensions".to_string(),
-        compound([
-            (
-                "minecraft:overworld",
-                compound([
-                    ("type", tag_string("minecraft:overworld")),
-                    (
-                        "generator",
-                        compound([("type", tag_string("minecraft:noise"))]),
-                    ),
-                ]),
-            ),
-            (
-                "minecraft:the_nether",
-                compound([
-                    ("type", tag_string("minecraft:the_nether")),
-                    (
-                        "generator",
-                        compound([
-                            ("type", tag_string("minecraft:noise")),
-                            ("settings", tag_string("minecraft:nether")),
-                        ]),
-                    ),
-                ]),
-            ),
-            (
-                "minecraft:the_end",
-                compound([
-                    ("type", tag_string("minecraft:the_end")),
-                    (
-                        "generator",
-                        compound([
-                            ("type", tag_string("minecraft:noise")),
-                            ("settings", tag_string("minecraft:end")),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]),
-    );
-    write_split(&data_dir, "world_gen_settings", world_gen)?;
-
-    // Gamerules: Bedrock flat keys → Java 26.x namespaced typed tags.
+    // Gamerules: Bedrock flat keys -> Java names (legacy names before 26.1,
+    // namespaced ids with typed values from 26.1 on).
     let mut rules = IndexMap::new();
     if let Some(entries) = level.root.as_compound() {
         for (key, value) in entries {
             if let Some(row) = crate::mapping::game_rules::find_by_bedrock(key) {
-                let (_, _, namespaced, kind, inverted) = *row;
-                let converted = match (kind, value) {
-                    (crate::mapping::game_rules::GameRuleKind::Bool, NbtTag::Byte(byte)) => {
-                        let truth = if inverted { *byte == 0 } else { *byte != 0 };
-                        NbtTag::Byte(i8::from(truth))
-                    }
-                    (crate::mapping::game_rules::GameRuleKind::Bool, NbtTag::Int(int)) => {
-                        let truth = if inverted { *int == 0 } else { *int != 0 };
-                        NbtTag::Byte(i8::from(truth))
-                    }
-                    (crate::mapping::game_rules::GameRuleKind::Int, NbtTag::Int(int)) => {
-                        NbtTag::Int(*int)
-                    }
-                    (crate::mapping::game_rules::GameRuleKind::Int, NbtTag::Byte(byte)) => {
-                        NbtTag::Int(i32::from(*byte))
-                    }
-                    _ => continue,
+                let (_, legacy, namespaced, kind, inverted) = *row;
+                let truth = match value {
+                    NbtTag::Byte(byte) => Some(*byte != 0),
+                    NbtTag::Int(int) => Some(*int != 0),
+                    _ => None,
                 };
-                rules.insert(namespaced.to_string(), converted);
+                let number = match value {
+                    NbtTag::Int(int) => Some(*int),
+                    NbtTag::Byte(byte) => Some(i32::from(*byte)),
+                    _ => None,
+                };
+                if target.split_data {
+                    let converted = match (kind, truth, number) {
+                        (crate::mapping::game_rules::GameRuleKind::Bool, Some(flag), _) => {
+                            NbtTag::Byte(i8::from(if inverted { !flag } else { flag }))
+                        }
+                        (crate::mapping::game_rules::GameRuleKind::Int, _, Some(number)) => {
+                            NbtTag::Int(number)
+                        }
+                        _ => continue,
+                    };
+                    rules.insert(namespaced.to_string(), converted);
+                } else {
+                    let text = match (kind, truth, number) {
+                        (crate::mapping::game_rules::GameRuleKind::Bool, Some(flag), _) => {
+                            (if inverted { !flag } else { flag }).to_string()
+                        }
+                        (crate::mapping::game_rules::GameRuleKind::Int, _, Some(number)) => {
+                            number.to_string()
+                        }
+                        _ => continue,
+                    };
+                    rules.insert(legacy.to_string(), tag_string(text));
+                }
             }
         }
     }
-    // Java 26.x replaced doFireTick with a numeric fire-spread radius.
-    let fire_allowed = level
-        .root
-        .get("dofiretick")
-        .and_then(TagValue::as_i64_value)
-        .is_some_and(|value| value != 0);
-    rules.insert(
-        "minecraft:fire_spread_radius_around_player".to_string(),
-        NbtTag::Int(if fire_allowed { 128 } else { 0 }),
-    );
     if rules.is_empty() {
         report.warn(
             WarningCode::DroppedField,
@@ -913,50 +978,149 @@ fn write_java_level(
             "no Bedrock gamerules were found in level.dat",
         );
     }
-    write_split(&data_dir, "game_rules", rules)?;
 
-    let mut weather = IndexMap::new();
-    weather.insert(
-        "raining".to_string(),
-        tag_string((level.root.get_int("RainLevel").unwrap_or(0) != 0).to_string()),
-    );
-    weather.insert(
-        "thundering".to_string(),
-        tag_string((level.root.get_int("LightningLevel").unwrap_or(0) != 0).to_string()),
-    );
-    weather.insert(
-        "rain_time".to_string(),
-        NbtTag::Int(level.root.get_int("RainTime").unwrap_or(0) as i32),
-    );
-    weather.insert(
-        "thunder_time".to_string(),
-        NbtTag::Int(level.root.get_int("LightningTime").unwrap_or(0) as i32),
-    );
-    weather.insert("clear_weather_time".to_string(), NbtTag::Int(0));
-    write_split(&data_dir, "weather", weather)?;
+    if target.split_data {
+        root.insert(
+            "spawn".to_string(),
+            compound([
+                ("pos", NbtTag::IntArray(spawn.to_vec())),
+                ("pitch", NbtTag::Float(0.0)),
+                ("yaw", NbtTag::Float(0.0)),
+                ("dimension", tag_string("minecraft:overworld")),
+            ]),
+        );
+        root.insert(
+            "difficulty_settings".to_string(),
+            compound([
+                ("difficulty", tag_string(difficulty)),
+                ("hardcore", NbtTag::Byte(0)),
+                ("locked", NbtTag::Byte(0)),
+            ]),
+        );
+    } else {
+        root.insert("SpawnX".to_string(), NbtTag::Int(spawn[0]));
+        root.insert("SpawnY".to_string(), NbtTag::Int(spawn[1]));
+        root.insert("SpawnZ".to_string(), NbtTag::Int(spawn[2]));
+        root.insert("SpawnAngle".to_string(), NbtTag::Float(0.0));
+        root.insert(
+            "Difficulty".to_string(),
+            NbtTag::Int(match difficulty {
+                "peaceful" => 0,
+                "easy" => 1,
+                "hard" => 3,
+                _ => 2,
+            }),
+        );
+        root.insert("hardcore".to_string(), NbtTag::Byte(0));
+        root.insert("DifficultyLocked".to_string(), NbtTag::Byte(0));
+        root.insert("GameRules".to_string(), NbtTag::Compound(rules.clone()));
+        root.insert("raining".to_string(), NbtTag::Byte(i8::from(rain)));
+        root.insert("thundering".to_string(), NbtTag::Byte(i8::from(thunder)));
+        root.insert("rainTime".to_string(), NbtTag::Int(rain_time));
+        root.insert("thunderTime".to_string(), NbtTag::Int(thunder_time));
+        root.insert("clearWeatherTime".to_string(), NbtTag::Int(0));
+        root.insert("DayTime".to_string(), NbtTag::Long(current_tick));
+    }
 
-    let mut clocks = IndexMap::new();
-    clocks.insert(
-        "minecraft:overworld".to_string(),
-        compound([
-            (
-                "total_ticks",
-                NbtTag::Long(level.root.get_int("currentTick").unwrap_or(0)),
-            ),
-            ("partial_tick", NbtTag::Float(0.0)),
-            ("rate", NbtTag::Float(1.0)),
-        ]),
-    );
-    write_split(&data_dir, "world_clocks", clocks)?;
+    let level_dat_path = world_root.join("level.dat");
+    je_nbt::write_gzip(&level_dat_path, "", &compound([("Data", NbtTag::Compound(root))]))?;
+
+    if target.split_data {
+        // 26.x split world data files.
+        let mut world_gen = IndexMap::new();
+        world_gen.insert(
+            "seed".to_string(),
+            NbtTag::Long(level.root.get_int("RandomSeed").unwrap_or(0)),
+        );
+        world_gen.insert("generate_structures".to_string(), NbtTag::Byte(1));
+        world_gen.insert("bonus_chest".to_string(), NbtTag::Byte(0));
+        world_gen.insert(
+            "dimensions".to_string(),
+            compound([
+                (
+                    "minecraft:overworld",
+                    compound([
+                        ("type", tag_string("minecraft:overworld")),
+                        (
+                            "generator",
+                            compound([("type", tag_string("minecraft:noise"))]),
+                        ),
+                    ]),
+                ),
+                (
+                    "minecraft:the_nether",
+                    compound([
+                        ("type", tag_string("minecraft:the_nether")),
+                        (
+                            "generator",
+                            compound([
+                                ("type", tag_string("minecraft:noise")),
+                                ("settings", tag_string("minecraft:nether")),
+                            ]),
+                        ),
+                    ]),
+                ),
+                (
+                    "minecraft:the_end",
+                    compound([
+                        ("type", tag_string("minecraft:the_end")),
+                        (
+                            "generator",
+                            compound([
+                                ("type", tag_string("minecraft:noise")),
+                                ("settings", tag_string("minecraft:end")),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        write_split(&data_dir, "world_gen_settings", world_gen, target.data_version)?;
+
+        let fire_allowed = level
+            .root
+            .get("dofiretick")
+            .and_then(TagValue::as_i64_value)
+            .is_some_and(|value| value != 0);
+        rules.insert(
+            "minecraft:fire_spread_radius_around_player".to_string(),
+            NbtTag::Int(if fire_allowed { 128 } else { 0 }),
+        );
+        write_split(&data_dir, "game_rules", rules, target.data_version)?;
+
+        let mut weather = IndexMap::new();
+        weather.insert("raining".to_string(), tag_string(rain.to_string()));
+        weather.insert("thundering".to_string(), tag_string(thunder.to_string()));
+        weather.insert("rain_time".to_string(), NbtTag::Int(rain_time));
+        weather.insert("thunder_time".to_string(), NbtTag::Int(thunder_time));
+        weather.insert("clear_weather_time".to_string(), NbtTag::Int(0));
+        write_split(&data_dir, "weather", weather, target.data_version)?;
+
+        let mut clocks = IndexMap::new();
+        clocks.insert(
+            "minecraft:overworld".to_string(),
+            compound([
+                ("total_ticks", NbtTag::Long(current_tick)),
+                ("partial_tick", NbtTag::Float(0.0)),
+                ("rate", NbtTag::Float(1.0)),
+            ]),
+        );
+        write_split(&data_dir, "world_clocks", clocks, target.data_version)?;
+    }
 
     let _ = plan;
     Ok(())
 }
 
-fn write_split(dir: &Path, name: &str, data: IndexMap<String, NbtTag>) -> Result<()> {
+fn write_split(
+    dir: &Path,
+    name: &str,
+    data: IndexMap<String, NbtTag>,
+    data_version: i32,
+) -> Result<()> {
     let mut root = IndexMap::new();
     root.insert("data".to_string(), NbtTag::Compound(data));
-    root.insert("DataVersion".to_string(), NbtTag::Int(TARGET_DATA_VERSION));
+    root.insert("DataVersion".to_string(), NbtTag::Int(data_version));
     let path = dir.join(format!("{name}.dat"));
     je_nbt::write_gzip(&path, "", &NbtTag::Compound(root))
 }

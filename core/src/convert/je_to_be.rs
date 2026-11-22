@@ -47,19 +47,33 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         ),
     );
 
-    let java_version = java_catalog_version(world.data_version());
-    if java_version != "26.2" {
+    // Pick the bundled catalog closest to the source DataVersion so property
+    // domains match what the world actually contains.
+    let java_catalog = JavaCatalog::for_data_version(world.data_version())?;
+    if java_catalog.data_version() != world.data_version() {
         report.warn(
             WarningCode::Lossy,
             "java-version",
             format!(
-                "no bundled Java block catalog for DataVersion {}; mapping with 26.2 names",
-                world.data_version()
+                "source DataVersion {} has no bundled catalog; mapping with {} ({})",
+                world.data_version(),
+                java_catalog.version(),
+                java_catalog.data_version()
             ),
         );
     }
-    let java_catalog = JavaCatalog::bundled(java_version)?;
     let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
+    if let Some(requested) = plan.target_version.as_deref()
+        && !requested.contains("1.26.60")
+    {
+        report.warn(
+            WarningCode::Lossy,
+            "bedrock-target",
+            format!(
+                "Bedrock target {requested} is not supported yet; writing 1.26.60 block states"
+            ),
+        );
+    }
 
     report.begin_stage("create-world");
     let be_options = create_options(&world)?;
@@ -105,6 +119,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     dimension,
                     &mut uid_counter,
                     world.total_ticks(),
+                    plan.pruning.blocks,
                 )?;
                 converted_chunks += 1;
                 report.counters().chunks += 1;
@@ -211,14 +226,6 @@ fn write_player(
     Ok(())
 }
 
-fn java_catalog_version(data_version: i32) -> &'static str {
-    // Only 26.2 (DataVersion 4903) ships bundled tables for now.
-    match data_version {
-        4903 => "26.2",
-        _ => "26.2",
-    }
-}
-
 fn create_options(world: &JavaWorld) -> Result<CreateOptions> {
     let data = world.data();
     let spawn = spawn_of(world);
@@ -296,6 +303,7 @@ fn convert_chunk(
     dimension: JeDimension,
     uid_counter: &mut i64,
     current_tick: i64,
+    policy: crate::convert::UnknownDataPolicy,
 ) -> Result<()> {
     let be_pos = ChunkPos {
         x: pos.x,
@@ -313,7 +321,14 @@ fn convert_chunk(
                 .get_int("Y")
                 .and_then(|value| i8::try_from(value).ok())
                 .unwrap_or(0);
-            if let Some(write) = convert_section(section, y, mapper, &mut mapped_cache, report) {
+            if let Some(write) = convert_section(
+                section,
+                y,
+                mapper,
+                &mut mapped_cache,
+                report,
+                policy,
+            )? {
                 sections.push(write);
             } else {
                 // Still record biomes for sections without blocks.
@@ -477,11 +492,16 @@ fn convert_section(
     mapper: &BlockMapper,
     cache: &mut BTreeMap<(String, Vec<(String, String)>), MappedState>,
     report: &mut ReportBuilder,
-) -> Option<SectionWrite> {
-    let block_states = section.get("block_states")?;
-    let palette = block_states.get_list("palette")?;
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<Option<SectionWrite>> {
+    let Some(block_states) = section.get("block_states") else {
+        return Ok(None);
+    };
+    let Some(palette) = block_states.get_list("palette") else {
+        return Ok(None);
+    };
     if palette.is_empty() {
-        return None;
+        return Ok(None);
     }
     let entries: Vec<(String, BTreeMap<String, String>)> = palette
         .iter()
@@ -563,6 +583,11 @@ fn convert_section(
                     let mapped = match mapper.je_to_be(name, &properties) {
                         Some(mapped) => mapped,
                         None => {
+                            if policy == crate::convert::UnknownDataPolicy::Error {
+                                return Err(WorldPortError::unsupported(format!(
+                                    "block {name}{properties:?} has no Bedrock mapping"
+                                )));
+                            }
                             report.unmapped_block(
                                 format!("{name}{properties:?}"),
                                 format!("block {name} has no Bedrock mapping; air was written"),
@@ -603,17 +628,19 @@ fn convert_section(
     }
 
     if !any_block && !has_liquid {
-        return None;
+        return Ok(None);
     }
-    let biomes = convert_biomes(section)?;
-    Some(SectionWrite {
+    let Some(biomes) = convert_biomes(section) else {
+        return Ok(None);
+    };
+    Ok(Some(SectionWrite {
         y,
         primary,
         primary_palette,
         liquid: has_liquid.then_some(liquid),
         liquid_palette,
         biomes,
-    })
+    }))
 }
 
 fn convert_biomes(section: &NbtTag) -> Option<[u32; 64]> {

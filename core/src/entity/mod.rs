@@ -255,7 +255,7 @@ pub fn java_to_bedrock(je: &NbtTag, uid: i64, report: &mut ReportBuilder) -> Opt
 
 /// Converts a Bedrock entity payload into a Java entity.
 #[must_use]
-pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag> {
+pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder, data_version: i32) -> Option<NbtTag> {
     let identifier = be.get_str("identifier")?;
     if !crate::mapping::is_vanilla(identifier) {
         report.warn(
@@ -295,9 +295,9 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
     if be.get("Mainhand").is_some() || be.get("Offhand").is_some() {
         let hands = vec![
             read_bedrock_hand(be.get("Mainhand"))
-                .map_or_else(empty_compound, |stack| write_java_item(&stack)),
+                .map_or_else(empty_compound, |stack| write_java_item(&stack, data_version)),
             read_bedrock_hand(be.get("Offhand"))
-                .map_or_else(empty_compound, |stack| write_java_item(&stack)),
+                .map_or_else(empty_compound, |stack| write_java_item(&stack, data_version)),
         ];
         out.insert("HandItems".to_string(), tag_list(hands));
     }
@@ -305,7 +305,7 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
         let items: Vec<NbtTag> = armor
             .iter()
             .map(|entry| {
-                read_bedrock_item(entry).map_or_else(empty_compound, |stack| write_java_item(&stack))
+                read_bedrock_item(entry).map_or_else(empty_compound, |stack| write_java_item(&stack, data_version))
             })
             .collect();
         let mut items = items;
@@ -317,7 +317,7 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
     if let Some(item) = be.get("Item")
         && let Some(stack) = read_bedrock_item(item)
     {
-        out.insert("Item".to_string(), write_java_item(&stack));
+        out.insert("Item".to_string(), write_java_item(&stack, data_version));
     }
     if !out.contains_key("Health")
         && let Some(health) = bedrock_health(be)
@@ -327,8 +327,12 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
     if let Some(attributes) = write_java_attributes(be) {
         out.insert("attributes".to_string(), attributes);
     }
-    if let Some(effects) = write_java_effects(be) {
-        out.insert("active_effects".to_string(), effects);
+    if data_version >= crate::item::COMPONENTS_DATA_VERSION {
+        if let Some(effects) = write_java_effects(be) {
+            out.insert("active_effects".to_string(), effects);
+        }
+    } else if let Some(effects) = write_legacy_effects(be) {
+        out.insert("ActiveEffects".to_string(), effects);
     }
     // Java needs a UUID; derive a stable one from the Bedrock UniqueID.
     if let Some(uid) = be.get_int("UniqueID") {
@@ -515,6 +519,28 @@ fn read_java_effects(je: &NbtTag) -> Option<NbtTag> {
     (!effects.is_empty()).then(|| tag_list(effects))
 }
 
+fn write_legacy_effects(be: &NbtTag) -> Option<NbtTag> {
+    let list = be.get_list("ActiveEffects")?;
+    let entries: Vec<NbtTag> = list
+        .iter()
+        .filter_map(|effect| {
+            let id = effect.get_int("Id")?;
+            Some(compound([
+                ("Id", NbtTag::Byte(i8::try_from(id).unwrap_or(0))),
+                (
+                    "Amplifier",
+                    NbtTag::Byte(effect.get_int("Amplifier").unwrap_or(0) as i8),
+                ),
+                (
+                    "Duration",
+                    NbtTag::Int(effect.get_int("Duration").unwrap_or(0) as i32),
+                ),
+            ]))
+        })
+        .collect();
+    (!entries.is_empty()).then(|| tag_list(entries))
+}
+
 fn write_java_effects(be: &NbtTag) -> Option<NbtTag> {
     let list = be.get_list("ActiveEffects")?;
     let mut effects = Vec::new();
@@ -586,22 +612,28 @@ mod tests {
             (
                 "HandItems",
                 tag_list(vec![
-                    crate::item::write_java_item(&crate::item::ItemStack {
-                        id: "minecraft:iron_sword".to_string(),
-                        count: 1,
-                        ..crate::item::ItemStack::default()
-                    }),
+                    crate::item::write_java_item(
+                        &crate::item::ItemStack {
+                            id: "minecraft:iron_sword".to_string(),
+                            count: 1,
+                            ..crate::item::ItemStack::default()
+                        },
+                        4903,
+                    ),
                     empty_compound(),
                 ]),
             ),
             (
                 "ArmorItems",
                 tag_list(vec![
-                    crate::item::write_java_item(&crate::item::ItemStack {
-                        id: "minecraft:iron_helmet".to_string(),
-                        count: 1,
-                        ..crate::item::ItemStack::default()
-                    }),
+                    crate::item::write_java_item(
+                        &crate::item::ItemStack {
+                            id: "minecraft:iron_helmet".to_string(),
+                            count: 1,
+                            ..crate::item::ItemStack::default()
+                        },
+                        4903,
+                    ),
                     empty_compound(),
                     empty_compound(),
                     empty_compound(),
@@ -626,7 +658,7 @@ mod tests {
             armor[0].get_str("Name"),
             Some("minecraft:iron_helmet")
         );
-        let back = bedrock_to_java(&be, &mut report).expect("entity returns");
+        let back = bedrock_to_java(&be, &mut report, 4903).expect("entity returns");
         assert_eq!(back.get_str("id"), Some("minecraft:zombie"));
         let pos = back.get_list("Pos").expect("pos");
         assert_eq!(pos[0].as_f64_value(), Some(10.5));
@@ -647,6 +679,38 @@ mod tests {
         ]);
         let be = java_to_bedrock(&je, 7, &mut report()).expect("orb converts");
         assert_eq!(be.get_str("identifier"), Some("minecraft:xp_orb"));
+    }
+
+    #[test]
+    fn legacy_targets_write_numeric_effects() {
+        let be = compound([
+            ("identifier", tag_string("minecraft:zombie")),
+            (
+                "ActiveEffects",
+                tag_list(vec![compound([
+                    ("Id", NbtTag::Byte(1)),
+                    ("Amplifier", NbtTag::Byte(0)),
+                    ("Duration", NbtTag::Int(200)),
+                ])]),
+            ),
+        ]);
+        let legacy = bedrock_to_java(&be, &mut report(), 3700).expect("legacy entity");
+        assert!(legacy.get("active_effects").is_none());
+        assert_eq!(
+            legacy
+                .get_list("ActiveEffects")
+                .and_then(|effects| effects.first())
+                .and_then(|effect| effect.get_int("Id")),
+            Some(1)
+        );
+        let modern = bedrock_to_java(&be, &mut report(), 4903).expect("modern entity");
+        assert_eq!(
+            modern
+                .get_list("active_effects")
+                .and_then(|effects| effects.first())
+                .and_then(|effect| effect.get_str("id")),
+            Some("minecraft:speed")
+        );
     }
 
     #[test]

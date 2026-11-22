@@ -144,7 +144,9 @@ pub fn compare_java(first: &JavaWorld, second: &JavaWorld, dimension: JeDimensio
         };
         let first_summary = summarize(&first_chunk);
         let second_summary = summarize(&second_chunk);
-        if first_summary.status != second_summary.status {
+        // Status strings differ per version ("full" vs "minecraft:full"), so
+        // compare only fully generated chunks instead of requiring equality.
+        if !first_summary.status.ends_with("full") || !second_summary.status.ends_with("full") {
             continue;
         }
         let first_hist = state_histogram(&first_chunk);

@@ -80,10 +80,16 @@ pub fn bedrock_to_java(be: &NbtTag, uuid: [i32; 4], data_version: i32) -> NbtTag
         out.insert("SelectedItemSlot".to_string(), NbtTag::Int(slot as i32));
     }
     if let Some(inventory) = be.get_list("Inventory") {
-        out.insert("Inventory".to_string(), java_inventory(inventory, true));
+        out.insert(
+            "Inventory".to_string(),
+            java_inventory(inventory, true, data_version),
+        );
     }
     if let Some(inventory) = be.get_list("EnderChestInventory") {
-        out.insert("EnderItems".to_string(), java_inventory(inventory, false));
+        out.insert(
+            "EnderItems".to_string(),
+            java_inventory(inventory, false, data_version),
+        );
     }
     if let Some(effects) = be.get_list("ActiveEffects") {
         out.insert("active_effects".to_string(), java_effects(effects));
@@ -198,7 +204,7 @@ fn player_health(be: &NbtTag) -> Option<f32> {
     None
 }
 
-fn java_inventory(list: &[NbtTag], map_offhand: bool) -> NbtTag {
+fn java_inventory(list: &[NbtTag], map_offhand: bool, data_version: i32) -> NbtTag {
     let entries: Vec<NbtTag> = list
         .iter()
         .filter_map(|entry| {
@@ -209,7 +215,7 @@ fn java_inventory(list: &[NbtTag], map_offhand: bool) -> NbtTag {
             } else {
                 slot
             };
-            let mut item = match write_java_item(&stack) {
+            let mut item = match write_java_item(&stack, data_version) {
                 NbtTag::Compound(entries) => entries,
                 _ => IndexMap::new(),
             };
@@ -356,11 +362,14 @@ mod tests {
             (
                 "Inventory",
                 tag_list(vec![{
-                    let mut item = match write_java_item(&crate::item::ItemStack {
-                        id: "minecraft:stone".to_string(),
-                        count: 12,
-                        ..crate::item::ItemStack::default()
-                    }) {
+                    let mut item = match write_java_item(
+                        &crate::item::ItemStack {
+                            id: "minecraft:stone".to_string(),
+                            count: 12,
+                            ..crate::item::ItemStack::default()
+                        },
+                        4903,
+                    ) {
                         NbtTag::Compound(entries) => entries,
                         _ => IndexMap::new(),
                     };

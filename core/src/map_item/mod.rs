@@ -121,11 +121,21 @@ pub fn read_java_map(path: &Path, id: i64) -> Result<MapData> {
 }
 
 /// Writes a Java `map_<id>.dat` file (gzip NBT with a `data` wrapper).
-pub fn write_java_map(dir: &Path, map: &MapData, data_version: i32) -> Result<PathBuf> {
+pub fn write_java_map(
+    dir: &Path,
+    map: &MapData,
+    data_version: i32,
+    dimension_string: bool,
+) -> Result<PathBuf> {
     io_result(dir, std::fs::create_dir_all(dir))?;
+    let dimension = if dimension_string {
+        tag_string(map.dimension.clone())
+    } else {
+        NbtTag::Byte(dimension_id(&map.dimension) as i8)
+    };
     let data = compound([
         ("scale", NbtTag::Byte(map.scale)),
-        ("dimension", tag_string(map.dimension.clone())),
+        ("dimension", dimension),
         ("xCenter", NbtTag::Int(map.x_center)),
         ("zCenter", NbtTag::Int(map.z_center)),
         ("width", NbtTag::Short(map.width)),
@@ -282,7 +292,7 @@ mod tests {
     fn java_map_file_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let map = sample_map();
-        let path = write_java_map(dir.path(), &map, 4903).expect("write");
+        let path = write_java_map(dir.path(), &map, 4903, true).expect("write");
         let back = read_java_map(&path, map.id).expect("read");
         assert_eq!(back.id, map.id);
         assert_eq!(back.scale, map.scale);

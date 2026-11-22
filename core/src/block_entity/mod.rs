@@ -240,7 +240,7 @@ pub fn java_to_bedrock(je: &NbtTag, report: &mut ReportBuilder) -> Option<IndexM
 
 /// Translates one Bedrock block entity payload into a Java one.
 #[must_use]
-pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag> {
+pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder, data_version: i32) -> Option<NbtTag> {
     let be_id = be.get_str("id")?;
     if !crate::mapping::is_vanilla(be_id) {
         report.warn(
@@ -269,7 +269,7 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
 
     if let Some(items) = be.get_list("Items") {
         let stacks = read_container_items(items, false);
-        out.insert("Items".to_string(), java_items_list(&stacks));
+        out.insert("Items".to_string(), java_items_list(&stacks, data_version));
     }
 
     if je_id == "minecraft:sign" || je_id == "minecraft:hanging_sign" {
@@ -309,7 +309,7 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
     {
         out.insert(
             "RecordItem".to_string(),
-            crate::item::write_java_item(&stack),
+            crate::item::write_java_item(&stack, data_version),
         );
     }
 
@@ -339,7 +339,7 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag
     if let Some(book) = out.get("Book").cloned()
         && let Some(stack) = crate::item::read_bedrock_item(&book)
     {
-        out.insert("Book".to_string(), crate::item::write_java_item(&stack));
+        out.insert("Book".to_string(), crate::item::write_java_item(&stack, data_version));
     }
     report.counters().block_entities += 1;
     Some(NbtTag::Compound(out))
@@ -376,11 +376,14 @@ mod tests {
             (
                 "Items",
                 tag_list(vec![{
-                    let mut item = match write_java_item(&ItemStack {
-                        id: "minecraft:diamond".to_string(),
-                        count: 5,
-                        ..ItemStack::default()
-                    }) {
+                    let mut item = match write_java_item(
+                        &ItemStack {
+                            id: "minecraft:diamond".to_string(),
+                            count: 5,
+                            ..ItemStack::default()
+                        },
+                        4903,
+                    ) {
                         NbtTag::Compound(entries) => entries,
                         _ => IndexMap::new(),
                     };
@@ -394,7 +397,7 @@ mod tests {
         assert_eq!(be.get_str("CustomName"), Some("\"Storage\""));
         let items = be.get_list("Items").expect("items");
         assert_eq!(items.len(), 1);
-        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report).expect("chest returns");
+        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report, 4903).expect("chest returns");
         assert_eq!(back.get_str("id"), Some("minecraft:chest"));
         let stacks = container_stacks(back.get_list("Items").expect("items"), true);
         assert_eq!(stacks[0].0, 3);
@@ -427,7 +430,7 @@ mod tests {
         let be = java_to_bedrock(&je, &mut report).expect("sign converts");
         let front = be.get("FrontText").expect("front text");
         assert_eq!(front.get_str("Text"), Some("Line 1\nLine 2\n\n"));
-        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report).expect("sign returns");
+        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report, 4903).expect("sign returns");
         let messages = back
             .get("front_text")
             .and_then(|side| side.get_list("messages"))
@@ -455,7 +458,7 @@ mod tests {
         ]);
         let be = java_to_bedrock(&je, &mut report).expect("spawner converts");
         assert_eq!(be.get_str("EntityIdentifier"), Some("minecraft:zombie"));
-        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report).expect("spawner returns");
+        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report, 4903).expect("spawner returns");
         assert_eq!(
             back.get("SpawnData")
                 .and_then(|data| data.get("entity"))

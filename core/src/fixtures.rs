@@ -138,11 +138,22 @@ fn write_chunk(root: &Path) -> Result<()> {
                 ("minecraft:air", None),
                 ("minecraft:stone", None),
                 ("minecraft:oak_planks", None),
+                // Introduced in 1.21.4: used to check version downgrade pruning.
+                (
+                    "minecraft:creaking_heart",
+                    Some(&[
+                        ("axis", "y"),
+                        ("creaking_heart_state", "dormant"),
+                        ("natural", "false"),
+                    ]),
+                ),
             ],
             // Bottom layer stone, a 3x3 plank platform above it.
             |x, y, z| {
                 if y == 0 {
                     1
+                } else if y == 1 && x == 14 && z == 14 {
+                    3
                 } else if y == 1 && (1..=3).contains(&x) && (1..=3).contains(&z) {
                     2
                 } else {
@@ -234,12 +245,27 @@ fn write_chunk(root: &Path) -> Result<()> {
 }
 
 fn block_states_palette(
-    palette: &[(&str, Option<&str>)],
+    palette: &[(&str, Option<&[(&str, &str)]>)],
     index_at: impl Fn(usize, usize, usize) -> u16,
 ) -> NbtTag {
     let entries: Vec<NbtTag> = palette
         .iter()
-        .map(|(name, _)| compound([("Name", tag_string(*name))]))
+        .map(|(name, properties)| {
+            let mut entry = IndexMap::new();
+            entry.insert("Name".to_string(), tag_string(*name));
+            if let Some(properties) = properties {
+                entry.insert(
+                    "Properties".to_string(),
+                    NbtTag::Compound(
+                        properties
+                            .iter()
+                            .map(|(key, value)| ((*key).to_string(), tag_string(*value)))
+                            .collect(),
+                    ),
+                );
+            }
+            NbtTag::Compound(entry)
+        })
         .collect();
     let mut indices = vec![0_u16; 4096];
     for x in 0..16 {
@@ -337,12 +363,15 @@ fn block_entities() -> Vec<NbtTag> {
 }
 
 fn java_item(slot: i8, id: &str, count: i32, name: Option<&str>) -> NbtTag {
-    let mut item = match crate::item::write_java_item(&ItemStack {
-        id: id.to_string(),
-        count,
-        custom_name: name.map(str::to_string),
-        ..ItemStack::default()
-    }) {
+    let mut item = match crate::item::write_java_item(
+        &ItemStack {
+            id: id.to_string(),
+            count,
+            custom_name: name.map(str::to_string),
+            ..ItemStack::default()
+        },
+        FIXTURE_DATA_VERSION,
+    ) {
         NbtTag::Compound(entries) => entries,
         _ => IndexMap::new(),
     };
@@ -352,19 +381,25 @@ fn java_item(slot: i8, id: &str, count: i32, name: Option<&str>) -> NbtTag {
 
 fn entities() -> Vec<NbtTag> {
     let mut zombie_hands = Vec::new();
-    zombie_hands.push(crate::item::write_java_item(&ItemStack {
-        id: "minecraft:iron_sword".to_string(),
-        count: 1,
-        custom_name: Some("Fixture Blade".to_string()),
-        enchantments: vec![("minecraft:sharpness".to_string(), 5)],
-        ..ItemStack::default()
-    }));
+    zombie_hands.push(crate::item::write_java_item(
+        &ItemStack {
+            id: "minecraft:iron_sword".to_string(),
+            count: 1,
+            custom_name: Some("Fixture Blade".to_string()),
+            enchantments: vec![("minecraft:sharpness".to_string(), 5)],
+            ..ItemStack::default()
+        },
+        FIXTURE_DATA_VERSION,
+    ));
     zombie_hands.push(empty_compound());
-    let mut armor = vec![crate::item::write_java_item(&ItemStack {
-        id: "minecraft:iron_helmet".to_string(),
-        count: 1,
-        ..ItemStack::default()
-    })];
+    let mut armor = vec![crate::item::write_java_item(
+        &ItemStack {
+            id: "minecraft:iron_helmet".to_string(),
+            count: 1,
+            ..ItemStack::default()
+        },
+        FIXTURE_DATA_VERSION,
+    )];
     armor.extend(std::iter::repeat_n(empty_compound(), 3));
 
     vec![
@@ -410,11 +445,17 @@ fn entities() -> Vec<NbtTag> {
                     NbtTag::Double(5.5),
                 ]),
             ),
-            ("Item", crate::item::write_java_item(&ItemStack {
-                id: "minecraft:apple".to_string(),
-                count: 3,
-                ..ItemStack::default()
-            })),
+            (
+                "Item",
+                crate::item::write_java_item(
+                    &ItemStack {
+                        id: "minecraft:apple".to_string(),
+                        count: 3,
+                        ..ItemStack::default()
+                    },
+                    FIXTURE_DATA_VERSION,
+                ),
+            ),
         ]),
         compound([
             ("id", tag_string("minecraft:experience_orb")),
@@ -459,11 +500,17 @@ fn entities() -> Vec<NbtTag> {
             ),
             ("Facing", NbtTag::Byte(1)),
             ("ItemRotation", NbtTag::Byte(0)),
-            ("Item", crate::item::write_java_item(&ItemStack {
-                id: "minecraft:filled_map".to_string(),
-                count: 1,
-                ..ItemStack::default()
-            })),
+            (
+                "Item",
+                crate::item::write_java_item(
+                    &ItemStack {
+                        id: "minecraft:filled_map".to_string(),
+                        count: 1,
+                        ..ItemStack::default()
+                    },
+                    FIXTURE_DATA_VERSION,
+                ),
+            ),
         ]),
         compound([
             ("id", tag_string("minecraft:painting")),
@@ -502,7 +549,7 @@ fn write_maps(root: &Path) -> Result<()> {
         tracking: true,
         colors,
     };
-    crate::map_item::write_java_map(&dir, &map, FIXTURE_DATA_VERSION)?;
+    crate::map_item::write_java_map(&dir, &map, FIXTURE_DATA_VERSION, true)?;
     crate::map_item::write_idcounts(&dir, map.id)?;
     Ok(())
 }

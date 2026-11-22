@@ -134,17 +134,77 @@ pub fn read_java_item(tag: &NbtTag) -> Option<ItemStack> {
     Some(stack)
 }
 
-/// Builds a Java 26.2 item stack (`{id, count, components}`).
+/// DataVersion where item components replaced the legacy `tag` shape (1.20.5).
+pub const COMPONENTS_DATA_VERSION: i32 = 3837;
+
+/// Builds a Java item stack for a target DataVersion.
+///
+/// 1.20.5+ uses `{id, count, components}`; older versions use
+/// `{id, Count, tag}`.
 #[must_use]
-pub fn write_java_item(stack: &ItemStack) -> NbtTag {
+pub fn write_java_item(stack: &ItemStack, data_version: i32) -> NbtTag {
     let mut item = IndexMap::new();
     item.insert("id".to_string(), tag_string(item_to_java(&stack.id)));
-    item.insert("count".to_string(), NbtTag::Int(stack.count.max(1)));
-    let components = write_components(stack);
-    if !matches!(&components, NbtTag::Compound(entries) if entries.is_empty()) {
-        item.insert("components".to_string(), components);
+    if data_version >= COMPONENTS_DATA_VERSION {
+        item.insert("count".to_string(), NbtTag::Int(stack.count.max(1)));
+        let components = write_components(stack);
+        if !matches!(&components, NbtTag::Compound(entries) if entries.is_empty()) {
+            item.insert("components".to_string(), components);
+        }
+    } else {
+        item.insert(
+            "Count".to_string(),
+            NbtTag::Byte(i8::try_from(stack.count.clamp(1, 64)).unwrap_or(1)),
+        );
+        let payload = write_legacy_tag(stack);
+        if !matches!(&payload, NbtTag::Compound(entries) if entries.is_empty()) {
+            item.insert("tag".to_string(), payload);
+        }
     }
     NbtTag::Compound(item)
+}
+
+/// Legacy Java item tag (`Enchantments`, `display`, `Damage`, `Unbreakable`).
+fn write_legacy_tag(stack: &ItemStack) -> NbtTag {
+    let mut payload = IndexMap::new();
+    if !stack.enchantments.is_empty() {
+        let list: Vec<NbtTag> = stack
+            .enchantments
+            .iter()
+            .map(|(id, level)| {
+                compound([
+                    ("id", tag_string(id.clone())),
+                    ("lvl", NbtTag::Short(*level)),
+                ])
+            })
+            .collect();
+        payload.insert("Enchantments".to_string(), tag_list(list));
+    }
+    if let Some(damage) = stack.damage
+        && damage != 0
+    {
+        payload.insert("Damage".to_string(), NbtTag::Int(damage));
+    }
+    if let Some(potion) = &stack.potion {
+        payload.insert("Potion".to_string(), tag_string(potion.clone()));
+    }
+    if stack.custom_name.is_some() || !stack.lore.is_empty() {
+        let mut display = IndexMap::new();
+        if let Some(name) = &stack.custom_name {
+            display.insert("Name".to_string(), tag_string(json_text(name)));
+        }
+        if !stack.lore.is_empty() {
+            display.insert(
+                "Lore".to_string(),
+                tag_list(stack.lore.iter().map(|line| tag_string(json_text(line))).collect()),
+            );
+        }
+        payload.insert("display".to_string(), NbtTag::Compound(display));
+    }
+    if stack.unbreakable {
+        payload.insert("Unbreakable".to_string(), NbtTag::Byte(1));
+    }
+    NbtTag::Compound(payload)
 }
 
 /// Reads a Bedrock item stack (`{Name, Count, Damage?, tag?}`).
@@ -444,12 +504,12 @@ pub const fn container_slot(slot: i32) -> i32 {
 
 /// Convenience for building a Java `Items` list from stacks.
 #[must_use]
-pub fn java_items_list(stacks: &[(i32, ItemStack)]) -> NbtTag {
+pub fn java_items_list(stacks: &[(i32, ItemStack)], data_version: i32) -> NbtTag {
     let entries: Vec<NbtTag> = stacks
         .iter()
         .filter(|(_, stack)| !stack.is_air())
         .map(|(slot, stack)| {
-            let mut item = match write_java_item(stack) {
+            let mut item = match write_java_item(stack, data_version) {
                 NbtTag::Compound(entries) => entries,
                 _ => IndexMap::new(),
             };
@@ -552,6 +612,31 @@ mod tests {
         assert_eq!(plain_text("\"Hello\""), "Hello");
         assert_eq!(plain_text("{\"text\":\"Hi\",\"color\":\"red\"}"), "Hi");
         assert_eq!(plain_text("Plain"), "Plain");
+    }
+
+    #[test]
+    fn legacy_targets_use_count_and_tag() {
+        let stack = ItemStack {
+            id: "minecraft:diamond_sword".to_string(),
+            count: 1,
+            enchantments: vec![("minecraft:sharpness".to_string(), 3)],
+            custom_name: Some("Legacy".to_string()),
+            ..ItemStack::default()
+        };
+        let legacy = write_java_item(&stack, 3700);
+        assert!(legacy.get("count").is_none());
+        assert_eq!(legacy.get_int("Count"), Some(1));
+        let payload = legacy.get("tag").expect("legacy tag");
+        assert!(payload.get_list("Enchantments").is_some());
+        assert_eq!(
+            payload
+                .get("display")
+                .and_then(|display| display.get_str("Name")),
+            Some("\"Legacy\"")
+        );
+        let back = read_java_item(&legacy).expect("legacy read");
+        assert_eq!(back.enchantments, stack.enchantments);
+        assert_eq!(back.custom_name.as_deref(), Some("Legacy"));
     }
 
     #[test]
