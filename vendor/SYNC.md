@@ -22,6 +22,13 @@ Local edits applied to the copies:
   the biome record from the same batch.
 - `bedrock-world/src/scan/mod.rs`: `parse_data3d_with_min_y` is public so the snapshot
   path can decode `Data3D` without a second storage lookup.
+- `bedrock-leveldb/src/table_scan.rs`: the parallel table scan keeps one decoded run
+  resident per lane, so its footprint was `table_count * 1 MiB`. A 443 MB world has
+  200+ SST tables, which pinned ~1.4 GB of decoded blocks just to list chunk keys.
+  The run target now shrinks with the table count to stay inside a 32 MiB resident
+  budget, and the result window is capped at the scheduler's in-flight target.
+  Peak RSS for a full BE->JE conversion dropped 2518 -> 276 MiB; wall time moved
+  49.8 s -> 38-40 s (it also stopped thrashing).
 
 Re-sync after the launcher's crates change:
 
