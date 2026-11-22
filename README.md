@@ -84,6 +84,19 @@ cargo build --profile native-release -p worldport-cli
   双向语义映射，非原版条目计数并报告。
 - ✅ 自动剔除非原版内容：非 `minecraft:` 命名空间的方块/实体/方块实体/物品在转换时
   剔除并计入报告（mod / addon 不会把未知 id 写进目标存档）。
+- ✅ M4 版本识别与升降级：
+  - 源版本：JE 按 `DataVersion` 选最接近的内置方块表；BE 读取 `lastOpenedWithVersion`/存储版本。
+  - 目标版本：`--target-version 1.21.4`（或 DataVersion）选择目标方块表并写回对应
+    `DataVersion`；布局按版本切换（1.18–1.20.x 经典 `region/`+`playerdata/`，
+    1.21+ `dimensions/minecraft/<dim>/`，26.1+ 分离式 `data/minecraft/*.dat` +
+    `players/data` + `data/minecraft/maps`）；物品按 1.20.5 分界写 `components` 或旧版
+    `Count/tag`，实体效果写 `active_effects` 或旧版 `ActiveEffects`，地图维度写字符串或字节。
+  - 降版本剔除：目标方块表里不存在的方块（如 1.21.4 的 `creaking_heart` 转 1.20.6）
+    会被剔除并计入报告；`UnknownDataPolicy::{Fallback,Drop,Error}` 可切换行为。
+  - 内置目标表：1.20.6 / 1.21.4 / 1.21.8 / 26.1 / 26.2（来自 misode/mcmeta，编译期烘焙；
+    加载时会校验完整性，缺失基础方块的表会被忽略）；低于 1.18 的目标直接拒绝。
+  - 实测：默认 26.2 回环全 0 差异；降到 1.21.4 仍全 0；降到 1.20.6 只有被剔除的
+    `creaking_heart` 1 个方块差异。
 - ⏳ M4：版本升降级与剔除。
 - ⏳ M5：性能对比（同一输入跑 Chunker CLI）。
 - ⏳ M6：`.bmcblx` 插件 + 原生 DLL，注册到 BMCBL「工具」页。
