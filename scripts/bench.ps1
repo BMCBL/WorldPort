@@ -65,9 +65,24 @@ for ($run = 1; $run -le $Runs; $run++) {
     Write-Host ("run {0}: exit={1} wall={2}s peak={3} MiB" -f $run, $result.exit, $result.wall_s, $result.peak_mib)
 }
 
-$best = ($results | Sort-Object wall_s | Select-Object -First 1)
-$mem = ($results | Sort-Object peak_mib -Descending | Select-Object -First 1)
+# Report per-run medians rather than "best of each metric": the fastest run and
+# the hungriest run are usually different runs, so mixing them invents a
+# combination that never happened. Peak memory is monotonic per run, so its
+# maximum is the only meaningful summary; wall time uses the median because a
+# single scheduling hiccup should not become the headline.
+function Get-Median([double[]]$values) {
+    $sorted = $values | Sort-Object
+    $count = $sorted.Count
+    if ($count -eq 0) { return 0 }
+    if ($count % 2 -eq 1) { return $sorted[[int](($count - 1) / 2)] }
+    return ($sorted[$count / 2 - 1] + $sorted[$count / 2]) / 2
+}
+
 $size = if (Test-Path $Out) {
     [math]::Round(((Get-ChildItem $Out -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
 } else { 0 }
-Write-Host ("best wall={0}s  peak={1} MiB  output={2} MiB" -f $best.wall_s, $mem.peak_mib, $size)
+$walls = $results | ForEach-Object { $_.wall_s }
+$peaks = $results | ForEach-Object { $_.peak_mib }
+Write-Host ("median wall={0}s  max peak_working_set={1} MiB  output={2} MiB  runs={3}" -f `
+    [math]::Round((Get-Median $walls), 2), ($peaks | Measure-Object -Maximum).Maximum, $size, $Runs)
+Write-Host "note: peak_working_set is Windows' PeakWorkingSet64; it is not a portable RSS figure."
