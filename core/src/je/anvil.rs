@@ -279,6 +279,32 @@ pub fn write_region_file<I>(path: &Path, entries: I, level: Compression) -> Resu
 where
     I: IntoIterator<Item = (u8, u8, Vec<u8>)>,
 {
+    write_region_compressed(
+        path,
+        entries
+            .into_iter()
+            .map(|(local_x, local_z, payload)| (local_x, local_z, ZlibEncode::Payload(payload))),
+        level,
+    )
+}
+
+/// One region entry: either an uncompressed NBT payload or an already-compressed
+/// deflate stream.
+///
+/// Callers that compress on their own worker pass [`ZlibEncode::Zlib`] so the
+/// writer does not decompress and recompress; the payload is written verbatim.
+pub enum ZlibEncode {
+    /// Uncompressed NBT; the writer compresses it.
+    Payload(Vec<u8>),
+    /// A zlib stream produced by the caller.
+    Zlib(Vec<u8>),
+}
+
+/// Writes a region file from entries that may already be compressed.
+pub fn write_region_compressed<I>(path: &Path, entries: I, level: Compression) -> Result<()>
+where
+    I: IntoIterator<Item = (u8, u8, ZlibEncode)>,
+{
     if let Some(parent) = path.parent() {
         io_result(parent, std::fs::create_dir_all(parent))?;
     }
@@ -297,9 +323,13 @@ where
         .into_iter()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(local_x, local_z, payload)| {
-            compress(RegionCompression::Zlib, &payload, level)
-                .map(|bytes| (local_x, local_z, bytes))
+        .map(|(local_x, local_z, payload)| match payload {
+            // Already a deflate stream: hand it straight to the sector writer.
+            ZlibEncode::Zlib(bytes) => Ok((local_x, local_z, bytes)),
+            ZlibEncode::Payload(bytes) => {
+                compress(RegionCompression::Zlib, &bytes, level)
+                    .map(|compressed| (local_x, local_z, compressed))
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     let mut writer = BufWriter::with_capacity(1 << 20, file);
@@ -372,7 +402,8 @@ fn unix_now_seconds() -> u32 {
         .unwrap_or(0)
 }
 
-fn compress(kind: RegionCompression, payload: &[u8], level: Compression) -> Result<Vec<u8>> {
+/// Compresses `payload` with the region-file codec (zlib for vanilla Java).
+pub fn compress(kind: RegionCompression, payload: &[u8], level: Compression) -> Result<Vec<u8>> {
     match kind {
         RegionCompression::Gzip => {
             let mut encoder = GzEncoder::new(Vec::with_capacity(payload.len() / 2), level);

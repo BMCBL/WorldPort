@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::convert::{ConversionOptions, ConversionPlan, Progress};
 use crate::error::{Result, WorldPortError, io_result};
-use crate::je::anvil::write_region_file;
+use crate::je::anvil::{RegionCompression, ZlibEncode, write_region_file, write_region_compressed};
 use crate::je::nbt as je_nbt;
 use crate::je::{JeBlockPos, JeChunkPos, JeDimension};
 use crate::mapping::biomes::java_biome_name;
@@ -226,7 +226,14 @@ pub fn convert(
                     .par_iter()
                     .map(|pos| {
                         options.check_cancelled()?;
-                        convert_position(&world, *pos, &mapper, &target, plan.pruning.blocks)
+                        convert_position(
+                            &world,
+                            *pos,
+                            &mapper,
+                            &target,
+                            plan.pruning.blocks,
+                            plan.compression_level,
+                        )
                     })
                     .collect()
             });
@@ -257,11 +264,19 @@ pub fn convert(
             pool.install(|| -> Result<()> {
                 if !chunks.is_empty() {
                     let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
-                    write_region_file(&path, chunks, compression_level(plan))?;
+                    write_region_compressed(
+                        &path,
+                        chunks.into_iter().map(|(lx, lz, bytes)| (lx, lz, ZlibEncode::Zlib(bytes))),
+                        compression_level(plan),
+                    )?;
                 }
                 if !entities.is_empty() {
                     let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
-                    write_region_file(&path, entities, compression_level(plan))?;
+                    write_region_compressed(
+                        &path,
+                        entities.into_iter().map(|(lx, lz, bytes)| (lx, lz, ZlibEncode::Zlib(bytes))),
+                        compression_level(plan),
+                    )?;
                 }
                 Ok(())
             })?;
@@ -299,16 +314,21 @@ fn convert_position(
     mapper: &BlockMapper,
     target: &JavaTarget,
     policy: crate::convert::UnknownDataPolicy,
+    compression_level: u32,
 ) -> Result<(Option<ConvertedChunk>, ReportBuilder)> {
     let mut report = ReportBuilder::new("", "", "", "");
     let Some((nbt, entities)) = read_chunk(world, pos, mapper, target, policy, &mut report)? else {
         return Ok((None, report));
     };
-    // Reuse one encode buffer per worker; a chunk payload is a few hundred KiB,
-    // so allocating it per chunk dominated the allocator for a whole world.
+    // Encode into the worker's buffer, compress immediately, then hand the
+    // buffer back for the next chunk. Keeping the uncompressed payload for the
+    // region writer meant allocating (and holding) a fresh buffer per chunk;
+    // compressing here lets one buffer serve every chunk and keeps only the
+    // compressed bytes resident.
+    let level = Compression::new(compression_level);
     let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
     je_nbt::encode_into(&mut scratch, "", &nbt)?;
-    let payload = std::mem::replace(&mut scratch, Vec::with_capacity(64 * 1024));
+    let payload = crate::je::anvil::compress(RegionCompression::Zlib, &scratch, level)?;
     let entities = if entities.is_empty() {
         None
     } else {
@@ -318,8 +338,16 @@ fn convert_position(
             ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
         ]);
         je_nbt::encode_into(&mut scratch, "", &entity_chunk)?;
-        Some(std::mem::replace(&mut scratch, Vec::with_capacity(16 * 1024)))
+        Some(crate::je::anvil::compress(
+            RegionCompression::Zlib,
+            &scratch,
+            level,
+        )?)
     };
+    // Keep a modest buffer; a pathological chunk must not pin a huge one.
+    if scratch.capacity() > 8 * 1024 * 1024 {
+        scratch = Vec::with_capacity(64 * 1024);
+    }
     SCRATCH.with_borrow_mut(|slot| *slot = scratch);
     Ok((Some(ConvertedChunk { payload, entities }), report))
 }
@@ -345,9 +373,15 @@ fn read_chunk(
     let mut any_blocks = false;
 
     // Union of subchunk layers and biome storages decides which sections to emit.
+    // Test for the record instead of calling `chunk.subchunk(y)`: that decodes
+    // the whole palette and index payload, so using it as an existence check
+    // parsed every non-empty subchunk twice (once to discard, once to convert).
     let mut section_ys: Vec<i8> = Vec::new();
-    for y in -4_i8..=19 {
-        if let Ok(Some(_)) = chunk.subchunk(y) {
+    for record in &chunk.records {
+        if record.key.tag != ChunkRecordTag::SubChunkPrefix {
+            continue;
+        }
+        if let Some(y) = record.key.subchunk_y {
             section_ys.push(y);
         }
     }

@@ -510,7 +510,6 @@ fn convert_chunk(
         dimension: dimension_of(dimension),
     };
     let keys = chunk_keys(be_pos);
-    let mut mapped_cache: BTreeMap<(String, Vec<(String, String)>), MappedState> = BTreeMap::new();
 
     // Sections, in the Bedrock subchunk grid.
     let mut sections: Vec<SectionWrite> = Vec::new();
@@ -524,7 +523,6 @@ fn convert_chunk(
                 section,
                 y,
                 mapper,
-                &mut mapped_cache,
                 report,
                 policy,
             )?;
@@ -686,6 +684,61 @@ fn convert_chunk(
     Ok(())
 }
 
+/// Renders a Bedrock state as a comparable key for palette deduplication.
+fn render_bedrock_state(state: &BlockState) -> String {
+    if state.states.is_empty() {
+        return state.name.clone();
+    }
+    let mut out = String::with_capacity(state.name.len() + 16 * state.states.len());
+    out.push_str(&state.name);
+    out.push('[');
+    for (index, (key, value)) in state.states.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&format!("{value:?}"));
+    }
+    out.push(']');
+    out
+}
+
+/// Maps one Java palette entry to its Bedrock state.
+///
+/// `with_water` requests the waterlogged variant of a block that can hold
+/// water; the returned state already includes that flag.
+fn resolve_je_entry(
+    mapper: &BlockMapper,
+    report: &mut ReportBuilder,
+    name: &str,
+    properties: &BTreeMap<String, String>,
+    with_water: bool,
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<MappedState> {
+    let mut properties = properties.clone();
+    if with_water {
+        properties.insert("waterlogged".to_string(), "true".to_string());
+    }
+    let Some(mapped) = mapper.je_to_be(name, &properties) else {
+        if policy == crate::convert::UnknownDataPolicy::Error {
+            return Err(WorldPortError::unsupported(format!(
+                "block {name}{properties:?} has no Bedrock mapping"
+            )));
+        }
+        report.unmapped_block(
+            format!("{name}{properties:?}"),
+            format!("block {name} has no Bedrock mapping; air was written"),
+        );
+        return Ok(MappedState {
+            name: "minecraft:air".to_string(),
+            properties: BTreeMap::new(),
+            lossy: true,
+        });
+    };
+    Ok(mapped)
+}
+
 fn air_state() -> BlockState {
     BlockState {
         name: "minecraft:air".to_string(),
@@ -705,7 +758,6 @@ fn convert_section(
     section: &NbtTag,
     y: i8,
     mapper: &BlockMapper,
-    cache: &mut BTreeMap<(String, Vec<(String, String)>), MappedState>,
     report: &mut ReportBuilder,
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<SectionOutcome> {
@@ -752,7 +804,9 @@ fn convert_section(
     let indices = decode_indices(data, SECTION_BLOCKS, bits);
 
     let mut primary_palette: Vec<BlockState> = vec![air_state()];
-    let mut primary_index_map: BTreeMap<u16, u16> = BTreeMap::new();
+    // Keyed by the rendered target state: different Java variants that map to
+    // the same Bedrock block share one palette slot.
+    let mut primary_index_map: BTreeMap<String, u16> = BTreeMap::new();
     let mut primary = vec![0_u16; SECTION_BLOCKS];
 
     let mut liquid_palette: Vec<BlockState> = vec![air_state(), water_state()];
@@ -767,96 +821,105 @@ fn convert_section(
         entries.iter().map(|(name, _)| crate::poi::classify(name)).collect();
     let mut palette_usage = vec![0_u32; entries.len()];
 
+    // Resolve every palette entry once, before walking the 4096 blocks.
+    //
+    // The previous loop rebuilt a `(name, properties)` key and cloned a
+    // `MappedState` per block, so a section with 30 entries paid 4096 key
+    // builds, map lookups and clones for 30 distinct answers. Per entry the
+    // work is now: map once, render once, store two slot values (plain and
+    // waterlogged) plus the liquid slot.
+    //
+    // `slot_primary[i][v]` is `0` for "no block" and `palette index + 1`
+    // otherwise; `slot_liquid[i]` is the liquid palette slot (`0` = none,
+    // `1` = water, `2` = lava) that the entry's blocks contribute.
+    let mut slot_primary: Vec<[u32; 2]> = vec![[0; 2]; entries.len()];
+    let mut slot_liquid: Vec<[u16; 2]> = vec![[0; 2]; entries.len()];
+    let mut needs_lava = false;
+    for (index, (name, properties)) in entries.iter().enumerate() {
+        if !crate::mapping::is_vanilla(name) {
+            // Mod/addon block: pruned, so both variants stay empty.
+            report.warn(
+                WarningCode::Pruned,
+                name.clone(),
+                format!("non-vanilla block {name} was pruned"),
+            );
+            continue;
+        }
+        let short = crate::mapping::short_name(name);
+        if short == "air" || short == "cave_air" || short == "void_air" {
+            continue;
+        }
+        if short == "water" || short == "lava" {
+            // Fluid entries only fill the liquid layer; they never enter the
+            // primary palette.
+            let fluid: u16 = if short == "water" { 1 } else { 2 };
+            slot_liquid[index] = [fluid, fluid];
+            needs_lava |= fluid == 2;
+            continue;
+        }
+        let declared_waterlogged = properties
+            .get("waterlogged")
+            .is_some_and(|value| value == "true");
+        for variant in 0..2usize {
+            let with_water = variant == 1;
+            let mapped = resolve_je_entry(mapper, report, name, properties, with_water, policy)?;
+            if mapped.name == "minecraft:air" {
+                continue;
+            }
+            if mapped.lossy {
+                report.warn(
+                    WarningCode::Lossy,
+                    mapped.name.clone(),
+                    format!("{} lost states the Bedrock block cannot express", mapped.name),
+                );
+            }
+            let state = to_block_state(&mapped, mapper.bedrock());
+            let key = render_bedrock_state(&state);
+            let target = *primary_index_map.entry(key).or_insert_with(|| {
+                primary_palette.push(state);
+                (primary_palette.len() - 1) as u16
+            });
+            slot_primary[index][variant] = u32::from(target) + 1;
+            if with_water {
+                slot_liquid[index][variant] = 1;
+            }
+        }
+        // A block that declares `waterlogged=true` in its own state is
+        // water-filled even when the per-block flag is absent, matching the
+        // source's own declaration.
+        if declared_waterlogged {
+            slot_liquid[index][0] = 1;
+        }
+    }
+    if needs_lava && liquid_palette.len() == 2 {
+        liquid_palette.push(lava_state());
+    }
+
     let mut any_block = false;
     for x in 0..16_usize {
         for z in 0..16_usize {
             for local_y in 0..16_usize {
                 let je_index = (local_y << 8) | (z << 4) | x;
-                let palette_index = indices.get(je_index).copied().unwrap_or(0) as usize;
-                let Some((name, properties)) = entries.get(palette_index) else {
-                    continue;
-                };
+                let entry_index = indices.get(je_index).copied().unwrap_or(0) as usize;
                 let be_offset = x * 256 + z * 16 + local_y;
-
-                if !crate::mapping::is_vanilla(name) {
-                    // Mod/addon block: prune instead of writing an unknown id.
-                    report.warn(
-                        WarningCode::Pruned,
-                        name.clone(),
-                        format!("non-vanilla block {name} was pruned"),
-                    );
-                    continue;
-                }
-                let short = crate::mapping::short_name(name);
-                if short == "air" || short == "cave_air" || short == "void_air" {
-                    continue;
-                }
-                if short == "water" || short == "lava" {
-                    has_liquid = true;
-                    liquid[be_offset] = if short == "water" { 1 } else { 2 };
-                    if short == "lava" && liquid_palette.len() == 2 {
-                        liquid_palette.push(lava_state());
-                    }
-                    continue;
-                }
-
-                if let Some(usage) = palette_usage.get_mut(palette_index) {
+                if let Some(usage) = palette_usage.get_mut(entry_index) {
                     *usage = usage.saturating_add(1);
                 }
-                let waterlogged = properties.get("waterlogged").is_some_and(|value| value == "true");
-                let cache_key = (
-                    name.clone(),
+                let waterlogged = entries.get(entry_index).is_some_and(|(_, properties)| {
                     properties
-                        .iter()
-                        .filter(|(key, _)| key.as_str() != "waterlogged")
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect::<Vec<_>>(),
-                );
-                let mapped = if let Some(mapped) = cache.get(&cache_key) {
-                    mapped.clone()
-                } else {
-                    let mapped = match mapper.je_to_be(name, &properties) {
-                        Some(mapped) => mapped,
-                        None => {
-                            if policy == crate::convert::UnknownDataPolicy::Error {
-                                return Err(WorldPortError::unsupported(format!(
-                                    "block {name}{properties:?} has no Bedrock mapping"
-                                )));
-                            }
-                            report.unmapped_block(
-                                format!("{name}{properties:?}"),
-                                format!("block {name} has no Bedrock mapping; air was written"),
-                            );
-                            MappedState {
-                                name: "minecraft:air".to_string(),
-                                properties: BTreeMap::new(),
-                                lossy: true,
-                            }
-                        }
-                    };
-                    cache.insert(cache_key, mapped.clone());
-                    mapped
-                };
-                if mapped.name == "minecraft:air" {
-                    continue;
-                }
-                if mapped.lossy {
-                    report.warn(
-                        WarningCode::Lossy,
-                        mapped.name.clone(),
-                        format!("{} lost states the Bedrock block cannot express", mapped.name),
-                    );
-                }
-                let state = to_block_state(&mapped, mapper.bedrock());
-                let palette_index = *primary_index_map.entry(palette_index as u16).or_insert_with(|| {
-                    primary_palette.push(state.clone());
-                    (primary_palette.len() - 1) as u16
+                        .get("waterlogged")
+                        .is_some_and(|value| value == "true")
                 });
-                any_block = true;
-                primary[be_offset] = palette_index;
-                if waterlogged {
+                let variant = usize::from(waterlogged);
+                let mapped = slot_primary[entry_index][variant];
+                if mapped != 0 {
+                    any_block = true;
+                    primary[be_offset] = u16::try_from(mapped - 1).unwrap_or(0);
+                }
+                let fluid = slot_liquid[entry_index][variant];
+                if fluid != 0 {
                     has_liquid = true;
-                    liquid[be_offset] = 1;
+                    liquid[be_offset] = fluid;
                 }
             }
         }

@@ -221,13 +221,33 @@ fn write_len(out: &mut Vec<u8>, length: usize) -> Result<()> {
 }
 
 fn write_mutf8_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
-    let mut encoded = Vec::with_capacity(value.len());
-    encode_mutf8(value, &mut encoded);
-    let length = u16::try_from(encoded.len())
-        .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(&encoded);
-    Ok(())
+    // ASCII maps byte-for-byte onto modified UTF-8, and NBT is dominated by
+    // short ASCII field names (`Name`, `Y`, `palette`, ...). Writing the slice
+    // directly avoids one `Vec` allocation per string.
+    if value.is_ascii() && !value.as_bytes().contains(&0) {
+        let length = u16::try_from(value.len())
+            .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+        return Ok(());
+    }
+    // Non-ASCII or embedded NUL: encode into a reused thread-local buffer so a
+    // chunk full of names does not allocate once per string.
+    MUTF8_SCRATCH.with_borrow_mut(|scratch| -> Result<()> {
+        scratch.clear();
+        encode_mutf8(value, scratch);
+        let length = u16::try_from(scratch.len())
+            .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(scratch);
+        Ok(())
+    })
+}
+
+thread_local! {
+    /// Reused buffer for non-ASCII modified UTF-8 strings.
+    static MUTF8_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
 struct Reader<'a> {
