@@ -18,7 +18,10 @@ WorldPort 是 BMCBL 的**世界转换工具**：在《Minecraft》基岩版（Be
 | 本地玩家 | 支持 | 支持（目标 M3，含背包/末影箱/效果） |
 | `playerdata/` 多人玩家 | 不支持 | 支持（目标 M3） |
 | 版本升降级 + 剔除 | 支持 | 支持（目标 M4） |
-| 结构与村庄 | 不支持 | v1 同样不支持（报告中明示） |
+| 村庄兴趣点（床/工作站/钟） | 不支持 | **支持**（BE→JE 写 `poi/`，按坐标去重） |
+| 村民职业/类型/等级 | 不支持 | **支持**（`SkinID`/`MarkVariant`/`TradeTier` ↔ `VillagerData`） |
+| 结构生成区（要塞/神殿/前哨/女巫小屋） | 不支持 | **部分**：Java 有 piece 边界时写 Bedrock `HardcodedSpawners`；反方向只统计、不伪造 `StructureStart` |
+| 结构模板（`.nbt` ↔ `.mcstructure`） | 不支持 | 未做（v1 边界） |
 | tick/scheduled events | 不支持 | 支持（目标 M3/M4） |
 
 ## 项目结构
@@ -157,6 +160,24 @@ Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command
     `Snapshot` 恢复进度。
   - 打包：`./scripts/build-plugin.ps1` 生成 `dist/worldport-0.1.0.bmcblx` 与
     `dist/native/windows-x86_64-msvc/worldport_native.dll`（DLL 摘要烘进 Wasm）。
+- ✅ M9 村庄 / POI / 结构（按能力分别标注，不统称 1:1）：
+  - **POI（完整转换）**：Bedrock `VILLAGE_*_POI` 按村民存、Java `poi/r.X.Z.mca` 按坐标存，
+    转换是「展平 + 按坐标去重」而不是复制。`free_tickets = Capacity - OwnerCount`（钳到 0，
+    capacity 为 0 视为单人）；Java 的票据是「剩余可用」，与 Bedrock 的归属计数相反。
+    真实 1.20.12 存档：1097 条 / 480 区块 / **0 重复坐标**，604 床与源数据完全一致；
+    443 个集合点 listing 归并为 40 个钟（同一村庄每个村民都会列出它）。
+    Bedrock 独有（蜂巢/磁石/避雷针/下界传送门）无 Java POI 类型，计数后丢弃，不写未知类型。
+  - **村庄运行状态（语义重建）**：Bedrock 的村庄（边界/居民）无法从方块推导，也不伪造
+    `VILLAGE_*` 记录；JE→BE 改为统计地形中的兴趣点并说明 Bedrock 会在区块加载时自行重建村庄。
+  - **村民（完整转换）**：15 个职业、7 个类型、等级/层级（Bedrock 0 基、Java 1 基）双向映射；
+    未知 `SkinID` 保持失业并报告，不猜职业。真实存档 784 个村民 0 个缺失 `VillagerData`。
+  - **结构生成区（部分保留）**：`HardcodedSpawners`（tag 0x39）是二进制生成盒，不是 NBT，
+    没有 piece 列表 / 战利品 / `/locate` 键。Java 有 `Children` 边界时写生成区
+    （fixture：`[-8,40,-8]..[8,60,8]` 精确往返）；Bedrock→Java **不伪造** `StructureStart`
+    ——伪造的 piece 会让 `/locate` 指向不存在的结构并干扰后续生成，改为统计并说明
+    （真实存档 2422 个区，与独立 dump 的 276/49/5 一致）。
+  - 结构模板（`.nbt` ↔ `.mcstructure`）未做，v1 边界不变。
+  - 结构统计走**计数器**而非警告行：同一世界有 2049 条方块级警告，超过报告 2048 行上限。
 
 ## 数据与许可
 
