@@ -78,6 +78,8 @@ impl RegionFile {
             ));
         }
         let file = if exists {
+            // A reader that never writes must not request write access: it
+            // fails on read-only media and takes an exclusive lock needlessly.
             io_result(path, File::options().read(true).write(true).open(path))?
         } else {
             let file = io_result(

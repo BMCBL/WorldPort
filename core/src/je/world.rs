@@ -23,9 +23,24 @@ use crate::nbt::{NbtExt, TagValue};
 /// a real world took 5.77 s reopening versus 0.63 s with one handle per region
 /// (16 opens). One cache per reader thread keeps handles private, so there is
 /// no lock on the read path.
+/// Region files a single reader keeps open at once.
+///
+/// A large world has hundreds of region files and every worker has its own
+/// cache, so an unbounded map grows with the world size: thousands of file
+/// handles plus one 8 KiB header each. Chunk reads are region-local, so a small
+/// window keeps the hit rate while bounding the handles.
+const REGION_CACHE_CAPACITY: usize = 24;
+
+/// One cached region handle with the tick it was last used on.
+struct CachedRegion {
+    region: RegionFile,
+    last_used: u64,
+}
+
 #[derive(Default)]
 pub struct RegionCache {
-    open: HashMap<PathBuf, RegionFile>,
+    open: HashMap<PathBuf, CachedRegion>,
+    clock: u64,
 }
 
 impl RegionCache {
@@ -36,14 +51,34 @@ impl RegionCache {
         local_x: u8,
         local_z: u8,
     ) -> Result<Option<Vec<u8>>> {
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
         if !self.open.contains_key(path) {
-            self.open
-                .insert(path.to_path_buf(), RegionFile::open(path, false)?);
+            if self.open.len() >= REGION_CACHE_CAPACITY {
+                // Evict the least recently used entry. Region reads are local,
+                // so the entry about to be replaced is normally the coldest.
+                if let Some(coldest) = self
+                    .open
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_used)
+                    .map(|(key, _)| key.clone())
+                {
+                    self.open.remove(&coldest);
+                }
+            }
+            self.open.insert(
+                path.to_path_buf(),
+                CachedRegion {
+                    region: RegionFile::open(path, false)?,
+                    last_used: clock,
+                },
+            );
         }
-        let Some(region) = self.open.get_mut(path) else {
+        let Some(cached) = self.open.get_mut(path) else {
             return Ok(None);
         };
-        region.read_chunk(local_x, local_z)
+        cached.last_used = clock;
+        cached.region.read_chunk(local_x, local_z)
     }
 
     /// Region files currently held open.

@@ -169,22 +169,29 @@ pub struct SectionWrite {
 }
 
 /// Encodes one section as a v9 subchunk payload.
-pub fn encode_section(section: &SectionWrite) -> Result<Bytes> {
-    let mut storages = vec![BlockPalette::with_unpacked_indices(
-        section.primary_palette.clone(),
-        section.primary.clone(),
-        None,
-    )];
-    if let Some(liquid) = &section.liquid
+///
+/// Takes the section by value: the encoder needs owned palettes and indices,
+/// and cloning them here copied 8 KiB of indices plus the full palette for
+/// every section of every chunk.
+pub fn encode_section(section: SectionWrite) -> Result<Bytes> {
+    let mut storages = Vec::with_capacity(2);
+    let mut liquid_taken = false;
+    if let Some(liquid) = section.liquid
         && !section.liquid_palette.is_empty()
         && liquid.iter().any(|index| *index != 0)
     {
+        liquid_taken = true;
         storages.push(BlockPalette::with_unpacked_indices(
-            section.liquid_palette.clone(),
-            liquid.clone(),
+            section.liquid_palette,
+            liquid,
             None,
         ));
     }
+    let _ = liquid_taken;
+    storages.insert(
+        0,
+        BlockPalette::with_unpacked_indices(section.primary_palette, section.primary, None),
+    );
     let subchunk = SubChunk {
         y: section.y,
         format: SubChunkFormat::Paletted {
@@ -373,7 +380,7 @@ mod tests {
             liquid_palette: Vec::new(),
             biomes: [1; 64],
         };
-        let bytes = encode_section(&section).expect("encode");
+        let bytes = encode_section(section).expect("encode");
         assert_eq!(bytes[0], 9);
         assert_eq!(bytes[2], 3);
         let decoded = SubChunk::read(3, bytes, SubChunkDecodeMode::FullIndices).expect("decode");
@@ -394,7 +401,7 @@ mod tests {
             liquid_palette: vec![air(), stone()],
             biomes: [1; 64],
         };
-        let bytes = encode_section(&section).expect("encode");
+        let bytes = encode_section(section).expect("encode");
         assert_eq!(bytes[1], 2, "two storage layers");
     }
 }

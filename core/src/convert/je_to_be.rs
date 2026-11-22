@@ -564,7 +564,25 @@ fn convert_chunk(
         quart_biomes.push(biome);
     }
 
-    for section in &sections {
+    // Consume the sections: `encode_section` needs owned palettes and indices,
+    // and cloning them per section copied 8 KiB of indices plus the whole
+    // palette (24 sections per chunk). The heightmap pass runs first so nothing
+    // needs the sections afterwards.
+    // Scheduled ticks resolve their block state by position. Read them before
+    // the sections are consumed, and only then snapshot the section data the
+    // lookup needs (most chunks carry no ticks, so this copy is rare).
+    let pending_ticks = crate::tick::read_java_chunk(chunk);
+    let tick_sections: Vec<(i8, Vec<u16>, Vec<BlockState>)> = if pending_ticks.is_empty() {
+        Vec::new()
+    } else {
+        sections
+            .iter()
+            .map(|section| (section.y, section.primary.clone(), section.primary_palette.clone()))
+            .collect()
+    };
+
+    let had_sections = !sections.is_empty();
+    for section in sections {
         let base_y = i32::from(section.y) * 16;
         for x in 0..16_usize {
             for z in 0..16_usize {
@@ -579,17 +597,18 @@ fn convert_chunk(
                 height_map[column] = height_map[column].max(i16::try_from(top).unwrap_or(i16::MAX));
             }
         }
-        let bytes = encode_section(section)?;
-        sink.put_raw(keys.subchunk(section.y).encode(), bytes);
         report.counters().sections += 1;
         for index in &section.primary {
             if *index != 0 {
                 report.counters().blocks += 1;
             }
         }
+        let y = section.y;
+        let bytes = encode_section(section)?;
+        sink.put_raw(keys.subchunk(y).encode(), bytes);
     }
 
-    if !sections.is_empty() {
+    if had_sections {
         let bytes = encode_biomes(&height_map, &quart_biomes)?;
         sink.put_raw(keys.data3d.encode(), bytes);
     }
@@ -644,21 +663,22 @@ fn convert_chunk(
         }
     }
 
-    // Scheduled ticks: read the unified model, then write Bedrock's record.
-    let ticks = crate::tick::read_java_chunk(chunk);
-    if !ticks.is_empty() {
+    // Scheduled ticks: write Bedrock's record from the model read earlier.
+    if !pending_ticks.is_empty() {
         let state_at = |x: i32, y: i32, z: i32| -> Option<(String, BTreeMap<String, NbtTag>)> {
             let section_y = i8::try_from(y.div_euclid(16)).ok()?;
-            let section = sections.iter().find(|section| section.y == section_y)?;
+            let (_, primary, palette) = tick_sections
+                .iter()
+                .find(|(section, _, _)| *section == section_y)?;
             let lx = usize::try_from(x.rem_euclid(16)).ok()?;
             let ly = usize::try_from(y.rem_euclid(16)).ok()?;
             let lz = usize::try_from(z.rem_euclid(16)).ok()?;
-            let index = section.primary.get(lx * 256 + lz * 16 + ly).copied()?;
-            let state = section.primary_palette.get(usize::from(index))?;
+            let index = primary.get(lx * 256 + lz * 16 + ly).copied()?;
+            let state = palette.get(usize::from(index))?;
             Some((state.name.clone(), state.states.clone()))
         };
         let (record, stats) = crate::tick::write_bedrock_pending(
-            &ticks,
+            &pending_ticks,
             current_tick,
             crate::be::write::target_block_state_version(),
             state_at,
