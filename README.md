@@ -58,6 +58,24 @@ cargo run -p worldport-cli -- chunk "<world>" --search --keys
 cargo build --profile native-release -p worldport-cli
 ```
 
+## 插件（工具页）
+
+```powershell
+./scripts/build-plugin.ps1
+```
+
+产物：
+
+- `dist/worldport-0.1.0.bmcblx` —— 导入「下载 → 插件」后，「工具」页出现「世界转换」。
+- `dist/native/windows-x86_64-msvc/worldport_native.dll` —— 在「设置 → 插件」批准。
+
+插件把 DLL 的 SHA-256 烘进包内，重新构建 DLL 后要重新打包（脚本会一起做）。
+页面里也能手动填写摘要（`native_sha256` 存在插件 KV，优先于烘入值）。
+
+Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command` 提交命令，
+`read_events` 长轮询事件，取消走 `cancel_command`（越过队列立即生效）。
+`native/tests/abi.rs` 直接用导出的 C ABI 跑完「创建 → 检测 → 转换 → 快照 → 销毁」。
+
 ## 当前状态
 
 - ✅ M0：JE 大端 NBT（modified UTF-8）、Anvil 读写、经典与 26.x 分离式布局
@@ -118,7 +136,16 @@ cargo build --profile native-release -p worldport-cli
   - 回环保真度（JE→BE→JE 与原世界对比，我们自己的转换器读回两个产物）：
     WorldPort 3.0% 方块差异、0 实体/tick/群系差异；Chunker 2.8% 方块差异、504 个方块
     实体差异、68 个未映射方块。两者的剩余方块差异都集中在墙/楼梯连接状态归一化。
-- ⏳ M6：`.bmcblx` 插件 + 原生 DLL，注册到 BMCBL「工具」页。
+- ✅ M6 插件：
+  - `native/` 实现 `bmcbl_native_entry` ABI（1.0）：单实例、64 KiB 命令 / 256 KiB 事件批次、
+    事件环 + 序号 + gap 标记、`cancel_command` 直接置取消标志（不受命令队列阻塞）、
+    销毁时 join 工作线程并静默回调。
+  - `plugin/` 是独立 workspace 的 `.bmcblx`（`worldport`，工具页图标 `network`，order 10）：
+    源/输出目录浏览与检测、方向与目标版本、转换内容开关、高级项（并行度/压缩/覆盖）、
+    进度、警告与结果摘要、输出目录打开、原生摘要保存；离开页面任务继续，回来用
+    `Snapshot` 恢复进度。
+  - 打包：`./scripts/build-plugin.ps1` 生成 `dist/worldport-0.1.0.bmcblx` 与
+    `dist/native/windows-x86_64-msvc/worldport_native.dll`（DLL 摘要烘进 Wasm）。
 
 ## 数据与许可
 
