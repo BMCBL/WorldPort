@@ -1,0 +1,37 @@
+[package]
+name = "worldport-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+description = "WorldPort: convert Minecraft worlds between Bedrock and Java with full NBT"
+
+# The plugin is a WebAssembly component; it is not part of the host workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+bmcbl_plugin_api = { path = "../sdk/bmcbl-plugin-api" }
+worldport-protocol = { path = "../protocol" }
+
+[build-dependencies]
+bmcbl_plugin_api = { path = "../sdk/bmcbl-plugin-api", features = ["pack"] }
+
+[package.metadata.bmcbl-plugin]
+id = "worldport"
+name = "WorldPort"
+description = "Bedrock 与 Java 世界双向转换：方块、方块实体、实体与完整 NBT、地图、计划刻"
+tags = ["world", "converter", "bedrock", "java"]
+capabilities = ["ui.page", "toast"]
+readme = "README.md"
+icon = "assets/icon.png"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
