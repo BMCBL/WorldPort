@@ -21,7 +21,7 @@ use crate::be::write::{
     BedrockOutput, CHUNK_VERSION_VALUE, FINALIZED_STATE_POPULATED, SECTION_BLOCKS, SectionWrite,
     chunk_keys, dimension_of, encode_biomes, encode_section, to_block_state,
 };
-use crate::convert::{ConversionOptions, ConversionPlan, Edition};
+use crate::convert::{ConversionOptions, ConversionPlan, Edition, Progress};
 use crate::error::{Result, WorldPortError};
 use crate::je::chunk::summarize;
 use crate::je::nbt as je_nbt;
@@ -146,18 +146,21 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     report.end_stage();
 
     report.begin_stage("maps");
+    options.report(Progress::new("maps", 0, None));
     if plan.features.maps {
         write_maps(&mut output, &world, &mut report)?;
     }
     report.end_stage();
 
     report.begin_stage("players");
+    options.report(Progress::new("players", 0, None));
     if plan.features.players {
         write_player(&mut output, &world, &mut report)?;
     }
     report.end_stage();
 
     report.begin_stage("level.dat");
+    options.report(Progress::new("level.dat", 0, None));
     if plan.features.level_dat {
         let root = level_dat_root(&world, &mut report)?;
         output.write_level_dat(root)?;
@@ -165,6 +168,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     report.end_stage();
 
     report.begin_stage("finalize");
+    options.report(Progress::new("finalize", 0, None));
     output.finish()?;
     report.end_stage();
     Ok(report.finish())

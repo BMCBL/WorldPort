@@ -21,7 +21,7 @@ use crate::je::anvil::write_region_file;
 use crate::je::nbt as je_nbt;
 use crate::je::{JeBlockPos, JeChunkPos, JeDimension};
 use crate::mapping::biomes::java_biome_name;
-use crate::mapping::schema::{JavaCatalog, bedrock_catalog};
+use crate::mapping::schema::bedrock_catalog;
 use crate::mapping::{BlockMapper, MappedState};
 use crate::nbt::{NbtExt, TagValue, compound, empty_compound, tag_list, tag_string};
 use crate::report::{ReportBuilder, WarningCode};
@@ -142,16 +142,19 @@ pub fn convert(
     );
 
     report.begin_stage("maps");
+    options.report(Progress::new("maps", 0, None));
     if plan.features.maps {
         write_maps(&plan.target, &world, &target, &mut report)?;
     }
     report.end_stage();
 
     report.begin_stage("players");
+    options.report(Progress::new("players", 0, None));
     let player_uuid = write_players(&plan.target, &world, &target, &mut report)?;
     report.end_stage();
 
     report.begin_stage("level.dat");
+    options.report(Progress::new("level.dat", 0, None));
     write_java_level(
         &plan.target,
         &world,
