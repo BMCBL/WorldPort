@@ -16,6 +16,8 @@ use crate::mapping::entities::{entity_to_bedrock, entity_to_java};
 use crate::nbt::{NbtExt, TagValue, compound, empty_compound, tag_list, tag_string};
 use crate::report::{ReportBuilder, WarningCode};
 
+pub mod villager;
+
 /// Fields copied between editions without translation.
 const SHARED_FIELDS: &[&str] = &[
     "Silent",
@@ -242,11 +244,30 @@ pub fn java_to_bedrock(je: &NbtTag, uid: i64, report: &mut ReportBuilder) -> Opt
     }
 
     if let Some(villager) = je.get("VillagerData") {
+        // Bedrock identifies profession and type by number, so the string ids
+        // have to be translated; an unknown id is reported instead of silently
+        // turning the villager into an unemployed one.
         let profession = villager.get_str("profession").unwrap_or("minecraft:none");
+        match villager::skin_id_from_profession(profession) {
+            Some(skin_id) => {
+                out.insert("SkinID".to_string(), NbtTag::Int(skin_id));
+            }
+            None => villager::report_unknown_profession(-1, report),
+        }
+        if let Some(villager_type) = villager.get_str("type")
+            && let Some(mark_variant) = villager::mark_variant_from_villager_type(villager_type)
+        {
+            out.insert("MarkVariant".to_string(), NbtTag::Int(mark_variant));
+        }
+        if let Some(level) = villager.get_int("level") {
+            out.insert("TradeTier".to_string(), NbtTag::Int(villager::trade_tier(level)));
+        }
         report.warn(
             WarningCode::Lossy,
             "villager-trades",
-            format!("villager profession {profession} is mapped best-effort on Bedrock"),
+            format!(
+                "villager profession {profession} is carried over as SkinID;                  Bedrock re-derives the trade offers from its own trade tables"
+            ),
         );
     }
     report.counters().entities += 1;
@@ -333,6 +354,12 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder, data_version: i3
         }
     } else if let Some(effects) = write_legacy_effects(be) {
         out.insert("ActiveEffects".to_string(), effects);
+    }
+    // Villagers: Bedrock numbers the profession and type, Java names them.
+    if identifier.starts_with("minecraft:villager") || identifier == "minecraft:wandering_trader" {
+        if let Some(villager_data) = villager_data(be, report) {
+            out.insert("VillagerData".to_string(), villager_data);
+        }
     }
     // Java needs a UUID; derive a stable one from the Bedrock UniqueID.
     if let Some(uid) = be.get_int("UniqueID") {
@@ -721,4 +748,37 @@ mod tests {
         )]);
         assert_eq!(chunk_of(&nbt), Some((-1, 2)));
     }
+}
+
+/// Builds Java `VillagerData` from a Bedrock villager payload.
+///
+/// Returns `None` for non-villagers. An unrecognised `SkinID` keeps the villager
+/// unemployed (`minecraft:none`) and reports it, because writing a guessed
+/// profession would give the villager a workstation claim it cannot honour.
+fn villager_data(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag> {
+    let skin_id = be
+        .get_int("SkinID")
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0);
+    let profession = match villager::profession_from_skin_id(skin_id) {
+        Some(profession) => profession,
+        None => {
+            villager::report_unknown_profession(skin_id, report);
+            "minecraft:none"
+        }
+    };
+    let mark_variant = be
+        .get_int("MarkVariant")
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0);
+    let villager_type =
+        villager::villager_type_from_mark_variant(mark_variant).unwrap_or("minecraft:plains");
+    let level = be
+        .get_int("TradeTier")
+        .map_or(1, villager::villager_level);
+    Some(compound([
+        ("profession", tag_string(profession)),
+        ("type", tag_string(villager_type)),
+        ("level", NbtTag::Int(level)),
+    ]))
 }
