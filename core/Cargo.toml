@@ -5,6 +5,7 @@ edition = "2024"
 license = "GPL-3.0"
 publish = false
 description = "WorldPort conversion engine: Minecraft Bedrock <-> Java worlds"
+build = "build.rs"
 
 [dependencies]
 bedrock-nbt.workspace = true
@@ -22,6 +23,12 @@ indexmap.workspace = true
 rustc-hash.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+lz4_flex = "0.11.5"
+
+[build-dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+lz4_flex = "0.11.5"
 
 [dev-dependencies]
 tempfile = "3.23.0"

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
 
 use crate::error::{Result, WorldPortError};
 
@@ -140,9 +139,12 @@ impl JavaCatalog {
         static V26_2: OnceLock<Result<JavaCatalog>> = OnceLock::new();
         match version {
             "26.2" => V26_2
-                .get_or_init(|| JavaCatalog::parse(include_bytes!(
-                    "../../../mappings/data/java/26.2/blocks.json.gz"
-                )))
+                .get_or_init(|| {
+                    JavaCatalog::parse_baked(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/java_catalog_26_2.bin.lz4"
+                    )))
+                })
                 .as_ref()
                 .map_err(clone_error),
             other => Err(WorldPortError::unsupported(format!(
@@ -151,35 +153,35 @@ impl JavaCatalog {
         }
     }
 
-    fn parse(gzipped: &[u8]) -> Result<Self> {
-        let mut json = String::new();
-        flate2::read::GzDecoder::new(gzipped)
-            .read_to_string(&mut json)
-            .map_err(|error| WorldPortError::other(format!("java catalog gzip: {error}")))?;
-        let raw: BTreeMap<String, RawJavaBlock> = serde_json::from_str(&json)
-            .map_err(|error| WorldPortError::other(format!("java catalog json: {error}")))?;
+    /// Decodes the compile-time baked catalog (`build.rs` → LZ4 + length-prefixed binary).
+    fn parse_baked(blob: &[u8]) -> Result<Self> {
+        let raw = lz4_flex::block::decompress_size_prepended(blob)
+            .map_err(|error| WorldPortError::other(format!("java catalog lz4: {error}")))?;
+        if raw.len() < 8 || &raw[..4] != b"WPCB" {
+            return Err(WorldPortError::other("java catalog has a bad magic header"));
+        }
+        let mut reader = BinReader::new(&raw[4..]);
+        let block_count = reader.u32()?;
         let mut blocks = BTreeMap::new();
-        for (name, block) in raw {
+        for _ in 0..block_count {
+            let name = reader.string()?;
+            let property_count = reader.u16()?;
             let mut properties = BTreeMap::new();
-            for (property, values) in block.properties {
-                let kind = if values.len() == 2
-                    && values.iter().any(|value| value == "true")
-                    && values.iter().any(|value| value == "false")
-                {
-                    PropertyKind::Bool
-                } else if values.iter().all(|value| value.parse::<i32>().is_ok()) {
-                    PropertyKind::Int
-                } else {
-                    PropertyKind::String
+            for _ in 0..property_count {
+                let property = reader.string()?;
+                let kind = match reader.u8()? {
+                    0 => PropertyKind::Bool,
+                    1 => PropertyKind::Int,
+                    _ => PropertyKind::String,
                 };
+                let value_count = reader.u16()?;
+                let mut values = Vec::with_capacity(usize::from(value_count));
+                for _ in 0..value_count {
+                    values.push(reader.string()?);
+                }
                 properties.insert(property, PropertySchema::new(kind, values));
             }
-            blocks.insert(
-                name,
-                BlockSchema {
-                    properties,
-                },
-            );
+            blocks.insert(name, BlockSchema { properties });
         }
         Ok(Self {
             version: "26.2".to_string(),
@@ -247,12 +249,6 @@ pub fn bedrock_format_version() -> u32 {
     bedrock_world::block::catalog().format_version()
 }
 
-#[derive(Debug, Deserialize)]
-struct RawJavaBlock {
-    #[serde(default)]
-    properties: BTreeMap<String, Vec<String>>,
-}
-
 fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::Bool(value) => Some(value.to_string()),
@@ -273,6 +269,50 @@ fn clone_error(error: &WorldPortError) -> WorldPortError {
             path: path.clone(),
             source: std::io::Error::new(source.kind(), source.to_string()),
         },
+    }
+}
+
+/// Cursor over the baked length-prefixed binary format.
+struct BinReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BinReader<'a> {
+    const fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| WorldPortError::other("java catalog offset overflow"))?;
+        let slice = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| WorldPortError::other("java catalog is truncated"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2 bytes")))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+    }
+
+    fn string(&mut self) -> Result<String> {
+        let length = usize::from(self.u16()?);
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|error| WorldPortError::other(format!("java catalog utf8: {error}")))
     }
 }
 
