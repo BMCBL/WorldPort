@@ -7,12 +7,17 @@
 //! Java storage is handled by [`je::anvil`].
 
 pub mod be;
+pub mod block_entity;
 pub mod compare;
 pub mod convert;
+pub mod entity;
 pub mod error;
+pub mod fixtures;
+pub mod item;
 pub mod je;
 pub mod mapping;
 pub mod nbt;
+pub mod player;
 pub mod report;
 
 pub use convert::{ConversionOptions, ConversionPlan, Edition, Features};

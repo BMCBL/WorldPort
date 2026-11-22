@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 
 use bedrock_nbt::NbtTag;
 use bedrock_world::block::BlockEntity;
+use bedrock_world::{ActorUid, ChunkKey, ChunkPos, ChunkRecordTag};
 use bedrock_world::chunk::palette::BlockState;
 use bedrock_world::world::CreateOptions;
-use bedrock_world::{ChunkPos, Dimension, Spawn};
+use bedrock_world::{Dimension, Spawn};
 use indexmap::IndexMap;
 
 use crate::be::write::{
@@ -18,7 +19,7 @@ use crate::be::write::{
     chunk_keys, dimension_of, encode_biomes, encode_section, to_block_state,
 };
 use crate::convert::{ConversionOptions, ConversionPlan, Edition};
-use crate::error::Result;
+use crate::error::{Result, WorldPortError};
 use crate::je::chunk::summarize;
 use crate::je::nbt as je_nbt;
 use crate::je::world::JavaWorld;
@@ -67,6 +68,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
 
     report.begin_stage("terrain");
     let mut converted_chunks = 0_u64;
+    let mut uid_counter: i64 = 1;
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
         let positions = world.chunk_positions(dimension)?;
         if positions.is_empty() {
@@ -97,9 +99,11 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     &mut output,
                     &mut report,
                     &mapper,
+                    &world,
                     &chunk,
                     *pos,
                     dimension,
+                    &mut uid_counter,
                 )?;
                 converted_chunks += 1;
                 report.counters().chunks += 1;
@@ -114,6 +118,12 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     output.flush()?;
     report.end_stage();
 
+    report.begin_stage("players");
+    if plan.features.players {
+        write_player(&mut output, &world, &mut report)?;
+    }
+    report.end_stage();
+
     report.begin_stage("level.dat");
     if plan.features.level_dat {
         let root = level_dat_root(&world, &mut report)?;
@@ -125,6 +135,43 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     output.finish()?;
     report.end_stage();
     Ok(report.finish())
+}
+
+/// Converts the local player into Bedrock's `~local_player` record.
+fn write_player(
+    output: &mut BedrockOutput,
+    world: &JavaWorld,
+    report: &mut ReportBuilder,
+) -> Result<()> {
+    // Modern worlds keep `playerdata/<uuid>.dat`; classic ones embed `Data.Player`.
+    let player = if let Some((_, path)) = world.player_files()?.into_iter().next() {
+        je_nbt::read_gzip(&path).ok()
+    } else {
+        world
+            .data()
+            .get("Player")
+            .map(|player| je_nbt::NamedTag {
+                name: String::new(),
+                tag: player.clone(),
+            })
+    };
+    let Some(player) = player else {
+        report.warn(
+            WarningCode::Skipped,
+            "player",
+            "no local player data was found in the source world",
+        );
+        return Ok(());
+    };
+    let be = crate::player::java_to_bedrock(&player.tag);
+    let bytes = bedrock_nbt::serialize_root(&be)
+        .map_err(|error| WorldPortError::nbt(format!("player: {error}")))?;
+    output.put_raw(
+        bytes::Bytes::from_static(b"~local_player"),
+        bytes::Bytes::from(bytes),
+    );
+    report.counters().players += 1;
+    Ok(())
 }
 
 fn java_catalog_version(data_version: i32) -> &'static str {
@@ -206,9 +253,11 @@ fn convert_chunk(
     output: &mut BedrockOutput,
     report: &mut ReportBuilder,
     mapper: &BlockMapper,
+    world: &JavaWorld,
     chunk: &NbtTag,
     pos: JeChunkPos,
     dimension: JeDimension,
+    uid_counter: &mut i64,
 ) -> Result<()> {
     let be_pos = ChunkPos {
         x: pos.x,
@@ -292,21 +341,71 @@ fn convert_chunk(
         bytes::Bytes::from(FINALIZED_STATE_POPULATED.to_le_bytes().to_vec()),
     );
 
-    // Block entities: the state is convertible, the payload translation lands in M3.
+    // Block entities: translate payloads into one `BlockEntity` record.
+    let mut block_entities: Vec<NbtTag> = Vec::new();
     if let Some(entities) = chunk.get_list("block_entities") {
         for entity in entities {
-            let id = entity.get_str("id").unwrap_or("minecraft:unknown");
-            report.warn(
-                WarningCode::UnsupportedFeature,
-                "block-entity",
-                format!("block entity {id} payload is not converted yet (M3)"),
+            if let Some(converted) = crate::block_entity::java_to_bedrock(entity, report) {
+                block_entities.push(NbtTag::Compound(converted));
+            }
+        }
+    }
+    if !block_entities.is_empty() {
+        let bytes = bedrock_nbt::serialize_consecutive_roots(&block_entities)
+            .map_err(|error| WorldPortError::nbt(format!("block entities: {error}")))?;
+        output.put_raw(
+            ChunkKey::new(be_pos, ChunkRecordTag::BlockEntity).encode(),
+            bytes::Bytes::from(bytes),
+        );
+    }
+
+    // Entities: legacy inline `Entities` plus the 1.17+ `entities/` region file.
+    let mut je_entities: Vec<NbtTag> = chunk
+        .get_list("Entities")
+        .map(<[NbtTag]>::to_vec)
+        .unwrap_or_default();
+    je_entities.extend(world.read_entity_chunk(dimension, pos)?);
+    if !je_entities.is_empty() {
+        for entity in &je_entities {
+            let uid = *uid_counter;
+            *uid_counter += 1;
+            let Some(payload) = crate::entity::java_to_bedrock(entity, uid, report) else {
+                continue;
+            };
+            let actor_pos = crate::entity::chunk_of(&payload).unwrap_or((be_pos.x, be_pos.z));
+            output.put_actor(
+                ChunkPos {
+                    x: actor_pos.0,
+                    z: actor_pos.1,
+                    dimension: be_pos.dimension,
+                },
+                ActorUid::from_unique_id(uid),
+                payload,
             );
         }
-        let _ = entities;
-        let _: Option<Vec<BlockEntity>> = None;
+    }
+
+    // Scheduled ticks have no verified Bedrock layout yet; dropping them is safer
+    // than writing records the game cannot read.
+    if plan_ticks_present(chunk) {
+        report.warn(
+            WarningCode::UnsupportedFeature,
+            "ticks",
+            "scheduled block/fluid ticks are not converted yet",
+        );
     }
 
     output.finish_chunk()
+}
+
+/// Whether the chunk carries scheduled ticks worth reporting.
+fn plan_ticks_present(chunk: &NbtTag) -> bool {
+    chunk
+        .get_list("block_ticks")
+        .is_some_and(|ticks| !ticks.is_empty())
+        || chunk
+            .get_list("fluid_ticks")
+            .is_some_and(|ticks| !ticks.is_empty())
 }
 
 fn air_state() -> BlockState {

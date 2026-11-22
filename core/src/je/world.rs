@@ -253,6 +253,40 @@ impl JavaWorld {
         self.dimension_dir(dimension).join("region")
     }
 
+    /// Entity region folder for a dimension (1.17+ layout).
+    #[must_use]
+    pub fn entity_region_dir(&self, dimension: JeDimension) -> PathBuf {
+        self.dimension_dir(dimension).join("entities")
+    }
+
+    /// Reads the entities stored in a separate `entities/r.X.Z.mca` chunk.
+    ///
+    /// The 1.17+ format keeps `{ Entities, DataVersion, Position }` per chunk.
+    pub fn read_entity_chunk(
+        &self,
+        dimension: JeDimension,
+        pos: JeChunkPos,
+    ) -> Result<Vec<NbtTag>> {
+        let (region_x, region_z) = pos.region();
+        let path = self
+            .entity_region_dir(dimension)
+            .join(format!("r.{region_x}.{region_z}.mca"));
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let mut region = RegionFile::open(&path, false)?;
+        let (local_x, local_z) = pos.local();
+        let Some(payload) = region.read_chunk(local_x, local_z)? else {
+            return Ok(Vec::new());
+        };
+        let decoded = je_nbt::decode(&payload)?;
+        Ok(decoded
+            .tag
+            .get_list("Entities")
+            .map(<[NbtTag]>::to_vec)
+            .unwrap_or_default())
+    }
+
     /// Existing region files for a dimension as `(region_x, region_z, path)`.
     pub fn region_files(&self, dimension: JeDimension) -> Result<Vec<(i32, i32, PathBuf)>> {
         let dir = self.region_dir(dimension);

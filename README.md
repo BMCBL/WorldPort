@@ -72,7 +72,13 @@ cargo build --profile native-release -p worldport-cli
   方块实体槽位等已知项）。
 - ✅ 朝向映射按官方 wiki 语义 + Chunker 的 `BedrockStateTypes` 取值表校正（门旋转 90°、
   活板门 weirdo_direction、活塞/末地烛水平翻转、楼梯 corner、拉杆/中继器旧版 direction）。
-- ⏳ M3：实体/物品/玩家/地图/tick。
+- ✅ M3（部分）：物品/背包（含附魔、自定义名、药水、1.20.5 components）、方块实体
+  （容器/告示牌/刷怪笼/唱片机/蜂巢等）、实体（标识符、Pos/Motion/Rotation、装备、
+  状态效果、骑乘/驯服等共享字段）、玩家（`~local_player` ↔ `playerdata/<uuid>.dat`，
+  含副手槽 106↔-106）。
+  `worldport fixtures` 生成的测试世界回环 **方块/群系/实体/方块实体差异全部为 0**。
+- ⏳ M3 剩余：地图（`map_<id>` ↔ `map_<id>.dat`）与 tick（Bedrock `PendingTicks` 记录
+  格式尚未用真实存档验证，当前跳过并报告）。
 - ⏳ M4：版本升降级与剔除。
 - ⏳ M5：性能对比（同一输入跑 Chunker CLI）。
 - ⏳ M6：`.bmcblx` 插件 + 原生 DLL，注册到 BMCBL「工具」页。

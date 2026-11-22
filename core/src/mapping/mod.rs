@@ -7,7 +7,11 @@
 //! reported instead of silently guessed.
 
 pub mod biomes;
+pub mod effects;
+pub mod enchantments;
+pub mod entities;
 pub mod game_rules;
+pub mod potions;
 pub mod mapper;
 pub mod schema;
 

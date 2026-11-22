@@ -11,7 +11,7 @@ use bedrock_world::chunk::subchunk::{SubChunk, SubChunkFormat, SubChunkVersion};
 use bedrock_world::chunk::palette::BlockPalette;
 use bedrock_world::world::{CreateOptions, OpenOptions, World};
 use bedrock_world::block::BlockEntity;
-use bedrock_world::{ChunkKey, ChunkPos, ChunkRecordTag, Dimension, encode_data3d_quart};
+use bedrock_world::{ActorUid, ChunkKey, ChunkPos, ChunkRecordTag, Dimension, encode_data3d_quart};
 use bytes::Bytes;
 use indexmap::IndexMap;
 
@@ -29,6 +29,7 @@ pub const SECTION_BLOCKS: usize = 16 * 16 * 16;
 pub struct BedrockOutput {
     world: World,
     pending: Vec<(Bytes, Bytes)>,
+    pending_actors: Vec<(ChunkPos, ActorUid, Bytes)>,
     pending_chunks: usize,
 }
 
@@ -54,6 +55,7 @@ impl BedrockOutput {
         Ok(Self {
             world,
             pending: Vec::new(),
+            pending_actors: Vec::new(),
             pending_chunks: 0,
         })
     }
@@ -68,6 +70,7 @@ impl BedrockOutput {
         Ok(Self {
             world,
             pending: Vec::new(),
+            pending_actors: Vec::new(),
             pending_chunks: 0,
         })
     }
@@ -89,6 +92,13 @@ impl BedrockOutput {
         self.pending.push((key, value));
     }
 
+    /// Queues one actor record (`actorprefix<uid>` + digest entry).
+    pub fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) {
+        if let Ok(bytes) = bedrock_nbt::serialize_root(&payload) {
+            self.pending_actors.push((pos, uid, Bytes::from(bytes)));
+        }
+    }
+
     /// Counts one converted column; commits when the batch is full.
     pub fn finish_chunk(&mut self) -> Result<()> {
         self.pending_chunks += 1;
@@ -100,12 +110,15 @@ impl BedrockOutput {
 
     /// Writes all queued records in one transaction.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_actors.is_empty() {
             return Ok(());
         }
         let mut transaction = self.world.transaction();
         for (key, value) in self.pending.drain(..) {
             transaction.put_raw_key(key, value);
+        }
+        for (pos, uid, value) in self.pending_actors.drain(..) {
+            transaction.put_actor(pos, uid, value)?;
         }
         transaction.commit()?;
         self.pending_chunks = 0;

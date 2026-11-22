@@ -170,6 +170,8 @@ pub struct ConversionPlan {
     pub compression_level: u32,
     /// Replace an existing target directory.
     pub overwrite: bool,
+    /// Stop after this many chunks (testing aid; `None` converts everything).
+    pub chunk_limit: Option<usize>,
 }
 
 impl ConversionPlan {
@@ -186,6 +188,7 @@ impl ConversionPlan {
             jobs: 0,
             compression_level: 6,
             overwrite: false,
+            chunk_limit: None,
         }
     }
 }

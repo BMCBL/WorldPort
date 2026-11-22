@@ -36,6 +36,8 @@ use std::collections::BTreeMap;
 
 use crate::mapping::schema::{BlockCatalog, PropertyKind};
 
+mod legacy;
+
 /// Result of mapping one block state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MappedState {
@@ -817,6 +819,11 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
 /// Bedrock families whose Java form needs explicit translation.
 fn be_special(short: &str, properties: &BTreeMap<String, String>) -> Option<MappedState> {
     let get = |key: &str| properties.get(key).map(String::as_str);
+
+    // Legacy ids from worlds before the flattened block names.
+    if let Some(mapped) = legacy::legacy_be_family(short, properties) {
+        return Some(mapped);
+    }
 
     // Bedrock keeps double slabs as their own blocks.
     if let Some(base) = short.strip_suffix("_double_slab") {

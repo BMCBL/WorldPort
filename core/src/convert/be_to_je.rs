@@ -61,8 +61,12 @@ pub fn convert(
     let java_catalog = JavaCatalog::bundled(TARGET_VERSION_NAME)?;
     let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
 
+    report.begin_stage("players");
+    let player_uuid = write_players(&plan.target, &world, &mut report)?;
+    report.end_stage();
+
     report.begin_stage("level.dat");
-    write_java_level(&plan.target, &world, &level_name, plan, &mut report)?;
+    write_java_level(&plan.target, &world, &level_name, player_uuid, plan, &mut report)?;
     report.end_stage();
 
     report.begin_stage("terrain");
@@ -78,6 +82,9 @@ pub fn convert(
             .filter(|pos| pos.dimension == dimension)
             .collect();
         positions.sort_by_key(|pos| (pos.x, pos.z));
+        if let Some(limit) = plan.chunk_limit {
+            positions.truncate(limit.saturating_sub(usize::try_from(converted).unwrap_or(0)));
+        }
         if positions.is_empty() {
             continue;
         }
@@ -85,10 +92,11 @@ pub fn convert(
         // Group every chunk of the dimension by region file: each region is
         // written once, otherwise later windows would truncate earlier writes.
         let mut by_region: BTreeMap<(i32, i32), Vec<(u8, u8, Vec<u8>)>> = BTreeMap::new();
+        let mut entity_regions: BTreeMap<(i32, i32), Vec<(u8, u8, Vec<u8>)>> = BTreeMap::new();
         for pos in &positions {
             options.check_cancelled()?;
             let je_pos = JeChunkPos::new(pos.x, pos.z);
-            let Some(nbt) = read_chunk(&world, *pos, &mapper, &mut report)? else {
+            let Some((nbt, entities)) = read_chunk(&world, *pos, &mapper, &mut report)? else {
                 report.warn(
                     WarningCode::Skipped,
                     je_pos.label(),
@@ -98,6 +106,19 @@ pub fn convert(
             };
             let payload = je_nbt::encode("", &nbt)?;
             let (lx, lz) = je_pos.local();
+            // 1.17+ stores entities in their own region files.
+            if !entities.is_empty() {
+                let entity_chunk = compound([
+                    ("Entities", tag_list(entities)),
+                    ("DataVersion", NbtTag::Int(TARGET_DATA_VERSION)),
+                    ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
+                ]);
+                let entity_payload = je_nbt::encode("", &entity_chunk)?;
+                entity_regions
+                    .entry(je_pos.region())
+                    .or_default()
+                    .push((lx, lz, entity_payload));
+            }
             by_region.entry(je_pos.region()).or_default().push((lx, lz, payload));
             converted += 1;
             report.counters().chunks += 1;
@@ -113,6 +134,16 @@ pub fn convert(
             .join("region");
         for ((region_x, region_z), entries) in by_region {
             let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
+            write_region_file(&path, entries, compression_level(plan))?;
+        }
+        let entity_dir = plan
+            .target
+            .join("dimensions")
+            .join("minecraft")
+            .join(je_dimension.folder_name())
+            .join("entities");
+        for ((region_x, region_z), entries) in entity_regions {
+            let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
             write_region_file(&path, entries, compression_level(plan))?;
         }
         options.report(Progress::new("terrain", converted, None));
@@ -131,7 +162,7 @@ fn read_chunk(
     pos: ChunkPos,
     mapper: &BlockMapper,
     report: &mut ReportBuilder,
-) -> Result<Option<NbtTag>> {
+) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
     let chunk = world.chunk(pos)?;
     let mut mapped_cache: BTreeMap<(String, Vec<(String, String)>), Option<MappedState>> =
         BTreeMap::new();
@@ -316,7 +347,7 @@ fn read_chunk(
     root.insert("InhabitedTime".to_string(), NbtTag::Long(0));
     root.insert("LastUpdate".to_string(), NbtTag::Long(0));
 
-    // Block entities: copy raw NBT, re-adding the Java `id`.
+    // Block entities: translate payloads into Java shape.
     let mut block_entities: Vec<NbtTag> = Vec::new();
     if let Some(record) = chunk
         .records
@@ -324,19 +355,24 @@ fn read_chunk(
         .find(|record| record.key.tag == ChunkRecordTag::BlockEntity)
         && let Ok(entities) = bedrock_nbt::parse_consecutive_roots(&record.value)
     {
-        for entity in entities {
-            let mut entity = entity;
-            if let Some(id) = entity.get_str("id").map(str::to_owned) {
-                let je_id = block_entity_id(&id);
-                entity.set("id", tag_string(je_id));
-                block_entities.push(entity);
-                report.counters().block_entities += 1;
+        for entity in &entities {
+            if let Some(converted) = crate::block_entity::bedrock_to_java(entity, report) {
+                block_entities.push(converted);
             }
         }
     }
     root.insert("block_entities".to_string(), tag_list(block_entities));
 
-    Ok(Some(NbtTag::Compound(root)))
+    // Entities from modern actor storage (digp + actorprefix). They are written
+    // to the separate `entities/` region file by the caller, matching 1.17+.
+    let mut java_entities: Vec<NbtTag> = Vec::new();
+    for record in world.actors(pos)? {
+        if let Some(entity) = crate::entity::bedrock_to_java(&record.entity.nbt, report) {
+            java_entities.push(entity);
+        }
+    }
+
+    Ok(Some((NbtTag::Compound(root), java_entities)))
 }
 
 fn map_state(
@@ -553,10 +589,60 @@ fn block_entity_id(id: &str) -> String {
     }
 }
 
+/// Converts Bedrock players into `playerdata/<uuid>.dat` files.
+///
+/// Returns the UUID of the first real player so `level.dat` can point at it.
+fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Result<Option<[i32; 4]>> {
+    let ids = world.players()?;
+    let mut chosen: Option<[i32; 4]> = None;
+    for id in &ids {
+        let Some(player) = world.player(id)? else {
+            continue;
+        };
+        // Server identity stubs have no position and no inventory.
+        if player.nbt.get_list("Pos").is_none() {
+            continue;
+        }
+        let key = id
+            .storage_key()
+            .map(|key| key.to_vec())
+            .unwrap_or_default();
+        let uuid = crate::player::offline_uuid(&key);
+        let java = crate::player::bedrock_to_java(&player.nbt, uuid, TARGET_DATA_VERSION);
+        let path = target
+            .join("playerdata")
+            .join(format!("{}.dat", uuid_string(uuid)));
+        je_nbt::write_gzip(&path, "", &java)?;
+        report.counters().players += 1;
+        chosen.get_or_insert(uuid);
+    }
+    if chosen.is_none() && !ids.is_empty() {
+        report.warn(
+            WarningCode::Skipped,
+            "players",
+            "Bedrock player records contain no gameplay data (server stubs)",
+        );
+    }
+    Ok(chosen)
+}
+
+fn uuid_string(uuid: [i32; 4]) -> String {
+    let bytes: Vec<u8> = uuid
+        .iter()
+        .flat_map(|value| value.to_be_bytes())
+        .collect();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
 fn write_java_level(
     target: &Path,
     world: &World,
     level_name: &str,
+    player_uuid: Option<[i32; 4]>,
     plan: &ConversionPlan,
     report: &mut ReportBuilder,
 ) -> Result<()> {
@@ -624,7 +710,7 @@ fn write_java_level(
     root.insert("LastPlayed".to_string(), NbtTag::Long(0));
     root.insert(
         "singleplayer_uuid".to_string(),
-        NbtTag::IntArray(vec![0, 0, 0, 0]),
+        NbtTag::IntArray(player_uuid.unwrap_or([0, 0, 0, 0]).to_vec()),
     );
     root.insert("version".to_string(), NbtTag::Int(19133));
 

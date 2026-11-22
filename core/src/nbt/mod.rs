@@ -71,60 +71,144 @@ impl NbtExt for NbtTag {
     }
 
     fn get_str(&self, key: &str) -> Option<&str> {
-        match self.get(key)? {
-            NbtTag::String(value) => Some(value),
-            _ => None,
-        }
+        field_str(self.get(key))
     }
 
     fn get_int(&self, key: &str) -> Option<i64> {
-        match self.get(key)? {
-            NbtTag::Byte(value) => Some(i64::from(*value)),
-            NbtTag::Short(value) => Some(i64::from(*value)),
-            NbtTag::Int(value) => Some(i64::from(*value)),
-            NbtTag::Long(value) => Some(*value),
-            _ => None,
-        }
+        field_int(self.get(key))
     }
 
     fn get_f64(&self, key: &str) -> Option<f64> {
-        match self.get(key)? {
-            NbtTag::Float(value) => Some(f64::from(*value)),
-            NbtTag::Double(value) => Some(*value),
-            NbtTag::Byte(value) => Some(f64::from(*value)),
-            NbtTag::Short(value) => Some(f64::from(*value)),
-            NbtTag::Int(value) => Some(f64::from(*value)),
-            NbtTag::Long(value) => Some(*value as f64),
-            _ => None,
-        }
+        field_f64(self.get(key))
     }
 
     fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.get(key)? {
-            NbtTag::Byte(value) => Some(*value != 0),
-            _ => None,
-        }
+        field_bool(self.get(key))
     }
 
     fn get_list(&self, key: &str) -> Option<&[NbtTag]> {
-        match self.get(key)? {
-            NbtTag::List(values) => Some(values),
-            _ => None,
-        }
+        field_list(self.get(key))
     }
 
     fn get_i32_array(&self, key: &str) -> Option<&[i32]> {
-        match self.get(key)? {
-            NbtTag::IntArray(values) => Some(values),
-            _ => None,
-        }
+        field_i32_array(self.get(key))
     }
 
     fn get_i64_array(&self, key: &str) -> Option<&[i64]> {
-        match self.get(key)? {
-            NbtTag::LongArray(values) => Some(values),
-            _ => None,
-        }
+        field_i64_array(self.get(key))
+    }
+}
+
+/// The same accessors for a compound map, so callers that already destructured
+/// a `Compound` do not have to rebuild a tag.
+impl NbtExt for IndexMap<String, NbtTag> {
+    fn as_compound(&self) -> Option<&IndexMap<String, NbtTag>> {
+        Some(self)
+    }
+
+    fn as_compound_mut(&mut self) -> Option<&mut IndexMap<String, NbtTag>> {
+        Some(self)
+    }
+
+    fn get(&self, key: &str) -> Option<&NbtTag> {
+        IndexMap::get(self, key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut NbtTag> {
+        IndexMap::get_mut(self, key)
+    }
+
+    fn set(&mut self, key: impl Into<String>, value: NbtTag) -> Option<NbtTag> {
+        IndexMap::insert(self, key.into(), value)
+    }
+
+    fn remove(&mut self, key: &str) -> Option<NbtTag> {
+        IndexMap::shift_remove(self, key)
+    }
+
+    fn get_str(&self, key: &str) -> Option<&str> {
+        field_str(IndexMap::get(self, key))
+    }
+
+    fn get_int(&self, key: &str) -> Option<i64> {
+        field_int(IndexMap::get(self, key))
+    }
+
+    fn get_f64(&self, key: &str) -> Option<f64> {
+        field_f64(IndexMap::get(self, key))
+    }
+
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        field_bool(IndexMap::get(self, key))
+    }
+
+    fn get_list(&self, key: &str) -> Option<&[NbtTag]> {
+        field_list(IndexMap::get(self, key))
+    }
+
+    fn get_i32_array(&self, key: &str) -> Option<&[i32]> {
+        field_i32_array(IndexMap::get(self, key))
+    }
+
+    fn get_i64_array(&self, key: &str) -> Option<&[i64]> {
+        field_i64_array(IndexMap::get(self, key))
+    }
+}
+
+fn field_str(tag: Option<&NbtTag>) -> Option<&str> {
+    match tag? {
+        NbtTag::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn field_int(tag: Option<&NbtTag>) -> Option<i64> {
+    match tag? {
+        NbtTag::Byte(value) => Some(i64::from(*value)),
+        NbtTag::Short(value) => Some(i64::from(*value)),
+        NbtTag::Int(value) => Some(i64::from(*value)),
+        NbtTag::Long(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn field_f64(tag: Option<&NbtTag>) -> Option<f64> {
+    match tag? {
+        NbtTag::Float(value) => Some(f64::from(*value)),
+        NbtTag::Double(value) => Some(*value),
+        NbtTag::Byte(value) => Some(f64::from(*value)),
+        NbtTag::Short(value) => Some(f64::from(*value)),
+        NbtTag::Int(value) => Some(f64::from(*value)),
+        NbtTag::Long(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn field_bool(tag: Option<&NbtTag>) -> Option<bool> {
+    match tag? {
+        NbtTag::Byte(value) => Some(*value != 0),
+        _ => None,
+    }
+}
+
+fn field_list(tag: Option<&NbtTag>) -> Option<&[NbtTag]> {
+    match tag? {
+        NbtTag::List(values) => Some(values),
+        _ => None,
+    }
+}
+
+fn field_i32_array(tag: Option<&NbtTag>) -> Option<&[i32]> {
+    match tag? {
+        NbtTag::IntArray(values) => Some(values),
+        _ => None,
+    }
+}
+
+fn field_i64_array(tag: Option<&NbtTag>) -> Option<&[i64]> {
+    match tag? {
+        NbtTag::LongArray(values) => Some(values),
+        _ => None,
     }
 }
 
