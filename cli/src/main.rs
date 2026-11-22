@@ -195,6 +195,9 @@ struct ConvertArgs {
     /// Write the report as JSON to this path.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Write a human-readable Markdown report to this path.
+    #[arg(long)]
+    report_md: Option<PathBuf>,
     /// Stop after this many chunks (testing aid).
     #[arg(long)]
     limit_chunks: Option<usize>,
@@ -831,6 +834,11 @@ fn convert(args: ConvertArgs) -> Result<()> {
     if let Some(path) = &args.report {
         std::fs::write(path, &json).with_context(|| format!("write {}", path.display()))?;
     }
+    if let Some(path) = &args.report_md {
+        let markdown = markdown_report(&report);
+        std::fs::write(path, markdown)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
     println!("{json}");
     if !report.is_clean() {
         eprintln!(
@@ -840,6 +848,105 @@ fn convert(args: ConvertArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+
+/// Renders the conversion report as Markdown for sharing or attaching to a bug report.
+fn markdown_report(report: &worldport_core::report::ConversionReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "# 世界转换报告
+");
+    let _ = writeln!(out, "- 源：{}（{}）", report.source_name, report.source_version);
+    let _ = writeln!(out, "- 目标：{}（{}）", report.target_path, report.target_version);
+    let elapsed = report.finished_unix_ms.saturating_sub(report.started_unix_ms);
+    let _ = writeln!(out, "- 用时：{:.1} 秒", elapsed as f64 / 1000.0);
+    let _ = writeln!(out, "- 结果：{}
+", if report.is_clean() { "无数据丢失" } else { "有警告" });
+
+    let _ = writeln!(out, "## 数量
+");
+    let _ = writeln!(out, "| 项目 | 数量 |");
+    let _ = writeln!(out, "| --- | ---: |");
+    let counters = &report.counters;
+    for (label, value) in [
+        ("区块", counters.chunks),
+        ("方块", counters.blocks),
+        ("方块实体", counters.block_entities),
+        ("实体", counters.entities),
+        ("玩家", counters.players),
+        ("地图", counters.maps),
+        ("子区块/区段", counters.sections),
+        ("计划刻", counters.ticks),
+    ] {
+        let _ = writeln!(out, "| {label} | {value} |");
+    }
+
+    if !report.stages.is_empty() {
+        let _ = writeln!(out, "
+## 阶段
+");
+        let _ = writeln!(out, "| 阶段 | 毫秒 |");
+        let _ = writeln!(out, "| --- | ---: |");
+        for stage in &report.stages {
+            let _ = writeln!(out, "| {} | {} |", stage.name, stage.elapsed_ms);
+        }
+    }
+
+    if !report.unmapped.blocks.is_empty()
+        || !report.unmapped.entities.is_empty()
+        || !report.unmapped.items.is_empty()
+        || !report.unmapped.biomes.is_empty()
+    {
+        let _ = writeln!(out, "
+## 未映射标识符
+");
+        for (label, rows) in [
+            ("方块", &report.unmapped.blocks),
+            ("实体", &report.unmapped.entities),
+            ("物品", &report.unmapped.items),
+            ("生物群系", &report.unmapped.biomes),
+        ] {
+            if rows.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "### {label}
+");
+            let _ = writeln!(out, "| 标识符 | 次数 |");
+            let _ = writeln!(out, "| --- | ---: |");
+            for (name, count) in rows.iter().take(50) {
+                let _ = writeln!(out, "| `{name}` | {count} |");
+            }
+            if rows.len() > 50 {
+                let _ = writeln!(out, "
+（其余 {} 项省略）", rows.len() - 50);
+            }
+            let _ = writeln!(out);
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        let _ = writeln!(out, "
+## 警告
+");
+        let _ = writeln!(out, "| 代码 | 键 | 次数 | 说明 |");
+        let _ = writeln!(out, "| --- | --- | ---: | --- |");
+        for warning in report.warnings.iter().take(100) {
+            let _ = writeln!(
+                out,
+                "| {} | `{}` | {} | {} |",
+                warning.code.as_str(),
+                warning.key,
+                warning.count,
+                warning.message.replace('|', "\\|")
+            );
+        }
+        if report.warnings.len() > 100 {
+            let _ = writeln!(out, "
+（其余 {} 行省略）", report.warnings.len() - 100);
+        }
+    }
+    out
 }
 
 #[allow(dead_code)]

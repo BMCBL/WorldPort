@@ -42,17 +42,21 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         world.level_name(),
         plan.target.display().to_string(),
     );
+    // Pick the bundled catalog closest to the source DataVersion so property
+    // domains match what the world actually contains.
+    let java_catalog = JavaCatalog::for_data_version(world.data_version())?;
+    let source_version = if java_catalog.data_version() == world.data_version() {
+        format!("java {}", java_catalog.version())
+    } else {
+        format!("java DataVersion {}", world.data_version())
+    };
     report.set_versions(
-        format!("java {}", world.data_version()),
+        source_version,
         format!(
             "bedrock 1.26.60 (block state {})",
             crate::be::write::target_block_state_version()
         ),
     );
-
-    // Pick the bundled catalog closest to the source DataVersion so property
-    // domains match what the world actually contains.
-    let java_catalog = JavaCatalog::for_data_version(world.data_version())?;
     if java_catalog.data_version() != world.data_version() {
         report.warn(
             WarningCode::Lossy,
