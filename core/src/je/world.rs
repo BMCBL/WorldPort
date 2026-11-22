@@ -152,7 +152,12 @@ impl JavaWorld {
                 }
             }
         }
-        self.data().get_int("DayTime").unwrap_or(0)
+        // `Time` is the world's game time; `DayTime` is only the time of day and
+        // must not be used as a scheduling clock.
+        self.data()
+            .get_int("Time")
+            .or_else(|| self.data().get_int("DayTime"))
+            .unwrap_or(0)
     }
 
     /// Whether it is currently raining.
@@ -342,16 +347,46 @@ impl JavaWorld {
 
     /// Player data files as `(file stem, path)`, ordered by name.
     pub fn player_files(&self) -> Result<Vec<(String, PathBuf)>> {
-        read_dat_stems(&self.root.join("playerdata"))
+        read_dat_stems(&self.player_data_dir())
+    }
+
+    /// Directory holding map data files.
+    ///
+    /// 26.x moved them to `data/minecraft/maps/`; older worlds keep them in `data/`.
+    #[must_use]
+    pub fn maps_dir(&self) -> PathBuf {
+        let modern = self.root.join("data").join("minecraft").join("maps");
+        if modern.is_dir() {
+            modern
+        } else {
+            self.root.join("data")
+        }
+    }
+
+    /// Player data directory (`players/data/` in 26.x, `playerdata/` before).
+    #[must_use]
+    pub fn player_data_dir(&self) -> PathBuf {
+        let modern = self.root.join("players").join("data");
+        if modern.is_dir() {
+            modern
+        } else {
+            self.root.join("playerdata")
+        }
     }
 
     /// Map item files as `(map id, path)`, ordered by id.
-    pub fn map_files(&self) -> Result<Vec<(i32, PathBuf)>> {
-        let dir = self.root.join("data");
+    ///
+    /// Bedrock map ids are 64-bit and Java's are 32-bit, so the id is read as
+    /// `i64` and normalised by the caller when writing Java.
+    pub fn map_files(&self) -> Result<Vec<(i64, PathBuf)>> {
         let mut maps = Vec::new();
-        for (stem, path) in read_dat_stems(&dir)? {
-            if let Some(id) = stem.strip_prefix("map_").and_then(|id| id.parse::<i32>().ok()) {
-                maps.push((id, path));
+        for dir in [self.maps_dir(), self.root.join("data")] {
+            for (stem, path) in read_dat_stems(&dir)? {
+                if let Some(id) = stem.strip_prefix("map_").and_then(|id| id.parse::<i64>().ok())
+                    && !maps.iter().any(|(existing, _)| *existing == id)
+                {
+                    maps.push((id, path));
+                }
             }
         }
         maps.sort_by_key(|(id, _)| *id);

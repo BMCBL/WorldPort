@@ -104,6 +104,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     *pos,
                     dimension,
                     &mut uid_counter,
+                    world.total_ticks(),
                 )?;
                 converted_chunks += 1;
                 report.counters().chunks += 1;
@@ -116,6 +117,12 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         }
     }
     output.flush()?;
+    report.end_stage();
+
+    report.begin_stage("maps");
+    if plan.features.maps {
+        write_maps(&mut output, &world, &mut report)?;
+    }
     report.end_stage();
 
     report.begin_stage("players");
@@ -135,6 +142,36 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     output.finish()?;
     report.end_stage();
     Ok(report.finish())
+}
+
+/// Converts Java map files into Bedrock `map_<id>` records.
+fn write_maps(
+    output: &mut BedrockOutput,
+    world: &JavaWorld,
+    report: &mut ReportBuilder,
+) -> Result<()> {
+    for (id, path) in world.map_files()? {
+        let map = match crate::map_item::read_java_map(&path, id) {
+            Ok(map) => map,
+            Err(error) => {
+                report.warn(
+                    WarningCode::Skipped,
+                    format!("map_{id}"),
+                    format!("map could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let nbt = crate::map_item::write_bedrock_map(&map);
+        let bytes = bedrock_nbt::serialize_root(&nbt)
+            .map_err(|error| WorldPortError::nbt(format!("map {id}: {error}")))?;
+        output.put_raw(
+            bytes::Bytes::from(format!("map_{id}")),
+            bytes::Bytes::from(bytes),
+        );
+        report.counters().maps += 1;
+    }
+    Ok(())
 }
 
 /// Converts the local player into Bedrock's `~local_player` record.
@@ -258,6 +295,7 @@ fn convert_chunk(
     pos: JeChunkPos,
     dimension: JeDimension,
     uid_counter: &mut i64,
+    current_tick: i64,
 ) -> Result<()> {
     let be_pos = ChunkPos {
         x: pos.x,
@@ -385,27 +423,44 @@ fn convert_chunk(
         }
     }
 
-    // Scheduled ticks have no verified Bedrock layout yet; dropping them is safer
-    // than writing records the game cannot read.
-    if plan_ticks_present(chunk) {
-        report.warn(
-            WarningCode::UnsupportedFeature,
-            "ticks",
-            "scheduled block/fluid ticks are not converted yet",
+    // Scheduled ticks: read the unified model, then write Bedrock's record.
+    let ticks = crate::tick::read_java_chunk(chunk);
+    if !ticks.is_empty() {
+        let state_at = |x: i32, y: i32, z: i32| -> Option<(String, BTreeMap<String, NbtTag>)> {
+            let section_y = i8::try_from(y.div_euclid(16)).ok()?;
+            let section = sections.iter().find(|section| section.y == section_y)?;
+            let lx = usize::try_from(x.rem_euclid(16)).ok()?;
+            let ly = usize::try_from(y.rem_euclid(16)).ok()?;
+            let lz = usize::try_from(z.rem_euclid(16)).ok()?;
+            let index = section.primary.get(lx * 256 + lz * 16 + ly).copied()?;
+            let state = section.primary_palette.get(usize::from(index))?;
+            Some((state.name.clone(), state.states.clone()))
+        };
+        let (record, stats) = crate::tick::write_bedrock_pending(
+            &ticks,
+            current_tick,
+            crate::be::write::target_block_state_version(),
+            state_at,
         );
+        report.counters().ticks += stats.written as u64;
+        if stats.pruned > 0 {
+            report.warn(
+                WarningCode::Pruned,
+                "ticks",
+                format!("{} scheduled ticks referenced non-vanilla blocks", stats.pruned),
+            );
+        }
+        if let Some(record) = record {
+            let bytes = bedrock_nbt::serialize_root(&record)
+                .map_err(|error| WorldPortError::nbt(format!("ticks: {error}")))?;
+            output.put_raw(
+                ChunkKey::new(be_pos, ChunkRecordTag::PendingTicks).encode(),
+                bytes::Bytes::from(bytes),
+            );
+        }
     }
 
     output.finish_chunk()
-}
-
-/// Whether the chunk carries scheduled ticks worth reporting.
-fn plan_ticks_present(chunk: &NbtTag) -> bool {
-    chunk
-        .get_list("block_ticks")
-        .is_some_and(|ticks| !ticks.is_empty())
-        || chunk
-            .get_list("fluid_ticks")
-            .is_some_and(|ticks| !ticks.is_empty())
 }
 
 fn air_state() -> BlockState {
@@ -471,6 +526,15 @@ fn convert_section(
                 };
                 let be_offset = x * 256 + z * 16 + local_y;
 
+                if !crate::mapping::is_vanilla(name) {
+                    // Mod/addon block: prune instead of writing an unknown id.
+                    report.warn(
+                        WarningCode::Pruned,
+                        name.clone(),
+                        format!("non-vanilla block {name} was pruned"),
+                    );
+                    continue;
+                }
                 let short = crate::mapping::short_name(name);
                 if short == "air" || short == "cave_air" || short == "void_air" {
                     continue;

@@ -125,6 +125,14 @@ const SHARED_FIELDS: &[&str] = &[
 #[must_use]
 pub fn java_to_bedrock(je: &NbtTag, report: &mut ReportBuilder) -> Option<IndexMap<String, NbtTag>> {
     let je_id = je.get_str("id")?;
+    if !crate::mapping::is_vanilla(je_id) {
+        report.warn(
+            crate::report::WarningCode::Pruned,
+            je_id.to_string(),
+            format!("non-vanilla block entity {je_id} was pruned"),
+        );
+        return None;
+    }
     let be_id = block_entity_id_to_bedrock(je_id);
     let Some(be_id) = be_id else {
         report.warn(
@@ -234,6 +242,14 @@ pub fn java_to_bedrock(je: &NbtTag, report: &mut ReportBuilder) -> Option<IndexM
 #[must_use]
 pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag> {
     let be_id = be.get_str("id")?;
+    if !crate::mapping::is_vanilla(be_id) {
+        report.warn(
+            crate::report::WarningCode::Pruned,
+            be_id.to_string(),
+            format!("non-vanilla block entity {be_id} was pruned"),
+        );
+        return None;
+    }
     let je_id = block_entity_id_to_java(be_id);
     let Some(je_id) = je_id else {
         report.warn(

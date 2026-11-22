@@ -120,6 +120,14 @@ const BEDROCK_ONLY: &[&str] = &[
 #[must_use]
 pub fn java_to_bedrock(je: &NbtTag, uid: i64, report: &mut ReportBuilder) -> Option<NbtTag> {
     let je_id = je.get_str("id")?;
+    if !crate::mapping::is_vanilla(je_id) {
+        report.warn(
+            WarningCode::Pruned,
+            je_id.to_string(),
+            format!("non-vanilla entity {je_id} was pruned"),
+        );
+        return None;
+    }
     let be_id = entity_to_bedrock(je_id);
     let mut out = IndexMap::new();
     out.insert("identifier".to_string(), tag_string(be_id.clone()));
@@ -249,6 +257,14 @@ pub fn java_to_bedrock(je: &NbtTag, uid: i64, report: &mut ReportBuilder) -> Opt
 #[must_use]
 pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder) -> Option<NbtTag> {
     let identifier = be.get_str("identifier")?;
+    if !crate::mapping::is_vanilla(identifier) {
+        report.warn(
+            WarningCode::Pruned,
+            identifier.to_string(),
+            format!("non-vanilla entity {identifier} was pruned"),
+        );
+        return None;
+    }
     let je_id = entity_to_java(identifier);
     let mut out = IndexMap::new();
     out.insert("id".to_string(), tag_string(je_id));

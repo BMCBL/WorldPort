@@ -112,7 +112,8 @@ fn namespaced(id: &str) -> String {
 #[must_use]
 pub fn read_java_item(tag: &NbtTag) -> Option<ItemStack> {
     let id = tag.get_str("id")?;
-    if id == "minecraft:air" {
+    // Non-vanilla items (mods/addons) are pruned rather than carried across.
+    if id == "minecraft:air" || !crate::mapping::is_vanilla(id) {
         return None;
     }
     let count = tag
@@ -150,7 +151,7 @@ pub fn write_java_item(stack: &ItemStack) -> NbtTag {
 #[must_use]
 pub fn read_bedrock_item(tag: &NbtTag) -> Option<ItemStack> {
     let name = tag.get_str("Name")?;
-    if name == "minecraft:air" {
+    if name == "minecraft:air" || !crate::mapping::is_vanilla(name) {
         return None;
     }
     let count = tag.get_int("Count").unwrap_or(1);

@@ -25,6 +25,7 @@ pub fn write_world(root: &Path) -> Result<()> {
     io_result(root, std::fs::create_dir_all(root))?;
     write_level(root)?;
     write_chunk(root)?;
+    write_maps(root)?;
     write_player(root)?;
     Ok(())
 }
@@ -478,6 +479,32 @@ fn entities() -> Vec<NbtTag> {
             ("Motive", tag_string("minecraft:kebab")),
         ]),
     ]
+}
+
+fn write_maps(root: &Path) -> Result<()> {
+    let dir = root.join("data").join("minecraft").join("maps");
+    let mut colors = vec![0_u8; 128 * 128];
+    for (index, pixel) in colors.iter_mut().enumerate() {
+        let x = index % 128;
+        let z = index / 128;
+        // A simple checkerboard with a few distinct palette entries.
+        *pixel = if (x / 16 + z / 16) % 2 == 0 { 4 } else { 8 };
+    }
+    let map = crate::map_item::MapData {
+        id: 3,
+        scale: 1,
+        dimension: "minecraft:overworld".to_string(),
+        x_center: 0,
+        z_center: 0,
+        width: 128,
+        height: 128,
+        locked: false,
+        tracking: true,
+        colors,
+    };
+    crate::map_item::write_java_map(&dir, &map, FIXTURE_DATA_VERSION)?;
+    crate::map_item::write_idcounts(&dir, map.id)?;
+    Ok(())
 }
 
 fn write_player(root: &Path) -> Result<()> {

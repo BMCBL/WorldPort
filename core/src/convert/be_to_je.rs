@@ -61,6 +61,12 @@ pub fn convert(
     let java_catalog = JavaCatalog::bundled(TARGET_VERSION_NAME)?;
     let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
 
+    report.begin_stage("maps");
+    if plan.features.maps {
+        write_maps(&plan.target, &world, &mut report)?;
+    }
+    report.end_stage();
+
     report.begin_stage("players");
     let player_uuid = write_players(&plan.target, &world, &mut report)?;
     report.end_stage();
@@ -230,6 +236,14 @@ fn read_chunk(
                         if state.name == "minecraft:air" {
                             continue;
                         }
+                        if !crate::mapping::is_vanilla(&state.name) {
+                            report.warn(
+                                WarningCode::Pruned,
+                                state.name.clone(),
+                                format!("non-vanilla block {} was pruned", state.name),
+                            );
+                            continue;
+                        }
                         // Merge the liquid layer into `waterlogged` where Java has it.
                         let mut properties = state_properties(state);
                         if let Some((liquid_states, liquid_packed)) = liquid
@@ -341,8 +355,30 @@ fn read_chunk(
         ("starts", empty_compound()),
         ("References", empty_compound()),
     ]));
-    root.insert("block_ticks".to_string(), tag_list(Vec::new()));
-    root.insert("fluid_ticks".to_string(), tag_list(Vec::new()));
+    // Scheduled ticks: Bedrock record -> unified model -> Java lists.
+    let mut block_ticks = tag_list(Vec::new());
+    let mut fluid_ticks = tag_list(Vec::new());
+    if let Some(record) = chunk
+        .records
+        .iter()
+        .find(|record| record.key.tag == ChunkRecordTag::PendingTicks)
+        && let Ok(root_tag) = bedrock_nbt::parse_root(&record.value)
+    {
+        let (ticks, stats) = crate::tick::read_bedrock_pending(&root_tag);
+        report.counters().ticks += stats.written as u64;
+        if stats.pruned > 0 {
+            report.warn(
+                WarningCode::Pruned,
+                "ticks",
+                format!("{} scheduled ticks referenced non-vanilla blocks", stats.pruned),
+            );
+        }
+        let (blocks, fluids) = crate::tick::write_java_chunk(&ticks);
+        block_ticks = blocks;
+        fluid_ticks = fluids;
+    }
+    root.insert("block_ticks".to_string(), block_ticks);
+    root.insert("fluid_ticks".to_string(), fluid_ticks);
     root.insert("PostProcessing".to_string(), tag_list(Vec::new()));
     root.insert("InhabitedTime".to_string(), NbtTag::Long(0));
     root.insert("LastUpdate".to_string(), NbtTag::Long(0));
@@ -609,8 +645,10 @@ fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Re
             .unwrap_or_default();
         let uuid = crate::player::offline_uuid(&key);
         let java = crate::player::bedrock_to_java(&player.nbt, uuid, TARGET_DATA_VERSION);
+        // 26.x moved player files to `players/data/`.
         let path = target
-            .join("playerdata")
+            .join("players")
+            .join("data")
             .join(format!("{}.dat", uuid_string(uuid)));
         je_nbt::write_gzip(&path, "", &java)?;
         report.counters().players += 1;
@@ -624,6 +662,69 @@ fn write_players(target: &Path, world: &World, report: &mut ReportBuilder) -> Re
         );
     }
     Ok(chosen)
+}
+
+/// Converts Bedrock `map_<id>` records into `data/minecraft/maps/map_<id>.dat`.
+fn write_maps(target: &Path, world: &World, report: &mut ReportBuilder) -> Result<()> {
+    use bedrock_world::storage::{StorageReadOptions, StorageVisitorControl};
+    let mut maps = Vec::new();
+    world.storage().for_each_prefix(
+        b"map_",
+        StorageReadOptions::default(),
+        &mut |key, value| {
+            if let Some(id) = key
+                .get(4..)
+                .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                .and_then(|suffix| suffix.parse::<i64>().ok())
+                && let Ok(root) = bedrock_nbt::parse_root(value)
+                && let Some(map) = crate::map_item::read_bedrock_map(&root, id)
+            {
+                maps.push(map);
+            }
+            Ok(StorageVisitorControl::Continue)
+        },
+    )?;
+    if maps.is_empty() {
+        return Ok(());
+    }
+    let dir = target.join("data").join("minecraft").join("maps");
+    // Java map ids are 32-bit; Bedrock ids are 64-bit, so ids that do not fit are
+    // renumbered densely. Items referencing a renumbered map keep their old id.
+    let mut used: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut next_id: i32 = 0;
+    let mut max_id: i32 = 0;
+    let mut renumbered = 0_u64;
+    for map in &mut maps {
+        let id = i32::try_from(map.id).ok().filter(|id| *id >= 0 && !used.contains(id));
+        let new_id = match id {
+            Some(id) => id,
+            None => {
+                while used.contains(&next_id) {
+                    next_id += 1;
+                }
+                next_id
+            }
+        };
+        if i64::from(new_id) != map.id {
+            renumbered += 1;
+            map.id = i64::from(new_id);
+        }
+        used.insert(new_id);
+        max_id = max_id.max(new_id);
+        crate::map_item::write_java_map(&dir, map, TARGET_DATA_VERSION)?;
+        report.counters().maps += 1;
+    }
+    if renumbered > 0 {
+        report.warn(
+            WarningCode::Lossy,
+            "map-ids",
+            format!(
+                "{renumbered} maps used 64-bit Bedrock ids and were renumbered; item references were not rewritten"
+            ),
+        );
+    }
+    crate::map_item::write_idcounts(&dir, i64::from(max_id))?;
+    Ok(())
 }
 
 fn uuid_string(uuid: [i32; 4]) -> String {

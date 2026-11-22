@@ -106,6 +106,8 @@ pub struct Counters {
     pub sections: u64,
     /// Biome cells written.
     pub biome_cells: u64,
+    /// Scheduled ticks written.
+    pub ticks: u64,
 }
 
 impl Counters {
@@ -119,6 +121,7 @@ impl Counters {
         self.maps += other.maps;
         self.sections += other.sections;
         self.biome_cells += other.biome_cells;
+        self.ticks += other.ticks;
     }
 }
 

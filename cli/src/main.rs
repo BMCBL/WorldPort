@@ -46,6 +46,31 @@ enum Command {
     Players(PlayersArgs),
     /// Write the synthetic test world used for M3 acceptance runs.
     Fixtures(FixturesArgs),
+    /// Print Bedrock PendingTicks/RandomTicks records (debugging aid).
+    Ticks(TicksArgs),
+    /// Measure the map-colour conversion paths (SIMD/memo decision aid).
+    BenchColors(BenchColorsArgs),
+}
+
+#[derive(Debug, Args)]
+struct BenchColorsArgs {
+    /// World whose maps are used as the workload.
+    world: PathBuf,
+    /// How many maps to load.
+    #[arg(long, default_value_t = 64)]
+    maps: usize,
+}
+
+#[derive(Debug, Args)]
+struct TicksArgs {
+    /// Bedrock world directory.
+    world: PathBuf,
+    /// How many chunks to scan.
+    #[arg(long, default_value_t = 2000)]
+    scan: usize,
+    /// How many tick records to print.
+    #[arg(long, default_value_t = 3)]
+    limit: usize,
 }
 
 #[derive(Debug, Args)]
@@ -238,6 +263,8 @@ fn run() -> Result<()> {
         Command::Compare(args) => compare_worlds(args),
         Command::Entities(args) => dump_entities(args),
         Command::Players(args) => dump_players(args),
+        Command::Ticks(args) => dump_ticks(args),
+        Command::BenchColors(args) => bench_colors(args),
         Command::Fixtures(args) => {
             worldport_core::fixtures::write_world(&args.path)?;
             println!("wrote fixture world to {}", args.path.display());
@@ -353,6 +380,81 @@ fn dump_entities(args: EntitiesArgs) -> Result<()> {
     Ok(())
 }
 
+fn bench_colors(args: BenchColorsArgs) -> Result<()> {
+    use std::collections::BTreeSet;
+    use std::time::Instant;
+    let world = JavaWorld::open(&args.world)?;
+    let palette = worldport_core::mapping::map_colors::shaded_palette();
+    let mut rgba = Vec::new();
+    let mut unique = BTreeSet::new();
+    for (id, path) in world.map_files()?.into_iter().take(args.maps) {
+        let map = worldport_core::map_item::read_java_map(&path, id)?;
+        let pixels = worldport_core::map_item::java_colors_to_rgba(&map.colors, &palette);
+        for pixel in pixels.chunks_exact(4) {
+            unique.insert(u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]));
+        }
+        rgba.extend_from_slice(&pixels);
+    }
+    if rgba.is_empty() {
+        bail!("no maps found in {}", args.world.display());
+    }
+    let pixels = rgba.len() / 4;
+    let start = Instant::now();
+    let scalar = worldport_core::map_item::rgba_to_java_colors_scalar(&rgba, &palette);
+    let scalar_time = start.elapsed();
+    let start = Instant::now();
+    let memo = worldport_core::map_item::rgba_to_java_colors(&rgba, &palette);
+    let memo_time = start.elapsed();
+    if scalar != memo {
+        bail!("memoised path disagrees with the scalar reference");
+    }
+    println!("maps        {}", args.maps.min(world.map_files()?.len()));
+    println!("pixels      {pixels}");
+    println!("unique rgba {}", unique.len());
+    println!("scalar      {:.2} ms", scalar_time.as_secs_f64() * 1000.0);
+    println!("memoised    {:.2} ms", memo_time.as_secs_f64() * 1000.0);
+    let speedup = scalar_time.as_secs_f64() / memo_time.as_secs_f64().max(1e-9);
+    println!("speedup     {speedup:.1}x");
+    Ok(())
+}
+
+fn dump_ticks(args: TicksArgs) -> Result<()> {
+    use bedrock_world::ChunkRecordTag;
+    let mut options = bedrock_world::world::OpenOptions::default();
+    options.read_only = true;
+    let world = bedrock_world::world::World::open(&args.world, options)?;
+    let mut positions = world.chunk_positions(Default::default())?;
+    positions.sort_by_key(|pos| (pos.x, pos.z));
+    let mut printed = 0;
+    for pos in positions.into_iter().take(args.scan) {
+        let chunk = world.chunk(pos)?;
+        for record in &chunk.records {
+            if !matches!(
+                record.key.tag,
+                ChunkRecordTag::PendingTicks | ChunkRecordTag::RandomTicks
+            ) {
+                continue;
+            }
+            if printed >= args.limit {
+                return Ok(());
+            }
+            eprintln!(
+                "chunk {},{} {:?} {} bytes",
+                pos.x,
+                pos.z,
+                record.key.tag,
+                record.value.len()
+            );
+            for root in bedrock_nbt::parse_consecutive_roots(&record.value).unwrap_or_default() {
+                println!("{}", snbt_safe(&root));
+            }
+            printed += 1;
+        }
+    }
+    eprintln!("printed {printed} tick records");
+    Ok(())
+}
+
 fn dump_players(args: PlayersArgs) -> Result<()> {
     let mut options = bedrock_world::world::OpenOptions::default();
     options.read_only = true;
@@ -391,6 +493,14 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
     println!("biome diffs  {}", report.biome_mismatches);
     println!("entity diffs {}", report.entity_mismatches);
     println!("BE diffs     {}", report.block_entity_mismatches);
+    println!(
+        "maps         {} vs {} ({} differ)",
+        report.first_maps, report.second_maps, report.map_mismatches
+    );
+    println!(
+        "ticks        {} vs {} ({} differ)",
+        report.first_ticks, report.second_ticks, report.tick_mismatches
+    );
     if !report.level_dat.is_empty() {
         println!("level.dat");
         for (field, left, right) in &report.level_dat {

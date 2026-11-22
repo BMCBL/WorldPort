@@ -43,6 +43,8 @@ pub struct ChunkDiff {
     pub entities: Vec<StateDiff>,
     /// Block entity id counts that differ.
     pub block_entities: Vec<StateDiff>,
+    /// Absolute difference in scheduled tick count.
+    pub ticks: u64,
 }
 
 /// Whole-world comparison summary.
@@ -72,6 +74,18 @@ pub struct CompareReport {
     pub entity_mismatches: u64,
     /// Total block entity id mismatches across all matched chunks.
     pub block_entity_mismatches: u64,
+    /// Map files in each world.
+    pub first_maps: u64,
+    /// Map files in each world.
+    pub second_maps: u64,
+    /// Maps whose pixels or metadata differ.
+    pub map_mismatches: u64,
+    /// Scheduled ticks in each world.
+    pub first_ticks: u64,
+    /// Scheduled ticks in each world.
+    pub second_ticks: u64,
+    /// Matched chunks whose scheduled tick count differs.
+    pub tick_mismatches: u64,
     /// Largest per-chunk differences (capped).
     pub worst_chunks: Vec<ChunkDiff>,
     /// Global block state differences (capped).
@@ -207,12 +221,21 @@ pub fn compare_java(first: &JavaWorld, second: &JavaWorld, dimension: JeDimensio
         for row in &diff.block_entities {
             report.block_entity_mismatches += row.first.abs_diff(row.second);
         }
+        let first_ticks = crate::tick::read_java_chunk(&first_chunk).len() as u64;
+        let second_ticks = crate::tick::read_java_chunk(&second_chunk).len() as u64;
+        report.first_ticks += first_ticks;
+        report.second_ticks += second_ticks;
+        if first_ticks != second_ticks {
+            report.tick_mismatches += first_ticks.abs_diff(second_ticks);
+            diff.ticks = first_ticks.abs_diff(second_ticks);
+        }
         report.block_mismatches += diff.block_mismatches;
         report.biome_mismatches += diff.biome_mismatches;
         if diff.block_mismatches != 0
             || diff.biome_mismatches != 0
             || !diff.entities.is_empty()
             || !diff.block_entities.is_empty()
+            || diff.ticks != 0
         {
             report.differing_chunks += 1;
             worst.push(diff);
@@ -237,8 +260,47 @@ pub fn compare_java(first: &JavaWorld, second: &JavaWorld, dimension: JeDimensio
             .cmp(&left.first.abs_diff(left.second))
     });
     report.block_totals.truncate(40);
+    compare_maps(first, second, &mut report)?;
     report.level_dat = level_dat_diff(first, second);
     Ok(report)
+}
+
+fn compare_maps(
+    first: &JavaWorld,
+    second: &JavaWorld,
+    report: &mut CompareReport,
+) -> Result<()> {
+    use crate::mapping::map_colors::shaded_palette;
+    let palette = shaded_palette();
+    let first_maps = first.map_files()?;
+    let second_maps = second.map_files()?;
+    report.first_maps = first_maps.len() as u64;
+    report.second_maps = second_maps.len() as u64;
+    let second_by_id: BTreeMap<i64, _> = second_maps.iter().cloned().collect();
+    for (id, path) in &first_maps {
+        let Some(other_path) = second_by_id.get(id) else {
+            report.map_mismatches += 1;
+            continue;
+        };
+        let Ok(left) = crate::map_item::read_java_map(path, *id) else {
+            continue;
+        };
+        let Ok(right) = crate::map_item::read_java_map(other_path, *id) else {
+            report.map_mismatches += 1;
+            continue;
+        };
+        let same_meta = left.scale == right.scale
+            && left.dimension == right.dimension
+            && left.x_center == right.x_center
+            && left.z_center == right.z_center
+            && left.locked == right.locked;
+        let same_pixels = crate::map_item::java_colors_to_rgba(&left.colors, &palette)
+            == crate::map_item::java_colors_to_rgba(&right.colors, &palette);
+        if !same_meta || !same_pixels {
+            report.map_mismatches += 1;
+        }
+    }
+    Ok(())
 }
 
 fn level_dat_diff(first: &JavaWorld, second: &JavaWorld) -> Vec<(String, String, String)> {

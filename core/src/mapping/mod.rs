@@ -11,6 +11,7 @@ pub mod effects;
 pub mod enchantments;
 pub mod entities;
 pub mod game_rules;
+pub mod map_colors;
 pub mod potions;
 pub mod mapper;
 pub mod schema;
@@ -22,6 +23,18 @@ pub use schema::{BlockCatalog, JavaCatalog, PropertyKind, bedrock_catalog, bedro
 #[must_use]
 pub fn strip_namespace(name: &str) -> &str {
     short_name(name)
+}
+
+/// Whether an identifier belongs to the vanilla namespace.
+///
+/// Mods and addons use their own namespace, so they can be pruned instead of
+/// being reported as a mapping gap.
+#[must_use]
+pub fn is_vanilla(name: &str) -> bool {
+    match name.split_once(':') {
+        Some((namespace, _)) => namespace == "minecraft",
+        None => true,
+    }
 }
 
 /// Returns the name with exactly one `minecraft:` namespace.
