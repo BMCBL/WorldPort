@@ -1886,6 +1886,15 @@ fn facing_from_bedrock_number(value: &str) -> Option<&'static str> {
 /// while 1.26.50+ writes it).
 const CATALOG_GAPS: &[&str] = &["minecraft:corner"];
 
+/// Whether a Bedrock property is known to exist without being in the catalog.
+///
+/// The audit and the mapper have to agree on this, or a property the mapper
+/// writes on purpose is reported as an invalid state.
+#[must_use]
+pub fn is_catalog_gap(key: &str) -> bool {
+    CATALOG_GAPS.contains(&key)
+}
+
 /// Drops undeclared properties and fills required ones with the schema default.
 fn fit_to_schema(mut mapped: MappedState, target: &BlockCatalog) -> MappedState {
     let Some(schema) = target.block(&mapped.name) else {
@@ -1898,6 +1907,11 @@ fn fit_to_schema(mut mapped: MappedState, target: &BlockCatalog) -> MappedState 
         return mapped;
     }
     let before = mapped.properties.len();
+    // Only property *names* are filtered. Validating values against the recorded
+    // domain was tried and reverted: the catalog is a sample, so a real value can
+    // be missing from it (`open_bit` on a lever), and dropping those silently
+    // changed correct mappings. `type=double` reaching `vertical_half` is a real
+    // defect, but it needs a rule for the family, not a global filter.
     mapped
         .properties
         .retain(|key, _| declared.contains_key(key) || CATALOG_GAPS.contains(&key.as_str()));

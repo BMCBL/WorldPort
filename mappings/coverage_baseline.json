@@ -9,7 +9,7 @@
   },
   "1.20.6 JE->BE": {
     "declared_loss": 1036,
-    "exact": 19164,
+    "exact": 23404,
     "silent_loss": 9,
     "states": 26684,
     "unmapped": 0,
@@ -25,7 +25,7 @@
   },
   "1.21.4 JE->BE": {
     "declared_loss": 1051,
-    "exact": 20158,
+    "exact": 24558,
     "silent_loss": 9,
     "states": 27866,
     "unmapped": 0,
@@ -41,7 +41,7 @@
   },
   "1.21.8 JE->BE": {
     "declared_loss": 1051,
-    "exact": 20231,
+    "exact": 24631,
     "silent_loss": 10,
     "states": 27946,
     "unmapped": 0,
@@ -57,7 +57,7 @@
   },
   "26.1 JE->BE": {
     "declared_loss": 1056,
-    "exact": 21953,
+    "exact": 26353,
     "silent_loss": 10,
     "states": 29873,
     "unmapped": 0,
@@ -73,7 +73,7 @@
   },
   "26.2 JE->BE": {
     "declared_loss": 1056,
-    "exact": 23954,
+    "exact": 28834,
     "silent_loss": 10,
     "states": 32366,
     "unmapped": 0,

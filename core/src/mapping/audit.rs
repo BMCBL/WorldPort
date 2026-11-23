@@ -228,6 +228,9 @@ fn declares(catalog: &BlockCatalog, name: &str, properties: &BTreeMap<String, St
         return false;
     };
     properties.iter().all(|(key, value)| {
+        if super::mapper::is_catalog_gap(key) {
+            return true;
+        }
         let Some(property) = schema.property(key) else {
             return false;
         };
