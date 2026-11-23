@@ -5,13 +5,13 @@
 //! - pre-1.21: `region/`, `DIM-1/region/`, `DIM1/region/` under the world root;
 //! - 1.21+: `dimensions/minecraft/{overworld,the_nether,the_end}/region/`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use bedrock_nbt::NbtTag;
 
 use crate::error::{Result, WorldPortError, io_result};
-use crate::je::anvil::RegionFile;
+use crate::je::anvil::{RegionFile, region_coordinates};
 use crate::je::nbt::{self as je_nbt, NamedTag};
 use crate::je::{JeChunkPos, JeDimension};
 use crate::nbt::{NbtExt, TagValue};
@@ -33,7 +33,7 @@ const REGION_CACHE_CAPACITY: usize = 24;
 
 /// One cached region handle with the tick it was last used on.
 struct CachedRegion {
-    region: RegionFile,
+    region: Option<RegionFile>,
     last_used: u64,
 }
 
@@ -54,11 +54,12 @@ impl RegionCache {
         self.clock = self.clock.wrapping_add(1);
         let clock = self.clock;
         if !self.open.contains_key(path) {
-            // A region file that does not exist simply has no chunks; opening it
-            // would fail, so check here instead of on every read.
-            if !path.is_file() {
-                return Ok(None);
-            }
+            let region = match RegionFile::open_read_only(path) {
+                Ok(region) => Some(region),
+                Err(WorldPortError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
             if self.open.len() >= REGION_CACHE_CAPACITY {
                 // Evict the least recently used entry. Region reads are local,
                 // so the entry about to be replaced is normally the coldest.
@@ -74,7 +75,7 @@ impl RegionCache {
             self.open.insert(
                 path.to_path_buf(),
                 CachedRegion {
-                    region: RegionFile::open_read_only(path)?,
+                    region,
                     last_used: clock,
                 },
             );
@@ -83,13 +84,16 @@ impl RegionCache {
             return Ok(None);
         };
         cached.last_used = clock;
-        cached.region.read_chunk(local_x, local_z)
+        match cached.region.as_mut() {
+            Some(region) => region.read_chunk(local_x, local_z),
+            None => Ok(None),
+        }
     }
 
     /// Region files currently held open.
     #[must_use]
     pub fn open_files(&self) -> usize {
-        self.open.len()
+        self.open.values().filter(|cached| cached.region.is_some()).count()
     }
 }
 
@@ -365,19 +369,17 @@ impl JavaWorld {
         let path = self
             .entity_region_dir(dimension)
             .join(format!("r.{region_x}.{region_z}.mca"));
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
         let (local_x, local_z) = pos.local();
         let Some(payload) = cache.read_chunk(&path, local_x, local_z)? else {
             return Ok(Vec::new());
         };
-        let decoded = je_nbt::decode(&payload)?;
-        Ok(decoded
-            .tag
-            .get_list("Entities")
-            .map(<[NbtTag]>::to_vec)
-            .unwrap_or_default())
+        let NbtTag::Compound(mut root) = je_nbt::decode(&payload)?.tag else {
+            return Ok(Vec::new());
+        };
+        match root.swap_remove("Entities") {
+            Some(NbtTag::List(entities)) => Ok(entities),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Existing region files for a dimension as `(region_x, region_z, path)`.
@@ -390,9 +392,7 @@ impl JavaWorld {
         for entry in io_result(&dir, std::fs::read_dir(&dir))? {
             let entry = io_result(&dir, entry)?;
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "mca")
-                && let Some((x, z)) = parse_region_file_name(&path)
-            {
+            if let Some((x, z)) = region_coordinates(&path) {
                 files.push((x, z, path));
             }
         }
@@ -403,13 +403,17 @@ impl JavaWorld {
     /// Every chunk present in a dimension, from region headers only.
     pub fn chunk_positions(&self, dimension: JeDimension) -> Result<Vec<JeChunkPos>> {
         let mut positions = Vec::new();
+        let mut seen = HashSet::new();
         for (region_x, region_z, path) in self.region_files(dimension)? {
             let region = RegionFile::open_read_only(&path)?;
             for (local_x, local_z) in region.occupied_slots() {
-                positions.push(JeChunkPos::new(
+                let pos = JeChunkPos::new(
                     region_x * 32 + i32::from(local_x),
                     region_z * 32 + i32::from(local_z),
-                ));
+                );
+                if seen.insert(pos) {
+                    positions.push(pos);
+                }
             }
         }
         Ok(positions)
@@ -437,7 +441,14 @@ impl JavaWorld {
             .region_dir(dimension)
             .join(format!("r.{region_x}.{region_z}.mca"));
         let (local_x, local_z) = pos.local();
-        let Some(payload) = cache.read_chunk(&path, local_x, local_z)? else {
+        let payload = match cache.read_chunk(&path, local_x, local_z)? {
+            Some(payload) => Some(payload),
+            None if self.layout == WorldLayout::Legacy => {
+                cache.read_chunk(&path.with_extension("mcr"), local_x, local_z)?
+            }
+            None => None,
+        };
+        let Some(payload) = payload else {
             return Ok(None);
         };
         let decoded = je_nbt::decode(&payload)?;
@@ -447,6 +458,23 @@ impl JavaWorld {
     /// Player data files as `(file stem, path)`, ordered by name.
     pub fn player_files(&self) -> Result<Vec<(String, PathBuf)>> {
         read_dat_stems(&self.player_data_dir())
+    }
+
+    /// The local player's NBT, wherever this world keeps it.
+    ///
+    /// Modern worlds store it in `playerdata/<uuid>.dat`; classic ones embed it
+    /// in `level.dat` as `Data.Player`. Comparison and conversion both need the
+    /// player as a concept, not as a file, because a conversion legitimately
+    /// moves it from one place to the other.
+    #[must_use]
+    pub fn local_player(&self) -> Option<NbtTag> {
+        if let Ok(files) = self.player_files()
+            && let Some((_, path)) = files.first()
+            && let Ok(named) = je_nbt::read_gzip(path)
+        {
+            return Some(named.tag);
+        }
+        self.data().get("Player").cloned()
     }
 
     /// Directory holding map data files.
@@ -535,19 +563,6 @@ fn read_dat_stems(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(files)
 }
 
-fn parse_region_file_name(path: &Path) -> Option<(i32, i32)> {
-    let name = path.file_stem()?.to_str()?;
-    let mut parts = name.split('.');
-    if parts.next()? != "r" {
-        return None;
-    }
-    let x = parts.next()?.parse().ok()?;
-    let z = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((x, z))
-}
 
 fn default_level_name(root: &Path) -> String {
     root.file_name()
@@ -563,10 +578,10 @@ mod tests {
     #[test]
     fn parses_region_file_names() {
         assert_eq!(
-            parse_region_file_name(Path::new("r.-3.12.mca")),
+            region_coordinates(Path::new("r.-3.12.mca")),
             Some((-3, 12))
         );
-        assert_eq!(parse_region_file_name(Path::new("r.0.mca")), None);
-        assert_eq!(parse_region_file_name(Path::new("level.dat")), None);
+        assert_eq!(region_coordinates(Path::new("r.0.mca")), None);
+        assert_eq!(region_coordinates(Path::new("level.dat")), None);
     }
 }

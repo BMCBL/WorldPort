@@ -24,6 +24,9 @@ rustc-hash.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 lz4_flex = "0.11.5"
+cesu8 = "1.1.0"
+lz4-java-wrc = "0.2.0"
+simd_cesu8 = "1.1.1"
 
 [build-dependencies]
 flate2.workspace = true

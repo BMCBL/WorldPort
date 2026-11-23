@@ -28,17 +28,30 @@ pub struct ChunkSummary {
 /// Summarizes one decoded Java chunk.
 #[must_use]
 pub fn summarize(chunk: &NbtTag) -> ChunkSummary {
+    let data = chunk.get("Level").unwrap_or(chunk);
     let mut summary = ChunkSummary {
         data_version: chunk
             .get_int("DataVersion")
             .and_then(|value| i32::try_from(value).ok())
             .unwrap_or(0),
-        status: chunk.get_str("Status").unwrap_or_default().to_string(),
+        status: data
+            .get_str("Status")
+            .unwrap_or_else(|| {
+                if data.get_bool("TerrainPopulated") == Some(true) {
+                    "full"
+                } else {
+                    ""
+                }
+            })
+            .to_string(),
         ..ChunkSummary::default()
     };
     let mut min_y = i8::MAX;
     let mut max_y = i8::MIN;
-    if let Some(sections) = chunk.get_list("sections") {
+    if let Some(sections) = data
+        .get_list("sections")
+        .or_else(|| data.get_list("Sections"))
+    {
         for section in sections {
             summary.sections += 1;
             if let Some(y) = section.get_int("Y") {
@@ -67,6 +80,22 @@ pub fn summarize(chunk: &NbtTag) -> ChunkSummary {
                 summary.non_empty_sections += 1;
             }
         }
+    } else if let Some(NbtTag::ByteArray(blocks)) = data.get("Blocks")
+        && blocks.len() == 16 * 16 * 128
+    {
+        // McRegion stores each 128-block column contiguously in one array.
+        summary.sections = 8;
+        min_y = 0;
+        max_y = 7;
+        for section_y in 0..8 {
+            let y = section_y * 16;
+            if blocks
+                .chunks_exact(128)
+                .any(|column| column[y..y + 16].iter().any(|&id| id != 0))
+            {
+                summary.non_empty_sections += 1;
+            }
+        }
     }
     if min_y > max_y {
         min_y = 0;
@@ -74,10 +103,11 @@ pub fn summarize(chunk: &NbtTag) -> ChunkSummary {
     }
     summary.min_section_y = min_y;
     summary.max_section_y = max_y;
-    summary.block_entities = chunk
+    summary.block_entities = data
         .get_list("block_entities")
+        .or_else(|| data.get_list("TileEntities"))
         .map_or(0, |values| u32::try_from(values.len()).unwrap_or(u32::MAX));
-    summary.entities = chunk
+    summary.entities = data
         .get_list("Entities")
         .map_or(0, |values| u32::try_from(values.len()).unwrap_or(u32::MAX));
     summary

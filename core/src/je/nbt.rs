@@ -8,7 +8,7 @@
 //! standard four-byte UTF-8 are accepted) and strict on the write side: list
 //! elements must be homogeneous, which is what Java requires.
 
-use std::io::{Cursor, Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use bedrock_nbt::NbtTag;
@@ -17,8 +17,8 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use indexmap::IndexMap;
 
+use super::read_bounded;
 use crate::error::{Result, WorldPortError, io_result};
-use crate::nbt::{decode_mutf8, encode_mutf8};
 
 const TAG_END: u8 = 0;
 const TAG_BYTE: u8 = 1;
@@ -103,18 +103,18 @@ pub fn encode_into(out: &mut Vec<u8>, name: &str, tag: &NbtTag) -> Result<()> {
 
 /// Reads a gzip-compressed `level.dat`-style file.
 pub fn read_gzip(path: &Path) -> Result<NamedTag> {
-    let bytes = io_result(path, std::fs::read(path))?;
-    decode_gzip(&bytes)
-        .map_err(|error| WorldPortError::nbt(format!("{}: {error}", path.display())))
+    let file = io_result(path, std::fs::File::open(path))?;
+    let decoded = io_result(path, read_bounded(GzDecoder::new(file), 4096))?;
+    decode(&decoded).map_err(|error| WorldPortError::nbt(format!("{}: {error}", path.display())))
 }
 
 /// Decodes gzip-compressed NBT bytes.
 pub fn decode_gzip(bytes: &[u8]) -> Result<NamedTag> {
-    let mut decoder = GzDecoder::new(Cursor::new(bytes));
-    let mut decoded = Vec::with_capacity(bytes.len().saturating_mul(2).max(1024));
-    decoder
-        .read_to_end(&mut decoded)
-        .map_err(|error| WorldPortError::nbt(format!("gzip: {error}")))?;
+    let decoded = read_bounded(
+        flate2::bufread::GzDecoder::new(bytes),
+        bytes.len().saturating_mul(3),
+    )
+    .map_err(|error| WorldPortError::nbt(format!("gzip: {error}")))?;
     decode(&decoded)
 }
 
@@ -166,6 +166,9 @@ fn write_payload(out: &mut Vec<u8>, tag: &NbtTag) -> Result<()> {
         }
         NbtTag::Compound(entries) => {
             for (key, value) in entries {
+                if matches!(value, NbtTag::End) {
+                    return Err(WorldPortError::nbt("compound entry cannot contain TAG_End"));
+                }
                 out.push(tag_id(value));
                 write_mutf8_string(out, key)?;
                 write_payload(out, value)?;
@@ -221,33 +224,24 @@ fn write_len(out: &mut Vec<u8>, length: usize) -> Result<()> {
 }
 
 fn write_mutf8_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
-    // ASCII maps byte-for-byte onto modified UTF-8, and NBT is dominated by
-    // short ASCII field names (`Name`, `Y`, `palette`, ...). Writing the slice
-    // directly avoids one `Vec` allocation per string.
-    if value.is_ascii() && !value.as_bytes().contains(&0) {
-        let length = u16::try_from(value.len())
-            .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
-        out.extend_from_slice(&length.to_be_bytes());
-        out.extend_from_slice(value.as_bytes());
-        return Ok(());
-    }
-    // Non-ASCII or embedded NUL: encode into a reused thread-local buffer so a
-    // chunk full of names does not allocate once per string.
-    MUTF8_SCRATCH.with_borrow_mut(|scratch| -> Result<()> {
-        scratch.clear();
-        encode_mutf8(value, scratch);
-        let length = u16::try_from(scratch.len())
-            .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
-        out.extend_from_slice(&length.to_be_bytes());
-        out.extend_from_slice(scratch);
-        Ok(())
-    })
+    let encoded = cesu8::to_java_cesu8(value);
+    let length = u16::try_from(encoded.len())
+        .map_err(|_| WorldPortError::nbt("string exceeds 65535 encoded bytes"))?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(&encoded);
+    Ok(())
 }
 
-thread_local! {
-    /// Reused buffer for non-ASCII modified UTF-8 strings.
-    static MUTF8_SCRATCH: std::cell::RefCell<Vec<u8>> =
-        std::cell::RefCell::new(Vec::with_capacity(64));
+/// Appends Java modified UTF-8 bytes.
+pub fn encode_mutf8(value: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(&cesu8::to_java_cesu8(value));
+}
+
+/// Decodes Java modified UTF-8 with replacement for malformed input.
+/// Accepts ordinary UTF-8 from third-party writers.
+#[must_use]
+pub fn decode_mutf8(bytes: &[u8]) -> String {
+    simd_cesu8::mutf8::decode_lossy(bytes).into_owned()
 }
 
 struct Reader<'a> {
@@ -282,19 +276,27 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("2 bytes")))
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
     }
 
     fn i16(&mut self) -> Result<i16> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().expect("2 bytes")))
+        Ok(i16::from_be_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
     }
 
     fn i32(&mut self) -> Result<i32> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(i32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn i64(&mut self) -> Result<i64> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes")))
+        Ok(i64::from_be_bytes(
+            self.take(8)?.try_into().expect("8 bytes"),
+        ))
     }
 
     fn f32(&mut self) -> Result<f32> {
@@ -360,26 +362,24 @@ impl<'a> Reader<'a> {
                 }
                 NbtTag::Compound(entries)
             }
-            TAG_INT_ARRAY => {
-                let length = self.list_len()?;
-                let mut values = Vec::with_capacity(length.min(4096));
-                for _ in 0..length {
-                    values.push(self.i32()?);
-                }
-                NbtTag::IntArray(values)
-            }
-            TAG_LONG_ARRAY => {
-                let length = self.list_len()?;
-                let mut values = Vec::with_capacity(length.min(4096));
-                for _ in 0..length {
-                    values.push(self.i64()?);
-                }
-                NbtTag::LongArray(values)
-            }
+            TAG_INT_ARRAY => NbtTag::IntArray(self.array(i32::from_be_bytes)?),
+            TAG_LONG_ARRAY => NbtTag::LongArray(self.array(i64::from_be_bytes)?),
             other => {
                 return Err(WorldPortError::nbt(format!("unknown nbt tag id {other}")));
             }
         })
+    }
+
+    fn array<const WIDTH: usize, T>(
+        &mut self,
+        decode: impl Fn([u8; WIDTH]) -> T,
+    ) -> Result<Vec<T>> {
+        let bytes = self
+            .list_len()?
+            .checked_mul(WIDTH)
+            .ok_or_else(|| WorldPortError::nbt("array length overflow"))?;
+        let (elements, _) = self.take(bytes)?.as_chunks::<WIDTH>();
+        Ok(elements.iter().copied().map(decode).collect())
     }
 
     /// Reads a collection length. Negative values are tolerated as zero, which
@@ -393,7 +393,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbt::{NbtExt, compound, tag_list, tag_string};
+    use crate::nbt::{compound, tag_list, tag_string};
 
     fn sample() -> NbtTag {
         compound([
@@ -403,13 +403,19 @@ mod tests {
                 "Sections",
                 tag_list(vec![compound([
                     ("Y", NbtTag::Byte(-4)),
-                    ("block_states", compound([("palette", tag_list(vec![
-                        compound([("Name", tag_string("minecraft:air"))]),
-                        compound([
-                            ("Name", tag_string("minecraft:stone")),
-                            ("Properties", compound([("axis", tag_string("y"))])),
-                        ]),
-                    ]))]))
+                    (
+                        "block_states",
+                        compound([(
+                            "palette",
+                            tag_list(vec![
+                                compound([("Name", tag_string("minecraft:air"))]),
+                                compound([
+                                    ("Name", tag_string("minecraft:stone")),
+                                    ("Properties", compound([("axis", tag_string("y"))])),
+                                ]),
+                            ]),
+                        )]),
+                    ),
                 ])]),
             ),
             ("Empty", tag_list(Vec::new())),
@@ -437,11 +443,59 @@ mod tests {
     }
 
     #[test]
+    fn mutf8_encoding_matches_java_for_the_cases_that_differ() {
+        // Java modified UTF-8 differs from UTF-8 in exactly two places: NUL is
+        // written as C0 80, and a character outside the BMP is written as its
+        // UTF-16 surrogate pair (six bytes) instead of four.
+        let mut out = Vec::new();
+        encode_mutf8("a\0b", &mut out);
+        assert_eq!(out, vec![b'a', 0xC0, 0x80, b'b'], "NUL must be C0 80");
+
+        let mut out = Vec::new();
+        encode_mutf8("\u{1F600}", &mut out); // U+1F600 -> D83D DE00
+        assert_eq!(
+            out,
+            vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+            "astral characters must be a six-byte surrogate pair"
+        );
+
+        // ASCII is unchanged, and a BMP character keeps its three bytes.
+        let mut out = Vec::new();
+        encode_mutf8("ok\u{65E5}", &mut out);
+        assert_eq!(out, vec![b'o', b'k', 0xE6, 0x97, 0xA5]);
+    }
+
+    #[test]
+    fn mutf8_round_trips_every_encoding_class() {
+        for text in ["", "ascii", "a\0b", "\u{65E5}\u{672C}\u{8A9E}", "\u{1F600}", "mix \u{1F389}"] {
+            let mut encoded = Vec::new();
+            encode_mutf8(text, &mut encoded);
+            assert_eq!(decode_mutf8(&encoded), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn mutf8_decoder_accepts_plain_utf8_from_third_party_writers() {
+        // Some tools write ordinary four-byte UTF-8 where Java would write a
+        // surrogate pair; the decoder has to tolerate that.
+        let plain = "\u{1F600}".as_bytes().to_vec();
+        assert_eq!(plain.len(), 4, "precondition: plain UTF-8 is four bytes");
+        assert_eq!(decode_mutf8(&plain), "\u{1F600}");
+    }
+
+    #[test]
+    fn mutf8_decoder_replaces_malformed_bytes() {
+        // A lone continuation byte is not valid in either encoding; the decoder
+        // must not panic or silently truncate the rest of the string.
+        let malformed = vec![b'a', 0x80, b'b'];
+        let decoded = decode_mutf8(&malformed);
+        assert!(decoded.starts_with('a'), "{decoded:?}");
+        assert!(decoded.ends_with('b'), "{decoded:?}");
+    }
+
+    #[test]
     fn rejects_heterogeneous_list_on_write() {
-        let tag = compound([(
-            "Bad",
-            tag_list(vec![NbtTag::Byte(1), NbtTag::Int(2)]),
-        )]);
+        let tag = compound([("Bad", tag_list(vec![NbtTag::Byte(1), NbtTag::Int(2)]))]);
         assert!(encode("", &tag).is_err());
     }
 
@@ -455,6 +509,6 @@ mod tests {
         bytes.extend_from_slice(&(-1_i32).to_be_bytes());
         bytes.push(TAG_END);
         let decoded = decode(&bytes).expect("decode");
-        assert_eq!(decoded.tag.get_list("L").map(|values| values.len()), Some(0));
+        assert_eq!(decoded.tag, compound([("L", NbtTag::List(Vec::new()))]));
     }
 }

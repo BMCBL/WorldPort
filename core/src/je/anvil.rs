@@ -1,5 +1,5 @@
-//! Anvil region files (`.mca`): 4 KiB sector layout, 1024 location slots,
-//! zlib/gzip/uncompressed chunk payloads.
+//! Java region containers (`.mca` and `.mcr`) with 4 KiB sectors.
+//! Reads gzip, zlib, raw NBT, Java's LZ4 block stream and external `.mcc` chunks.
 //!
 //! Reading tolerates files produced by third-party tools; writing always emits a
 //! compact contiguous region. Bulk conversion uses [`write_region_file`], which
@@ -11,15 +11,37 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
-use flate2::read::{GzDecoder, ZlibDecoder};
-use flate2::write::{GzEncoder, ZlibEncoder};
 use rayon::prelude::*;
 
 use crate::error::{Result, WorldPortError, io_result};
 
+mod compression;
+pub use compression::compress;
+use compression::decompress;
+
 const SECTOR_BYTES: u64 = 4096;
 const HEADER_BYTES: u64 = SECTOR_BYTES * 2;
 const SLOTS: usize = 1024;
+const EXTERNAL_CHUNK: u8 = 0x80;
+const MAX_EXTERNAL_BYTES: u64 = crate::je::MAX_PAYLOAD_BYTES + 1024 * 1024;
+
+/// Returns the coordinates from a standard `r.<x>.<z>.mca` or `.mcr` name.
+#[must_use]
+pub fn region_coordinates(path: &Path) -> Option<(i32, i32)> {
+    let extension = path.extension()?.to_str()?;
+    if !matches!(extension, "mca" | "mcr") {
+        return None;
+    }
+    let mut parts = path.file_stem()?.to_str()?.split('.');
+    if parts.next()? != "r" {
+        return None;
+    }
+    let x: i32 = parts.next()?.parse().ok()?;
+    let z: i32 = parts.next()?.parse().ok()?;
+    x.checked_mul(32)?;
+    z.checked_mul(32)?;
+    parts.next().is_none().then_some((x, z))
+}
 
 /// Chunk payload compression, as stored in the region file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +162,7 @@ impl RegionFile {
     /// Returns whether a chunk slot is populated.
     #[must_use]
     pub fn has_chunk(&self, local_x: u8, local_z: u8) -> bool {
-        self.locations[slot_index(local_x, local_z)].is_present()
+        local_x < 32 && local_z < 32 && self.locations[slot_index(local_x, local_z)].is_present()
     }
 
     /// Lists populated chunk slots as `(local_x, local_z)`.
@@ -154,9 +176,17 @@ impl RegionFile {
 
     /// Reads and decompresses one chunk payload.
     pub fn read_chunk(&mut self, local_x: u8, local_z: u8) -> Result<Option<Vec<u8>>> {
+        if local_x >= 32 || local_z >= 32 {
+            return Err(WorldPortError::invalid(format!(
+                "chunk position {local_x},{local_z} is outside the region"
+            )));
+        }
         let location = self.locations[slot_index(local_x, local_z)];
         if !location.is_present() {
             return Ok(None);
+        }
+        if location.offset_sectors < 2 {
+            return Err(WorldPortError::invalid("chunk overlaps the region header"));
         }
         let start = u64::from(location.offset_sectors) * SECTOR_BYTES;
         self.file
@@ -169,7 +199,7 @@ impl RegionFile {
         let length = usize::try_from(u32::from_be_bytes([
             header[0], header[1], header[2], header[3],
         ]))
-        .map_err(|_| WorldPortError::nbt("chunk length overflow"))?;
+        .map_err(|_| WorldPortError::invalid("chunk length overflow"))?;
         if length == 0 {
             return Ok(None);
         }
@@ -179,17 +209,58 @@ impl RegionFile {
         // this chunk. Without this check a corrupt or hostile `.mca` can make
         // the reader allocate an arbitrary buffer before the read fails.
         let capacity = u64::from(location.sector_count) * SECTOR_BYTES;
-        if u64::try_from(length).unwrap_or(u64::MAX) > capacity {
-            return Err(WorldPortError::nbt(format!(
+        if (length as u64).saturating_add(4) > capacity {
+            return Err(WorldPortError::invalid(format!(
                 "chunk at {},{} declares {length} bytes but its header allocates {capacity}",
                 local_x, local_z
             )));
+        }
+        if compression & EXTERNAL_CHUNK != 0 {
+            if length != 1 {
+                return Err(WorldPortError::invalid(
+                    "external chunk stub must contain only the compression ID",
+                ));
+            }
+            return self
+                .read_external_chunk(local_x, local_z, compression & !EXTERNAL_CHUNK)
+                .map(Some);
         }
         let mut compressed = vec![0_u8; payload_len];
         self.file
             .read_exact(&mut compressed)
             .map_err(|error| WorldPortError::io(&self.path, error))?;
-        decompress(&self.path, compression, &compressed).map(Some)
+        decompress(&self.path, compression, compressed).map(Some)
+    }
+
+    fn read_external_chunk(&self, local_x: u8, local_z: u8, compression: u8) -> Result<Vec<u8>> {
+        let (x, z) = region_coordinates(&self.path).ok_or_else(|| {
+            WorldPortError::invalid(format!("invalid region name: {}", self.path.display()))
+        })?;
+        let path = self.path.with_file_name(format!(
+            "c.{}.{}.mcc",
+            x * 32 + i32::from(local_x),
+            z * 32 + i32::from(local_z)
+        ));
+        let file = io_result(&path, File::open(&path))?;
+        let size = io_result(&path, file.metadata())?.len();
+        if size > MAX_EXTERNAL_BYTES {
+            return Err(WorldPortError::invalid(format!(
+                "external chunk is too large: {}",
+                path.display()
+            )));
+        }
+        let mut data = Vec::with_capacity(size as usize);
+        io_result(
+            &path,
+            file.take(MAX_EXTERNAL_BYTES + 1).read_to_end(&mut data),
+        )?;
+        if data.len() as u64 > MAX_EXTERNAL_BYTES {
+            return Err(WorldPortError::invalid(format!(
+                "external chunk is too large: {}",
+                path.display()
+            )));
+        }
+        decompress(&path, compression, data)
     }
 
     /// Writes a chunk payload, appending sectors at the end of the file.
@@ -201,12 +272,17 @@ impl RegionFile {
         compression: RegionCompression,
         level: Compression,
     ) -> Result<()> {
+        if local_x >= 32 || local_z >= 32 {
+            return Err(WorldPortError::invalid(format!(
+                "chunk position {local_x},{local_z} is outside the region"
+            )));
+        }
         let compressed = compress(compression, payload, level)?;
         let length = u32::try_from(compressed.len() + 1)
-            .map_err(|_| WorldPortError::other("chunk payload exceeds 4 GiB"))?;
+            .map_err(|_| WorldPortError::invalid("chunk payload exceeds 4 GiB"))?;
         let span = u64::from(length) + 4;
         let sectors = u8::try_from(span.div_ceil(SECTOR_BYTES))
-            .map_err(|_| WorldPortError::other("chunk payload exceeds 255 sectors"))?;
+            .map_err(|_| WorldPortError::invalid("chunk payload exceeds 255 sectors"))?;
         let index = slot_index(local_x, local_z);
         let existing = self.locations[index];
         let offset = if existing.sector_count == sectors {
@@ -216,7 +292,7 @@ impl RegionFile {
             self.next_sector = self
                 .next_sector
                 .checked_add(u32::from(sectors))
-                .ok_or_else(|| WorldPortError::other("region file exceeds 4 GiB"))?;
+                .ok_or_else(|| WorldPortError::invalid("region file exceeds 4 GiB"))?;
             self.file
                 .set_len(u64::from(self.next_sector) * SECTOR_BYTES)
                 .map_err(|error| WorldPortError::io(&self.path, error))?;
@@ -278,7 +354,7 @@ impl RegionFile {
             return Ok(());
         }
         if length < HEADER_BYTES {
-            return Err(WorldPortError::nbt(format!(
+            return Err(WorldPortError::invalid(format!(
                 "region file {} is {} bytes, shorter than the {HEADER_BYTES}-byte header",
                 self.path.display(),
                 length
@@ -373,12 +449,11 @@ where
         .map(|(local_x, local_z, payload)| match payload {
             // Already a deflate stream: hand it straight to the sector writer.
             ZlibEncode::Zlib(bytes) => Ok((local_x, local_z, bytes)),
-            ZlibEncode::Payload(bytes) => {
-                compress(RegionCompression::Zlib, &bytes, level)
-                    .map(|compressed| (local_x, local_z, compressed))
-            }
+            ZlibEncode::Payload(bytes) => compress(RegionCompression::Zlib, &bytes, level)
+                .map(|compressed| (local_x, local_z, compressed)),
         })
         .collect::<Result<Vec<_>>>()?;
+    const ZERO_SECTOR: [u8; SECTOR_BYTES as usize] = [0; SECTOR_BYTES as usize];
     let mut writer = BufWriter::with_capacity(1 << 20, file);
     writer
         .write_all(&[0_u8; HEADER_BYTES as usize])
@@ -388,22 +463,22 @@ where
     let mut next_sector = 2_u32;
     for (local_x, local_z, compressed) in compressed {
         if local_x >= 32 || local_z >= 32 {
-            return Err(WorldPortError::other(format!(
+            return Err(WorldPortError::invalid(format!(
                 "local chunk position out of range: {local_x},{local_z}"
             )));
         }
         let length = u32::try_from(compressed.len() + 1)
-            .map_err(|_| WorldPortError::other("chunk payload exceeds 4 GiB"))?;
+            .map_err(|_| WorldPortError::invalid("chunk payload exceeds 4 GiB"))?;
         let span = u64::from(length) + 4;
         let sectors = u8::try_from(span.div_ceil(SECTOR_BYTES))
-            .map_err(|_| WorldPortError::other("chunk payload exceeds 255 sectors"))?;
+            .map_err(|_| WorldPortError::invalid("chunk payload exceeds 255 sectors"))?;
         locations[slot_index(local_x, local_z)] = Location {
             offset_sectors: next_sector,
             sector_count: sectors,
         };
         next_sector = next_sector
             .checked_add(u32::from(sectors))
-            .ok_or_else(|| WorldPortError::other("region file exceeds 4 GiB"))?;
+            .ok_or_else(|| WorldPortError::invalid("region file exceeds 4 GiB"))?;
         writer
             .write_all(&length.to_be_bytes())
             .and_then(|()| writer.write_all(&[RegionCompression::Zlib.id()]))
@@ -412,7 +487,7 @@ where
         let padding = u64::from(sectors) * SECTOR_BYTES - span;
         if padding > 0 {
             writer
-                .write_all(&vec![0_u8; usize::try_from(padding).unwrap_or(0)])
+                .write_all(&ZERO_SECTOR[..padding as usize])
                 .map_err(|error| WorldPortError::io(path, error))?;
         }
     }
@@ -449,227 +524,5 @@ fn unix_now_seconds() -> u32 {
         .unwrap_or(0)
 }
 
-/// Compresses `payload` with the region-file codec (zlib for vanilla Java).
-pub fn compress(kind: RegionCompression, payload: &[u8], level: Compression) -> Result<Vec<u8>> {
-    match kind {
-        RegionCompression::Gzip => {
-            let mut encoder = GzEncoder::new(Vec::with_capacity(payload.len() / 2), level);
-            encoder
-                .write_all(payload)
-                .map_err(|error| WorldPortError::nbt(format!("gzip: {error}")))?;
-            encoder
-                .finish()
-                .map_err(|error| WorldPortError::nbt(format!("gzip: {error}")))
-        }
-        RegionCompression::Zlib => {
-            let mut encoder = ZlibEncoder::new(Vec::with_capacity(payload.len() / 2), level);
-            encoder
-                .write_all(payload)
-                .map_err(|error| WorldPortError::nbt(format!("zlib: {error}")))?;
-            encoder
-                .finish()
-                .map_err(|error| WorldPortError::nbt(format!("zlib: {error}")))
-        }
-        RegionCompression::None => Ok(payload.to_vec()),
-    }
-}
-
-/// Largest decompressed chunk the reader accepts.
-///
-/// A real chunk is a few hundred KiB; the cap stops a decompression bomb from
-/// expanding a tiny `.mca` entry into gigabytes before NBT parsing fails.
-const MAX_DECOMPRESSED_CHUNK: u64 = 64 * 1024 * 1024;
-
-fn decompress(path: &Path, compression: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut decoded = Vec::with_capacity(payload.len().saturating_mul(3).max(1024));
-    let mut bounded = |decoded: &mut Vec<u8>| -> Result<()> {
-        // `take` stops the decoder at the cap instead of reading everything and
-        // checking afterwards.
-        if decoded.len() as u64 >= MAX_DECOMPRESSED_CHUNK {
-            return Err(WorldPortError::nbt(format!(
-                "chunk in {} decompresses beyond {MAX_DECOMPRESSED_CHUNK} bytes",
-                path.display()
-            )));
-        }
-        Ok(())
-    };
-    match compression {
-        1 => {
-            let mut reader =
-                GzDecoder::new(payload).take(MAX_DECOMPRESSED_CHUNK);
-            reader
-                .read_to_end(&mut decoded)
-                .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?;
-            bounded(&mut decoded)?;
-        }
-        2 => {
-            let mut reader =
-                ZlibDecoder::new(payload).take(MAX_DECOMPRESSED_CHUNK);
-            reader
-                .read_to_end(&mut decoded)
-                .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?;
-            bounded(&mut decoded)?;
-        }
-        3 => return Ok(payload.to_vec()),
-        other => {
-            return Err(WorldPortError::unsupported(format!(
-                "region chunk compression id {other} in {} (only gzip/zlib/uncompressed are supported)",
-                path.display()
-            )));
-        }
-    };
-    Ok(decoded)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::je::nbt;
-    use crate::nbt::{compound, tag_string};
-    use bedrock_nbt::NbtTag;
-
-    #[test]
-    fn region_round_trips_chunks() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("r.0.0.mca");
-        let first = nbt::encode("", &compound([("Name", tag_string("first"))])).expect("encode");
-        let second = nbt::encode("", &compound([("Name", tag_string("second"))])).expect("encode");
-        write_region_file(
-            &path,
-            vec![
-                (0, 0, first.clone()),
-                (31, 31, second.clone()),
-            ],
-            Compression::default(),
-        )
-        .expect("write");
-
-        let mut region = RegionFile::open(&path, false).expect("open");
-        assert!(region.has_chunk(0, 0));
-        assert!(region.has_chunk(31, 31));
-        assert!(!region.has_chunk(1, 1));
-        assert_eq!(region.read_chunk(0, 0).expect("read").as_deref(), Some(first.as_slice()));
-        assert_eq!(
-            region.read_chunk(31, 31).expect("read").as_deref(),
-            Some(second.as_slice())
-        );
-    }
-
-    #[test]
-    fn read_only_constructor_opens_a_write_protected_file() {
-        let dir = std::env::temp_dir().join("worldport-region-readonly");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("r.0.0.mca");
-
-        // Write a region normally, then drop write permission on the file.
-        write_region_file(
-            &path,
-            vec![(0, 0, crate::je::nbt::encode("", &crate::nbt::compound([
-                ("xPos", bedrock_nbt::NbtTag::Int(0)),
-            ])).expect("encode"))],
-            Compression::new(1),
-        )
-        .expect("write region");
-
-        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&path, permissions).expect("chmod");
-
-        // `open(.., false)` asks for write access and would fail here; the
-        // read-only constructor must still open and read the chunk.
-        let mut region = RegionFile::open_read_only(&path).expect("open read only");
-        assert!(region.read_chunk(0, 0).expect("read").is_some());
-
-        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        let _ = std::fs::set_permissions(&path, permissions);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn zero_length_region_file_is_an_empty_region() {
-        // Games leave 0-byte `.mca` files behind (an entities directory that
-        // never received a chunk). That is not corruption.
-        let dir = std::env::temp_dir().join("worldport-region-empty");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("r.0.0.mca");
-        std::fs::write(&path, b"").expect("write empty file");
-
-        let mut region = RegionFile::open_read_only(&path).expect("open empty region");
-        assert!(region.read_chunk(0, 0).expect("read").is_none());
-        assert!(region.occupied_slots().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn truncated_header_is_rejected() {
-        let dir = std::env::temp_dir().join("worldport-region-short");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("r.0.0.mca");
-        std::fs::write(&path, vec![0_u8; 100]).expect("write short file");
-
-        let Err(error) = RegionFile::open_read_only(&path) else {
-            panic!("a truncated header must be rejected");
-        };
-        assert!(error.to_string().contains("shorter than"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn declared_length_beyond_the_allocated_sectors_is_rejected() {
-        let dir = std::env::temp_dir().join("worldport-region-oversize");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("r.0.0.mca");
-        write_region_file(
-            &path,
-            vec![(0, 0, vec![0_u8; 32])],
-            Compression::new(1),
-        )
-        .expect("write region");
-
-        // Rewrite the chunk's length prefix to claim far more than one sector.
-        let mut bytes = std::fs::read(&path).expect("read file");
-        let header = 4096_usize * 2;
-        bytes[header..header + 4].copy_from_slice(&u32::MAX.to_be_bytes());
-        std::fs::write(&path, &bytes).expect("write file");
-
-        let mut region = RegionFile::open_read_only(&path).expect("open");
-        let error = region.read_chunk(0, 0).expect_err("must reject");
-        assert!(
-            error.to_string().contains("header allocates"),
-            "{error}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn region_append_write_and_delete() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("r.0.0.mca");
-        let payload = nbt::encode("", &compound([("A", NbtTag::Int(7))])).expect("encode");
-        let mut region = RegionFile::open(&path, true).expect("open");
-        region
-            .write_chunk(3, 4, &payload, RegionCompression::Zlib, Compression::fast())
-            .expect("write");
-        region.flush().expect("flush");
-        drop(region);
-
-        let mut region = RegionFile::open(&path, false).expect("reopen");
-        assert_eq!(region.read_chunk(3, 4).expect("read").as_deref(), Some(payload.as_slice()));
-        region.delete_chunk(3, 4);
-        region.flush().expect("flush");
-        assert!(!region.has_chunk(3, 4));
-    }
-
-    #[test]
-    fn negative_chunk_coordinates_map_to_region_slots() {
-        let pos = crate::je::JeChunkPos::new(-1, -33);
-        assert_eq!(pos.region(), (-1, -2));
-        assert_eq!(pos.local(), (31, 31));
-    }
-}
+mod tests;

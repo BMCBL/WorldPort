@@ -101,3 +101,26 @@ impl JeBlockPos {
         JeChunkPos::new(self.x >> 4, self.z >> 4)
     }
 }
+
+/// Maximum decoded size of a single chunk or gzip NBT document.
+const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_bounded(
+    mut input: impl std::io::Read,
+    initial_capacity: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+
+    let mut output = Vec::with_capacity(initial_capacity.min(MAX_PAYLOAD_BYTES as usize));
+    input
+        .by_ref()
+        .take(MAX_PAYLOAD_BYTES + 1)
+        .read_to_end(&mut output)?;
+    if output.len() as u64 > MAX_PAYLOAD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "decoded payload exceeds 64 MiB",
+        ));
+    }
+    Ok(output)
+}
