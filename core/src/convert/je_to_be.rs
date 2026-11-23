@@ -950,6 +950,7 @@ fn convert_section(
     }
 
     let mut any_block = false;
+    let mut out_of_range: u64 = 0;
     for x in 0..16_usize {
         for z in 0..16_usize {
             for local_y in 0..16_usize {
@@ -959,12 +960,19 @@ fn convert_section(
                 if let Some(usage) = palette_usage.get_mut(entry_index) {
                     *usage = usage.saturating_add(1);
                 }
-                let mapped = slot_primary[entry_index];
+                // A corrupt chunk can carry a palette index past the palette
+                // length; indexing the slot tables directly would panic and
+                // abort the whole conversion. Treat it as air and record it.
+                let (Some(&mapped), Some(&fluid)) =
+                    (slot_primary.get(entry_index), slot_liquid.get(entry_index))
+                else {
+                    out_of_range += 1;
+                    continue;
+                };
                 if mapped != 0 {
                     any_block = true;
                     primary[be_offset] = u16::try_from(mapped - 1).unwrap_or(0);
                 }
-                let fluid = slot_liquid[entry_index];
                 if fluid != 0 {
                     has_liquid = true;
                     liquid[be_offset] = fluid;
@@ -980,6 +988,16 @@ fn convert_section(
         for _ in 0..*usage {
             interests.record(interest);
         }
+    }
+
+    if out_of_range > 0 {
+        report.warn(
+            WarningCode::Skipped,
+            "palette-index",
+            format!(
+                "{out_of_range} block(s) in section {y} had a palette index past the palette; treated as air"
+            ),
+        );
     }
 
     if !any_block && !has_liquid {
