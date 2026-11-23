@@ -101,6 +101,11 @@ pub struct Counters {
     pub chunks: u64,
     /// Non-air blocks written.
     pub blocks: u64,
+    /// Cells whose state had to be recomputed from their neighbours.
+    ///
+    /// Bedrock stores no connection data for fences, panes or bars, so those
+    /// states are derived. A non-zero count means the pass really did run.
+    pub neighbour_states: u64,
     /// Block entities written.
     pub block_entities: u64,
     /// Entities written.

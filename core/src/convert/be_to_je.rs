@@ -435,6 +435,8 @@ fn read_chunk(
     // Heightmaps start at "no block yet", which is the minimum height itself.
     let mut height_map = [0_i16; 256];
     let mut any_blocks = false;
+    // Cells whose state depended on a neighbour and had to be recomputed.
+    let mut neighbour_states = 0_usize;
 
     // Union of subchunk layers and biome storages decides which sections to emit.
     // Test for the record instead of calling `chunk.subchunk(y)`: that decodes
@@ -632,6 +634,15 @@ fn read_chunk(
         }
 
         any_blocks |= section_has_blocks;
+        // Bedrock does not store what fences, panes, walls, stairs and chests
+        // need to know about their neighbours, so those states are recomputed
+        // here from the section that is already decoded.
+        neighbour_states += crate::convert::neighbors::apply(
+            crate::convert::neighbors::SectionGrid {
+                palette: &mut palette,
+                indices: &mut indices,
+            },
+        );
         let mut section = IndexMap::new();
         section.insert("Y".to_string(), NbtTag::Byte(section_y));
         section.insert("block_states".to_string(), block_states_nbt(palette, &indices));
@@ -655,6 +666,9 @@ fn read_chunk(
             ChunkRecordTag::HardcodedSpawners => features.chunk_metadata,
             _ => false,
         });
+    if neighbour_states > 0 {
+        report.counters().neighbour_states += neighbour_states as u64;
+    }
     if !any_blocks && !has_optional {
         return Ok(None);
     }

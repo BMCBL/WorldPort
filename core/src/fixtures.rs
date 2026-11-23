@@ -219,8 +219,72 @@ fn write_chunk(root: &Path) -> Result<()> {
                         ("natural", "false"),
                     ]),
                 ),
+                // Fence line end points and middle, with Java's own connection
+                // values spelled out.
+                (
+                    "minecraft:oak_fence",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "true"),
+                        ("south", "false"),
+                        ("west", "false"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
+                (
+                    "minecraft:oak_fence",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "true"),
+                        ("south", "false"),
+                        ("west", "true"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
+                (
+                    "minecraft:oak_fence",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "false"),
+                        ("south", "false"),
+                        ("west", "true"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
+                // The same shapes for a glass-pane line.
+                (
+                    "minecraft:glass_pane",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "true"),
+                        ("south", "false"),
+                        ("west", "false"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
+                (
+                    "minecraft:glass_pane",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "true"),
+                        ("south", "false"),
+                        ("west", "true"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
+                (
+                    "minecraft:glass_pane",
+                    Some(&[
+                        ("north", "false"),
+                        ("east", "false"),
+                        ("south", "false"),
+                        ("west", "true"),
+                        ("waterlogged", "false"),
+                    ]),
+                ),
             ],
-            // Bottom layer stone, a 3x3 plank platform above it.
+            // Bottom layer stone, a 3x3 plank platform above it, then a fence
+            // line along x and a glass-pane line along z.
             |x, y, z| {
                 if y == 0 {
                     1
@@ -228,6 +292,23 @@ fn write_chunk(root: &Path) -> Result<()> {
                     3
                 } else if y == 1 && (1..=3).contains(&x) && (1..=3).contains(&z) {
                     2
+                } else if y == 2 && z == 1 && (1..=3).contains(&x) {
+                    // A three-fence line: the ends connect inward, the middle
+                    // connects both ways. These values are the ground truth a
+                    // roundtrip has to reproduce, because Bedrock stores no fence
+                    // connections at all and they can only come back from
+                    // neighbour derivation.
+                    match x {
+                        1 => 4,
+                        2 => 5,
+                        _ => 6,
+                    }
+                } else if y == 2 && z == 3 && (1..=3).contains(&x) {
+                    match x {
+                        1 => 7,
+                        2 => 8,
+                        _ => 9,
+                    }
                 } else {
                     0
                 }

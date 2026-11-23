@@ -1374,11 +1374,33 @@ fn translate_one(key: &str, value: &str, direction: Direction, has: &dyn Fn(&str
                 Translation::Dropped,
                 |target| prop(target, bool_to_number(value)),
             ),
+            // Walls keep their connections in Bedrock, under different names and
+            // with three states instead of Java's three plus a separate post bit.
+            // The value is only written when the target block really declares
+            // the property, so fences and panes (which Bedrock connects on the
+            // client from neighbours) still fall through to `Dropped`.
+            "north" | "east" | "south" | "west" => {
+                let connection = format!("wall_connection_type_{key}");
+                if has(&connection) {
+                    Translation::Property(connection, java_wall_connection(value))
+                } else if has(key) {
+                    // A Bedrock block that does carry the direction itself
+                    // (newer fences) stores it as a byte.
+                    Translation::Property(key.to_string(), bool_to_number(value))
+                } else {
+                    Translation::Dropped
+                }
+            }
+            "up" => {
+                if has("wall_post_bit") {
+                    Translation::Property("wall_post_bit".to_string(), bool_to_number(value))
+                } else {
+                    Translation::Dropped
+                }
+            }
             // Derived by Bedrock or not persisted there.
             "shape" | "distance" | "stage" | "leaves" | "snowy" | "extended" | "instrument"
-            | "north" | "east" | "south" | "west" | "up" | "down" | "in_wall" | "hinge" => {
-                Translation::Dropped
-            }
+            | "down" | "in_wall" | "hinge" => Translation::Dropped,
             _ => pick(&[key])
                 .map_or(Translation::Dropped, |target| prop(target, value.to_string())),
         },
@@ -1401,6 +1423,23 @@ fn translate_one(key: &str, value: &str, direction: Direction, has: &dyn Fn(&str
                 } else {
                     Translation::Dropped
                 }
+            }
+            // Walls: Bedrock's three connection states map onto Java's three,
+            // and the post bit is Java's `up`. Both are written only when the
+            // Java target declares them.
+            key if key.starts_with("wall_connection_type_") => {
+                let direction = &key["wall_connection_type_".len()..];
+                if has(direction) {
+                    Translation::Property(
+                        direction.to_string(),
+                        bedrock_wall_connection(value).to_string(),
+                    )
+                } else {
+                    Translation::Dropped
+                }
+            }
+            "wall_post_bit" if has("up") => {
+                Translation::Property("up".to_string(), number_to_bool(value))
             }
             "minecraft:vertical_half" => pick(&["half", "type"]).map_or(
                 Translation::Dropped,
@@ -1479,9 +1518,34 @@ fn translate_one(key: &str, value: &str, direction: Direction, has: &dyn Fn(&str
                 .map_or(Translation::Dropped, |target| prop(target, value.to_string())),
             "block_light_level" => pick(&["level"])
                 .map_or(Translation::Dropped, |target| prop(target, value.to_string())),
+            // Java spells booleans `true`/`false`; Bedrock says `0`/`1`. Passing
+            // the digit through produced states no Java world can load.
+            _ if matches!(value, "0" | "1") && has(key) => {
+                Translation::Property(key.to_string(), number_to_bool(value))
+            }
             _ => pick(&[key])
                 .map_or(Translation::Dropped, |target| prop(target, value.to_string())),
         },
+    }
+}
+
+/// Java's `none`/`low`/`tall` to Bedrock's `none`/`short`/`tall`.
+fn java_wall_connection(value: &str) -> String {
+    match value {
+        "low" => "short".to_string(),
+        // `true`/`false` appear when a wall state came from an older world.
+        "true" => "tall".to_string(),
+        "false" => "none".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Bedrock's `none`/`short`/`tall` back to Java's `none`/`low`/`tall`.
+fn bedrock_wall_connection(value: &str) -> &str {
+    match value {
+        "short" => "low",
+        "tall" => "tall",
+        _ => "none",
     }
 }
 

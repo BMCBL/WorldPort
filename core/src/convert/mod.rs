@@ -2,6 +2,7 @@
 
 pub mod be_to_je;
 pub mod je_to_be;
+pub mod neighbors;
 pub mod profile;
 
 use std::path::{Path, PathBuf};
