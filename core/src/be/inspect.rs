@@ -57,26 +57,12 @@ pub fn summarize(path: &Path) -> Result<BedrockWorldSummary> {
     let mut summary = BedrockWorldSummary {
         level_name: root.get_str("LevelName").unwrap_or_default().to_string(),
         seed: level_dat.random_seed()?.unwrap_or(0),
+        version_label: version_label(root),
         storage_version: root.get_int("StorageVersion").unwrap_or(0),
         game_type: root.get_int("GameType").unwrap_or(0),
         difficulty: root.get_int("Difficulty").unwrap_or(0),
         ..BedrockWorldSummary::default()
     };
-    summary.version_label = root
-        .get("lastOpenedWithVersion")
-        .and_then(|tag| match tag {
-            bedrock_nbt::NbtTag::List(values) => Some(
-                values
-                    .iter()
-                    .filter_map(|value| value.as_i64_value())
-                    .map(|value| value.to_string())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default();
-
     let positions = world.chunk_positions(Default::default())?;
     for pos in positions {
         match pos.dimension {
@@ -95,6 +81,16 @@ pub fn summarize(path: &Path) -> Result<BedrockWorldSummary> {
     summary.record_counts = counts;
     summary.players = world.players()?.len();
     Ok(summary)
+}
+
+pub(crate) fn version_label(root: &bedrock_nbt::NbtTag) -> String {
+    root.get_list("lastOpenedWithVersion")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(TagValue::as_i64_value)
+        .map(|version| version.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Checks whether a chunk column is present.
