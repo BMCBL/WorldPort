@@ -318,6 +318,48 @@ fn read_components(stack: &mut ItemStack, components: &IndexMap<String, NbtTag>)
             .filter_map(|line| line.as_str_value().map(plain_text))
             .collect();
     }
+    // Books: since 1.20.5 the text moved from `tag.pages` into a component, so a
+    // modern book converted without this arrived in Bedrock blank. Bedrock keeps
+    // the older shape (`tag.pages`/`title`/`author`), which the item's passthrough
+    // payload already carries, so the component is folded into that.
+    for component in [
+        "minecraft:written_book_content",
+        "minecraft:writable_book_content",
+    ] {
+        let Some(content) = components.get(component) else {
+            continue;
+        };
+        if let Some(pages) = content.get_list("pages") {
+            let lines: Vec<NbtTag> = pages
+                .iter()
+                .map(|page| {
+                    // A page is a text component; `raw` holds it unmapped, `text`
+                    // the flattened form older data used.
+                    page.get_str("raw")
+                        .or_else(|| page.get_str("text"))
+                        .map(|text| tag_string(text.to_string()))
+                        .unwrap_or_else(|| tag_string(""))
+                })
+                .collect();
+            stack.extra.insert("pages".to_string(), tag_list(lines));
+        }
+        for (key, target) in [("title", "title"), ("author", "author")] {
+            if let Some(value) = content.get(key) {
+                let text = value
+                    .get_str("raw")
+                    .or_else(|| value.get_str("text"))
+                    .or_else(|| value.as_str_value());
+                if let Some(text) = text {
+                    stack.extra.insert(target.to_string(), tag_string(text.to_string()));
+                }
+            }
+        }
+        if content.get("resolved").is_some() {
+            stack
+                .extra
+                .insert("resolved".to_string(), NbtTag::Byte(1));
+        }
+    }
     if components.get("minecraft:unbreakable").is_some() {
         stack.unbreakable = true;
     }
@@ -377,6 +419,40 @@ fn write_components(stack: &ItemStack) -> NbtTag {
         && damage != 0
     {
         components.insert("minecraft:damage".to_string(), NbtTag::Int(damage));
+    }
+    // Rebuild the book component from the Bedrock-shaped payload, so a book
+    // written before 1.20.5 and one written after convert to the same thing.
+    if let Some(pages) = stack.extra.get_list("pages") {
+        let title = stack
+            .extra
+            .get_str("title")
+            .map(|title| compound([("raw", tag_string(title.to_string()))]));
+        let author = stack.extra.get_str("author").map(str::to_string);
+        let mut content = IndexMap::new();
+        content.insert(
+            "pages".to_string(),
+            tag_list(
+                pages
+                    .iter()
+                    .map(|page| {
+                        compound([(
+                            "raw",
+                            tag_string(page.as_str_value().unwrap_or("").to_string()),
+                        )])
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(title) = title {
+            content.insert("title".to_string(), title);
+        }
+        if let Some(author) = author {
+            content.insert("author".to_string(), tag_string(author));
+        }
+        components.insert(
+            "minecraft:written_book_content".to_string(),
+            NbtTag::Compound(content),
+        );
     }
     if let Some(name) = &stack.custom_name {
         components.insert(
@@ -650,5 +726,61 @@ mod tests {
         let bedrock = write_bedrock_item(&stack);
         let back = read_bedrock_item(&bedrock).expect("potion");
         assert_eq!(back.potion.as_deref(), Some("minecraft:healing"));
+    }
+    #[test]
+    fn a_modern_written_book_keeps_its_text() {
+        // Since 1.20.5 a book's text lives in a component, not `tag.pages`. Without
+        // this mapping a book converted to Bedrock arrived blank, which is worse
+        // than losing a colour.
+        let item = compound([
+            ("id", tag_string("minecraft:written_book")),
+            ("count", NbtTag::Int(1)),
+            (
+                "components",
+                compound([(
+                    "minecraft:written_book_content",
+                    compound([
+                        (
+                            "pages",
+                            tag_list(vec![
+                                compound([("raw", tag_string("first page"))]),
+                                compound([("raw", tag_string("second page"))]),
+                            ]),
+                        ),
+                        ("title", compound([("raw", tag_string("A Title"))])),
+                        ("author", tag_string("Steve")),
+                        ("resolved", NbtTag::Byte(1)),
+                    ]),
+                )]),
+            ),
+        ]);
+        let stack = read_java_item(&item).expect("reads");
+        let bedrock = write_bedrock_item(&stack);
+        let tag = bedrock.get("tag").expect("bedrock tag");
+        let pages = tag.get_list("pages").expect("pages survived");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].as_str_value(), Some("first page"));
+        assert_eq!(tag.get_str("title"), Some("A Title"));
+        assert_eq!(tag.get_str("author"), Some("Steve"));
+
+        // And back: a Java target has to receive the component, not a stray tag.
+        let returned = write_java_item(&stack, 4903);
+        let content = returned
+            .get("components")
+            .and_then(|components| components.get("minecraft:written_book_content"))
+            .expect("written_book_content");
+        let pages = content.get_list("pages").expect("pages");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[1].get("raw").and_then(|raw| raw.as_str_value()),
+            Some("second page")
+        );
+        assert_eq!(
+            content
+                .get("title")
+                .and_then(|title| title.get("raw"))
+                .and_then(|raw| raw.as_str_value()),
+            Some("A Title")
+        );
     }
 }

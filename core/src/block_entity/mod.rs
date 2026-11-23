@@ -165,12 +165,24 @@ pub fn java_to_bedrock(je: &NbtTag, report: &mut ReportBuilder) -> Option<IndexM
             if let Some(side) = je.get(je_key)
                 && let Some(messages) = side.get_list("messages")
             {
+                // Bedrock has no colour field: a sign's colour is a legacy code at
+                // the start of the text. Dropping it turned every coloured sign
+                // black, which is a visible loss for something as small as a dye.
+                let prefix = side
+                    .get_str("color")
+                    .and_then(|color| legacy_color_code(color).map(|code| format!("\u{a7}{code}")))
+                    .unwrap_or_default();
                 let lines: Vec<String> = messages
                     .iter()
                     .map(|line| crate::item::plain_text(line.as_str_value().unwrap_or("")))
+                    .map(|line| format!("{prefix}{line}"))
                     .collect();
                 let mut text = IndexMap::new();
                 text.insert("Text".to_string(), tag_string(lines.join("\n")));
+                if side.get_bool("has_glowing_text").unwrap_or(false) {
+                    // Bedrock marks a glowing sign on the block entity.
+                    text.insert("Glowing".to_string(), NbtTag::Byte(1));
+                }
                 out.insert(be_key.to_string(), NbtTag::Compound(text));
             }
         }
@@ -277,12 +289,22 @@ pub fn bedrock_to_java(be: &NbtTag, report: &mut ReportBuilder, data_version: i3
             if let Some(side) = be.get(be_key)
                 && let Some(text) = side.get_str("Text")
             {
-                let messages: Vec<NbtTag> = text
+                // A leading section code is the colour; Java keeps it as a
+                // property, so it must not stay in the line text as well.
+                let (color, body) = split_legacy_color(text);
+                let messages: Vec<NbtTag> = body
                     .split('\n')
                     .map(|line| tag_string(crate::item::json_text(line)))
                     .collect();
                 let mut side_tag = IndexMap::new();
                 side_tag.insert("messages".to_string(), NbtTag::List(messages));
+                if let Some(color) = color {
+                    side_tag.insert("color".to_string(), tag_string(color));
+                }
+                side_tag.insert(
+                    "has_glowing_text".to_string(),
+                    NbtTag::Byte(i8::from(side.get_bool("Glowing").unwrap_or(false))),
+                );
                 out.insert(je_key.to_string(), NbtTag::Compound(side_tag));
             }
         }
@@ -357,6 +379,53 @@ pub fn empty_payload() -> NbtTag {
     empty_compound()
 }
 
+/// Java's dye name to the legacy section code Bedrock writes in sign text.
+const SIGN_COLORS: &[(&str, char)] = &[
+    ("black", '0'),
+    ("dark_blue", '1'),
+    ("dark_green", '2'),
+    ("dark_aqua", '3'),
+    ("dark_red", '4'),
+    ("dark_purple", '5'),
+    ("gold", '6'),
+    ("gray", '7'),
+    ("dark_gray", '8'),
+    ("blue", '9'),
+    ("green", 'a'),
+    ("aqua", 'b'),
+    ("red", 'c'),
+    ("light_purple", 'd'),
+    ("yellow", 'e'),
+    ("white", 'f'),
+];
+
+fn legacy_color_code(color: &str) -> Option<char> {
+    // `black` is Java's default and Bedrock's absence, so writing it would add a
+    // code that was never there.
+    if color == "black" {
+        return None;
+    }
+    SIGN_COLORS
+        .iter()
+        .find(|(name, _)| *name == color)
+        .map(|(_, code)| *code)
+}
+
+/// Splits a leading `\u{a7}<code>` off a Bedrock sign line.
+fn split_legacy_color(text: &str) -> (Option<&'static str>, &str) {
+    let mut chars = text.chars();
+    if chars.next() != Some('\u{a7}') {
+        return (None, text);
+    }
+    let Some(code) = chars.next() else {
+        return (None, text);
+    };
+    match SIGN_COLORS.iter().find(|(_, known)| *known == code) {
+        Some((name, _)) => (Some(name), &text[2..]),
+        None => (None, text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +475,76 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_coloured_sign_keeps_its_colour_through_the_roundtrip() {
+        // Bedrock has no colour field, so a red sign has to survive as a legacy
+        // code in the text - otherwise every dyed sign came back black.
+        let je = compound([
+            ("id", tag_string("minecraft:sign")),
+            (
+                "front_text",
+                compound([
+                    ("color", tag_string("red")),
+                    ("has_glowing_text", NbtTag::Byte(1)),
+                    (
+                        "messages",
+                        tag_list(vec![
+                            tag_string("{\"text\":\"hello\"}"),
+                            tag_string("\"world\""),
+                            tag_string(""),
+                            tag_string(""),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]);
+        let mut report = crate::report::ReportBuilder::new("java", "bedrock", "", "");
+        let be = java_to_bedrock(&je, &mut report).expect("converts");
+        let text = be
+            .get("FrontText")
+            .and_then(|front| front.get_str("Text"))
+            .expect("FrontText.Text");
+        assert!(text.starts_with('\u{a7}'), "colour code missing: {text:?}");
+        assert!(text.starts_with("\u{a7}c"), "red is `c`: {text:?}");
+        assert!(text.contains("hello"), "{text:?}");
+
+        let back = bedrock_to_java(&NbtTag::Compound(be), &mut report, 4903).expect("returns");
+        let side = back.get("front_text").expect("front_text");
+        assert_eq!(side.get_str("color"), Some("red"));
+        assert_eq!(side.get_bool("has_glowing_text"), Some(true));
+        let first = side.get_list("messages").expect("messages")[0]
+            .as_str_value()
+            .expect("string");
+        assert!(
+            !first.contains('\u{a7}'),
+            "the code must move into the property: {first:?}"
+        );
+        assert!(first.contains("hello"), "{first:?}");
+    }
+
+    #[test]
+    fn a_black_sign_gets_no_colour_code() {
+        // Black is Bedrock's default, so a code for it would add text the original
+        // never had.
+        let je = compound([
+            ("id", tag_string("minecraft:sign")),
+            (
+                "front_text",
+                compound([
+                    ("color", tag_string("black")),
+                    ("messages", tag_list(vec![tag_string("plain")])),
+                ]),
+            ),
+        ]);
+        let mut report = crate::report::ReportBuilder::new("java", "bedrock", "", "");
+        let be = java_to_bedrock(&je, &mut report).expect("converts");
+        let text = be
+            .get("FrontText")
+            .and_then(|front| front.get_str("Text"))
+            .expect("Text");
+        assert!(!text.contains('\u{a7}'), "{text:?}");
+    }
+
     fn sign_text_joins_and_splits_lines() {
         let mut report =
             crate::report::ReportBuilder::new("java", "bedrock", "test", "test");
