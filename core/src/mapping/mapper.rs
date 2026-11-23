@@ -265,16 +265,22 @@ fn je_alias(short: &str) -> Option<MappedState> {
             return Some(MappedState::new(namespaced(target)).with("color", color));
         }
     }
-    if let Some(wood) = short.strip_suffix("_sign") {
-        let wood = wood.replace("dark_oak", "darkoak");
-        return Some(MappedState::new(namespaced(&format!("{wood}_standing_sign"))));
+    // Order matters: the most specific suffix has to win, or `oak_wall_sign`
+    // matches `_sign` first and becomes `oak_wall_standing_sign`, a block that
+    // does not exist. That produced an invalid id for every wall sign.
+    if let Some(wood) = short.strip_suffix("_wall_hanging_sign") {
+        return Some(MappedState::new(namespaced(&format!("{wood}_hanging_sign"))).lossy());
+    }
+    if let Some(wood) = short.strip_suffix("_hanging_sign") {
+        return Some(MappedState::new(namespaced(&format!("{wood}_hanging_sign"))));
     }
     if let Some(wood) = short.strip_suffix("_wall_sign") {
         let wood = wood.replace("dark_oak", "darkoak");
         return Some(MappedState::new(namespaced(&format!("{wood}_wall_sign"))));
     }
-    if let Some(wood) = short.strip_suffix("_wall_hanging_sign") {
-        return Some(MappedState::new(namespaced(&format!("{wood}_hanging_sign"))).lossy());
+    if let Some(wood) = short.strip_suffix("_sign") {
+        let wood = wood.replace("dark_oak", "darkoak");
+        return Some(MappedState::new(namespaced(&format!("{wood}_standing_sign"))));
     }
     if short.starts_with("potted_") {
         return Some(MappedState::new("minecraft:flower_pot").lossy());
@@ -1311,8 +1317,15 @@ fn translate_properties(
         .unwrap_or_default();
     let has = |candidate: &str| declared.iter().any(|entry| *entry == candidate);
 
+    // A double slab is a separate block in Bedrock, so Java's `type=double` has
+    // nothing to translate into: `vertical_half` only holds `bottom`/`top`.
+    let double_slab = mapped.name.ends_with("_double_slab");
+
     for (source_key, value) in source {
         let key = short_property(source_key);
+        if double_slab && key == "type" {
+            continue;
+        }
         match translate_one(key, value, direction, &has) {
             Translation::Property(target_key, translated) => {
                 // A special rule already produced this target property.
