@@ -89,10 +89,11 @@ pub fn no_java_block(name: &str) -> Option<NoJavaBlock> {
     {
         return Some(NoJavaBlock::Legacy);
     }
-    if matches!(
-        short,
-        "disc_press" | "underwater_tnt" | "monster_egg" | "structure_void" | "moving_block"
-    ) {
+    // Deliberately *not* listed: `moving_block` is Java's `moving_piston` and
+    // `structure_void` exists in both editions, so calling either "Bedrock-only"
+    // would excuse a mapping gap. `monster_egg` is a retired id with no state left
+    // to convert.
+    if matches!(short, "disc_press" | "underwater_tnt" | "monster_egg") {
         return Some(NoJavaBlock::Utility);
     }
     None
@@ -133,6 +134,12 @@ mod tests {
             "minecraft:normal_stone_slab",
             "minecraft:barrier",
             "minecraft:cobblestone_wall",
+            // Both editions have these under different names; classifying either
+            // as "Bedrock-only" would hide a real mapping gap.
+            "minecraft:moving_block",
+            "minecraft:structure_void",
+            "minecraft:stone_slab",
+            "minecraft:cave_vines_head_with_berries",
         ] {
             assert_eq!(no_java_block(name), None, "{name} must be expected to map");
         }

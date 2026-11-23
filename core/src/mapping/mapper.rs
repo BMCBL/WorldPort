@@ -275,6 +275,10 @@ const JE_ALIASES: &[(&str, &str)] = &[
     // Bedrock renamed the block; the two names describe the same thing, so the
     // roundtrip is a rename rather than a loss and both sides declare it.
     ("stonecutter", "stonecutter_block"),
+    // Same block, two names: Java's `moving_piston` is Bedrock's `moving_block`
+    // (block 36). Bedrock keeps no state on it, so the facing and type are lost -
+    // the block only exists while a piston is moving.
+    ("moving_piston", "moving_block"),
     // Lit furnaces are separate Bedrock blocks, not a `lit` property.
     ("blast_furnace", "lit_blast_furnace"),
     ("smoker", "lit_smoker"),
@@ -412,6 +416,11 @@ fn be_alias(short: &str) -> Option<MappedState> {
         }
         // Bedrock keeps lit ores and lamps as their own blocks; Java uses a `lit`
         // property on one block.
+        "moving_block" => {
+            // Block 36: it exists only while a piston is mid-push, and Bedrock
+            // stores no facing or type on it.
+            return Some(MappedState::new("minecraft:moving_piston").lossy());
+        }
         "lit_redstone_lamp" => return Some(MappedState::new("minecraft:redstone_lamp").lossy()),
         "lit_redstone_ore" => return Some(MappedState::new("minecraft:redstone_ore").lossy()),
         "lit_deepslate_redstone_ore" => {
