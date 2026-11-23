@@ -178,6 +178,30 @@ Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command
   | 只读源文件 | 要求写权限，只读介质打不开 | `open_read_only` 只请求读权限 |
   | 批量导入 Actor | 每个含实体的事务全库扫 `digp` | `import_transaction` 用导入内集合校验唯一性 |
 
+  **JE 读取路径的实测分解**（`je_stage_bench` + `WORLDPORT_PROFILE=1`，真实世界 2,000 区块）：
+
+  | 环节 | ms/区块 | 占读取路径 |
+  | --- | ---: | ---: |
+  | Java NBT 解析 | 0.036 | 44% |
+  | Palette LongArray 解包 | 0.027 | 33% |
+  | Region 读 + zlib 解压 | 0.019 | 23% |
+  | **合计** | **0.082** | |
+
+  而 JE→BE 的地形阶段约 1.2 ms/区块，因此**整个 Java 读取路径只占转换的 6.8%**：
+  即使把 NBT 解析和 Palette 解包做到零成本，上限也只有 5.3% 提速，低于本机噪声。
+  这是**不引入 simdnbt / 不融合解包循环**的依据——瓶颈在方块映射、NBT 树构建和
+  LevelDB 写入，不在读取。
+
+  已修的真实开销：`read_chunk_cached` 每区块调用 `path.is_file()`（一次 `stat`
+  系统调用），移入 RegionCache 后 read 阶段 **0.74 → 0.26 ms/区块（−65%）**；
+  端到端只快约 1%，因为 16 个 worker 掩盖了 I/O 等待。
+
+  **zlib 后端说明**：`bedrock-leveldb` 在 x86_64/aarch64 上请求 flate2 的 `zlib-ng`
+  （C 后端，自带运行时 CPU 派发），而 flate2 优先选 `any_c_zlib` 而非 `zlib-rs`，
+  所以实际执行的是 zlib-ng。`flate2` 的 `runtime_detection` 特性已补上（它启用
+  `zlib-rs/std`，否则 zlib-rs 的 `is_x86_feature_detected!` 编译成恒 false），
+  在不用 zlib-ng 的平台上才生效。
+
   **测量口径（重要）**：上表是端到端耗时，两个转换器实际处理的区块数并不相同
   （JE→BE：WorldPort 只转 6,968 个完全生成区块，Chunker 记录 7,312 个；BE→JE：
   108,484 vs 111,744），因此应读作「同输入的实际耗时比」而不是「算法性能倍数」。
