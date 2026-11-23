@@ -1196,12 +1196,10 @@ fn convert_section(
             interests,
         });
     }
-    let Some(biomes) = convert_biomes(section) else {
-        return Ok(SectionOutcome {
-            write: None,
-            interests,
-        });
-    };
+    // A malformed/missing biome tag must not silently erase a section whose
+    // block palette was already decoded. In strict mode fail; in fallback mode
+    // emit explicit diagnostics and use plains until a valid biome is available.
+    let biomes = section_biomes_or_fallback(section, y, report, policy)?;
     Ok(SectionOutcome {
         write: Some(SectionWrite {
             y,
@@ -1213,6 +1211,28 @@ fn convert_section(
         }),
         interests,
     })
+}
+
+fn section_biomes_or_fallback(
+    section: &NbtTag,
+    y: i8,
+    report: &mut ReportBuilder,
+    policy: crate::convert::UnknownDataPolicy,
+) -> Result<[u32; 64]> {
+    if let Some(biomes) = convert_biomes(section) {
+        return Ok(biomes);
+    }
+    if policy == crate::convert::UnknownDataPolicy::Error {
+        return Err(WorldPortError::unsupported(format!(
+            "section {y} has convertible blocks but missing or invalid biome data"
+        )));
+    }
+    report.warn(
+        WarningCode::Lossy,
+        format!("section:{y}:biomes"),
+        "missing biome data; substituted plains instead of discarding blocks",
+    );
+    Ok([1_u32; 64])
 }
 
 fn convert_biomes(section: &NbtTag) -> Option<[u32; 64]> {
@@ -1467,6 +1487,29 @@ mod tests {
             }).unwrap();
             assert_eq!(encode_air_section(y).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn missing_biomes_do_not_discard_convertible_sections() {
+        let section = crate::nbt::empty_compound();
+        let mut report = ReportBuilder::new("java", "bedrock", "", "");
+        assert_eq!(
+            section_biomes_or_fallback(
+                &section,
+                -4,
+                &mut report,
+                crate::convert::UnknownDataPolicy::Fallback,
+            ).expect("fallback"),
+            [1_u32; 64],
+        );
+        assert!(
+            section_biomes_or_fallback(
+                &section,
+                -4,
+                &mut report,
+                crate::convert::UnknownDataPolicy::Error,
+            ).is_err(),
+        );
     }
 
     #[test]
