@@ -171,5 +171,20 @@ jobs:
           [[ "$GITHUB_REF_NAME" == "$tag" ]]
           (cd artifacts && sha256sum --check --strict worldport-native-*.sha256)
           [[ "$(jq -er '.tag_name' artifacts/worldport-native.json)" == "$tag" ]]
-          gh release create "$tag" artifacts/worldport-*.bmcblx artifacts/worldport-native-* \
+          gh release create "$tag" \
+            artifacts/worldport-*.bmcblx \
+            artifacts/worldport-native-abi1-* \
             --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest
+          # The plugin falls back to this index when the registry is unreachable,
+          # so it is uploaded on its own line and then checked: an asset that is
+          # silently dropped turns that fallback into a 404 for every user.
+          gh release upload "$tag" artifacts/worldport-native.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          published=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for required in worldport-native.json worldport-native-abi1-windows-x86_64-msvc.dll; do
+            grep -qx "$required" <<< "$published" || {
+              echo "release is missing $required" >&2
+              exit 1
+            }
+          done
+          [[ $(grep -c '\.bmcblx$' <<< "$published") == 1 ]]
