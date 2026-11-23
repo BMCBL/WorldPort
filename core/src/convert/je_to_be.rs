@@ -96,6 +96,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     let mut interests = crate::poi::InterestInventory::default();
     // Structure areas collected during the terrain pass; no second world read.
     let mut structure_areas: Vec<(i32, i32, crate::structure::StructureArea)> = Vec::new();
+    let profile_totals = crate::convert::profile::Totals::default();
     let uid_counter = AtomicI64::new(1);
     let current_tick = world.total_ticks();
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
@@ -144,6 +145,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     *interests.by_kind.entry(kind).or_default() += count;
                 }
                 structure_areas.extend(outcome.structures);
+                profile_totals.add(&outcome.timings);
                 if outcome.converted {
                     converted_chunks += 1;
                     report.counters().chunks += 1;
@@ -159,6 +161,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     }
     output.flush()?;
     report.end_stage();
+    crate::convert::profile::report(&profile_totals.snapshot());
 
     report.begin_stage("structures");
     options.report(Progress::new("structures", 0, None));
@@ -391,6 +394,8 @@ struct ChunkOutcome {
     converted: bool,
     /// Village-interest blocks found in this chunk.
     interests: crate::poi::InterestInventory,
+    /// Per-phase timings for this chunk.
+    timings: crate::convert::profile::ChunkTimings,
     /// Structure areas this chunk declared, with the chunk position they came
     /// from.
     ///
@@ -434,9 +439,12 @@ fn convert_position(
     current_tick: i64,
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<ChunkOutcome> {
+    let mut profiler = crate::convert::profile::Profiler::new();
     let mut report = ReportBuilder::new("java", "bedrock", "", "");
+    profiler.start();
     let chunk = REGIONS.with_borrow_mut(|cache| world.read_chunk_cached(cache, dimension, pos));
     let Some(chunk) = chunk? else {
+        profiler.stop(crate::convert::profile::read);
         report.warn(WarningCode::Skipped, pos.label(), "chunk vanished while reading");
         return Ok(ChunkOutcome {
             raw: Vec::new(),
@@ -445,8 +453,13 @@ fn convert_position(
             converted: false,
             interests: Default::default(),
             structures: Vec::new(),
+            timings: profiler.timings(),
         });
     };
+    profiler.stop(crate::convert::profile::read);
+    // `summarize` walks the parsed tree, so it is analysis, not I/O; count it
+    // with the mapping phase it feeds.
+    profiler.start();
     let summary = summarize(&chunk);
     if !summary.status.ends_with("full") {
         report.warn(
@@ -461,12 +474,14 @@ fn convert_position(
             converted: false,
             interests: Default::default(),
             structures: Vec::new(),
+            timings: profiler.timings(),
         });
     }
     let mut sink = ChunkSink::default();
     let mut interests = crate::poi::InterestInventory::default();
     let mut structures = Vec::new();
     let mut unsupported_structures = BTreeMap::new();
+    profiler.start();
     convert_chunk(
         &mut sink,
         &mut report,
@@ -482,6 +497,8 @@ fn convert_position(
         &mut structures,
         &mut unsupported_structures,
     )?;
+    profiler.stop(crate::convert::profile::map);
+    profiler.count_chunk();
     let structures: Vec<(i32, i32, crate::structure::StructureArea)> = structures
         .into_iter()
         .map(|area| (pos.x, pos.z, area))
@@ -502,6 +519,7 @@ fn convert_position(
         converted: true,
         interests,
         structures,
+        timings: profiler.timings(),
     })
 }
 

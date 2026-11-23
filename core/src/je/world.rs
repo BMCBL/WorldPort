@@ -54,6 +54,11 @@ impl RegionCache {
         self.clock = self.clock.wrapping_add(1);
         let clock = self.clock;
         if !self.open.contains_key(path) {
+            // A region file that does not exist simply has no chunks; opening it
+            // would fail, so check here instead of on every read.
+            if !path.is_file() {
+                return Ok(None);
+            }
             if self.open.len() >= REGION_CACHE_CAPACITY {
                 // Evict the least recently used entry. Region reads are local,
                 // so the entry about to be replaced is normally the coldest.
@@ -424,12 +429,13 @@ impl JavaWorld {
         pos: JeChunkPos,
     ) -> Result<Option<NbtTag>> {
         let (region_x, region_z) = pos.region();
+        // The region directory is resolved once per world, but the file name
+        // still has to be built per chunk. `is_file()` was a `stat` per chunk
+        // (one syscall per block column); a missing region is already reported
+        // by the open attempt, so the probe is gone.
         let path = self
             .region_dir(dimension)
             .join(format!("r.{region_x}.{region_z}.mca"));
-        if !path.is_file() {
-            return Ok(None);
-        }
         let (local_x, local_z) = pos.local();
         let Some(payload) = cache.read_chunk(&path, local_x, local_z)? else {
             return Ok(None);
