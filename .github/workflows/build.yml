@@ -11,7 +11,16 @@ permissions:
   contents: read
 
 jobs:
+  compatibility:
+    name: Java/Bedrock cross-version regression
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify every bundled Java Palette and NBT version
+        run: cargo test --locked -p worldport-core --test version_matrix -- --nocapture
+
   native:
+    needs: compatibility
     name: Native (${{ matrix.target }})
     strategy:
       fail-fast: false
