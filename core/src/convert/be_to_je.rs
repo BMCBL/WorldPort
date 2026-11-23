@@ -231,6 +231,7 @@ pub fn convert(
                             *pos,
                             &mapper,
                             &target,
+                            &plan.features,
                             plan.pruning.blocks,
                             plan.compression_level,
                         )
@@ -313,11 +314,14 @@ fn convert_position(
     pos: ChunkPos,
     mapper: &BlockMapper,
     target: &JavaTarget,
+    features: &crate::convert::Features,
     policy: crate::convert::UnknownDataPolicy,
     compression_level: u32,
 ) -> Result<(Option<ConvertedChunk>, ReportBuilder)> {
     let mut report = ReportBuilder::new("", "", "", "");
-    let Some((nbt, entities)) = read_chunk(world, pos, mapper, target, policy, &mut report)? else {
+    let Some((nbt, entities)) =
+        read_chunk(world, pos, mapper, target, features, policy, &mut report)?
+    else {
         return Ok((None, report));
     };
     // Encode into the worker's buffer, compress immediately, then hand the
@@ -362,10 +366,19 @@ fn read_chunk(
     pos: ChunkPos,
     mapper: &BlockMapper,
     target: &JavaTarget,
+    features: &crate::convert::Features,
     policy: crate::convert::UnknownDataPolicy,
     report: &mut ReportBuilder,
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
-    let (chunk, biome_data) = world.chunk_snapshot(pos)?;
+    // Only fetch the records this conversion was asked to convert: a skipped
+    // category should not cost a point lookup and its ordering work.
+    let selection = bedrock_world::ChunkSnapshotSelection {
+        entities: features.entities,
+        block_entities: features.block_entities,
+        pending_ticks: features.ticks,
+        hardcoded_spawn_areas: features.chunk_metadata,
+    };
+    let (chunk, biome_data) = world.chunk_snapshot_selected(pos, selection)?;
     let biomes = biome_data.map(|data| data.storages);
     let mut sections: Vec<NbtTag> = Vec::new();
     let mut height_map_blocking = [0_i16; 256];
@@ -608,11 +621,15 @@ fn read_chunk(
     // Entities from modern actor storage (digp + actorprefix). They are written
     // to the separate `entities/` region file by the caller, matching 1.17+.
     let mut java_entities: Vec<NbtTag> = Vec::new();
-    for record in world.actors(pos)? {
-        if let Some(entity) =
-            crate::entity::bedrock_to_java(&record.entity.nbt, report, target.data_version)
-        {
-            java_entities.push(entity);
+    // Actor records live under their own keys, outside the chunk record batch,
+    // so skipping entities has to be checked here too.
+    if features.entities {
+        for record in world.actors(pos)? {
+            if let Some(entity) =
+                crate::entity::bedrock_to_java(&record.entity.nbt, report, target.data_version)
+            {
+                java_entities.push(entity);
+            }
         }
     }
 

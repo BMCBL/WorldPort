@@ -201,6 +201,27 @@ struct ConvertArgs {
     /// Stop after this many chunks (testing aid).
     #[arg(long)]
     limit_chunks: Option<usize>,
+    /// Skip entities (and their NBT).
+    #[arg(long)]
+    no_entities: bool,
+    /// Skip block entities (chests, signs, ...).
+    #[arg(long)]
+    no_block_entities: bool,
+    /// Skip players.
+    #[arg(long)]
+    no_players: bool,
+    /// Skip map items.
+    #[arg(long)]
+    no_maps: bool,
+    /// Skip pending block/fluid ticks.
+    #[arg(long)]
+    no_ticks: bool,
+    /// Skip village interests (beds, workstations, meeting points).
+    #[arg(long)]
+    no_village_interests: bool,
+    /// Skip per-chunk metadata such as hardcoded spawn areas.
+    #[arg(long)]
+    no_chunk_metadata: bool,
 }
 
 fn parse_edition(value: &str) -> Result<Edition, String> {
@@ -826,6 +847,15 @@ fn convert(args: ConvertArgs) -> Result<()> {
     plan.target_version = args.target_version;
     plan.jobs = args.jobs;
     plan.compression_level = args.compression;
+    // Feature switches are applied before any reading, so a skipped category
+    // costs neither conversion work nor its LevelDB lookup.
+    plan.features.entities &= !args.no_entities;
+    plan.features.block_entities &= !args.no_block_entities;
+    plan.features.players &= !args.no_players;
+    plan.features.maps &= !args.no_maps;
+    plan.features.ticks &= !args.no_ticks;
+    plan.features.village_interests &= !args.no_village_interests;
+    plan.features.chunk_metadata &= !args.no_chunk_metadata;
     plan.overwrite = args.overwrite;
     plan.chunk_limit = args.limit_chunks;
     let options = ConversionOptions::default();
