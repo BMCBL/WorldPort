@@ -1,224 +1,224 @@
 {
   "1.20.6 BE->JE": {
-    "declared_loss": 29,
+    "declared_loss": 128,
     "exact": 12798,
-    "silent_loss": 99,
+    "silent_loss": 0,
     "states": 16101,
     "unmapped": 2179,
     "unstable": 0
   },
   "1.20.6 JE->BE": {
-    "declared_loss": 1124,
+    "declared_loss": 1133,
     "exact": 23514,
-    "silent_loss": 9,
+    "silent_loss": 0,
     "states": 26684,
     "unmapped": 0,
     "unstable": 0
   },
   "1.21.4 BE->JE": {
-    "declared_loss": 41,
+    "declared_loss": 142,
     "exact": 13731,
-    "silent_loss": 101,
+    "silent_loss": 0,
     "states": 16101,
     "unmapped": 1748,
     "unstable": 0
   },
   "1.21.4 JE->BE": {
-    "declared_loss": 1147,
+    "declared_loss": 1156,
     "exact": 24672,
-    "silent_loss": 9,
+    "silent_loss": 0,
     "states": 27866,
     "unmapped": 0,
     "unstable": 0
   },
   "1.21.8 BE->JE": {
-    "declared_loss": 29,
+    "declared_loss": 142,
     "exact": 13817,
-    "silent_loss": 113,
+    "silent_loss": 0,
     "states": 16101,
     "unmapped": 1663,
     "unstable": 0
   },
   "1.21.8 JE->BE": {
-    "declared_loss": 1147,
+    "declared_loss": 1157,
     "exact": 24745,
-    "silent_loss": 10,
+    "silent_loss": 0,
     "states": 27946,
     "unmapped": 0,
     "unstable": 0
   },
   "26.1 BE->JE": {
-    "declared_loss": 29,
+    "declared_loss": 142,
     "exact": 14405,
-    "silent_loss": 113,
+    "silent_loss": 0,
     "states": 16101,
     "unmapped": 1075,
     "unstable": 0
   },
   "26.1 JE->BE": {
-    "declared_loss": 1152,
+    "declared_loss": 1162,
     "exact": 26467,
-    "silent_loss": 10,
+    "silent_loss": 0,
     "states": 29873,
     "unmapped": 0,
     "unstable": 0
   },
   "26.2 BE->JE": {
-    "declared_loss": 29,
+    "declared_loss": 142,
     "exact": 15472,
-    "silent_loss": 113,
+    "silent_loss": 0,
     "states": 16101,
     "unmapped": 68,
     "unstable": 0
   },
   "26.2 JE->BE": {
-    "declared_loss": 1152,
+    "declared_loss": 1162,
     "exact": 28960,
-    "silent_loss": 10,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 0,
     "unstable": 0
   },
   "be 1.12.0.28 BE->JE": {
-    "declared_loss": 73,
+    "declared_loss": 124,
     "exact": 2083,
-    "silent_loss": 51,
+    "silent_loss": 0,
     "states": 3192,
     "unmapped": 431,
     "unstable": 281
   },
   "be 1.14.20.1 BE->JE": {
-    "declared_loss": 86,
+    "declared_loss": 149,
     "exact": 1972,
-    "silent_loss": 63,
+    "silent_loss": 0,
     "states": 3129,
     "unmapped": 434,
     "unstable": 290
   },
   "be 1.16.101.01 BE->JE": {
-    "declared_loss": 250,
+    "declared_loss": 313,
     "exact": 5285,
-    "silent_loss": 63,
+    "silent_loss": 0,
     "states": 6611,
     "unmapped": 435,
     "unstable": 290
   },
   "be 1.17.41.01 BE->JE": {
-    "declared_loss": 263,
+    "declared_loss": 331,
     "exact": 6462,
-    "silent_loss": 68,
+    "silent_loss": 0,
     "states": 7948,
     "unmapped": 543,
     "unstable": 290
   },
   "be 1.18.31.04 BE->JE": {
-    "declared_loss": 243,
+    "declared_loss": 311,
     "exact": 6700,
-    "silent_loss": 68,
+    "silent_loss": 0,
     "states": 8228,
     "unmapped": 596,
     "unstable": 275
   },
   "be 1.19.83.01 BE->JE": {
-    "declared_loss": 247,
+    "declared_loss": 315,
     "exact": 11682,
-    "silent_loss": 68,
+    "silent_loss": 0,
     "states": 13136,
     "unmapped": 564,
     "unstable": 236
   },
   "be 1.20.80.05 BE->JE": {
-    "declared_loss": 229,
+    "declared_loss": 361,
     "exact": 12922,
-    "silent_loss": 132,
+    "silent_loss": 0,
     "states": 14140,
     "unmapped": 480,
     "unstable": 47
   },
   "be 1.21.60.0 BE->JE": {
-    "declared_loss": 206,
+    "declared_loss": 394,
     "exact": 14107,
-    "silent_loss": 188,
+    "silent_loss": 0,
     "states": 15168,
     "unmapped": 332,
     "unstable": 1
   },
   "be 1.26.60.0 BE->JE": {
-    "declared_loss": 461,
+    "declared_loss": 649,
     "exact": 20471,
-    "silent_loss": 188,
+    "silent_loss": 0,
     "states": 23960,
     "unmapped": 620,
     "unstable": 1
   },
   "to be 1.12.0.28 JE->BE": {
-    "declared_loss": 868,
+    "declared_loss": 884,
     "exact": 7012,
-    "silent_loss": 16,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 15751,
     "unstable": 0
   },
   "to be 1.14.20.1 JE->BE": {
-    "declared_loss": 868,
+    "declared_loss": 898,
     "exact": 7060,
-    "silent_loss": 30,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 15699,
     "unstable": 0
   },
   "to be 1.16.101.01 JE->BE": {
-    "declared_loss": 926,
+    "declared_loss": 940,
     "exact": 9135,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 14478,
     "unstable": 0
   },
   "to be 1.17.41.01 JE->BE": {
-    "declared_loss": 936,
+    "declared_loss": 950,
     "exact": 12356,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 12514,
     "unstable": 0
   },
   "to be 1.18.31.04 JE->BE": {
-    "declared_loss": 960,
+    "declared_loss": 974,
     "exact": 12976,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 12105,
     "unstable": 0
   },
   "to be 1.19.83.01 JE->BE": {
-    "declared_loss": 1084,
+    "declared_loss": 1098,
     "exact": 15736,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 11035,
     "unstable": 0
   },
   "to be 1.20.80.05 JE->BE": {
-    "declared_loss": 1078,
+    "declared_loss": 1092,
     "exact": 18660,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 8897,
     "unstable": 0
   },
   "to be 1.21.60.0 JE->BE": {
-    "declared_loss": 1148,
+    "declared_loss": 1162,
     "exact": 24673,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 3807,
     "unstable": 0
   },
   "to be 1.26.60.0 JE->BE": {
-    "declared_loss": 1152,
+    "declared_loss": 1166,
     "exact": 28963,
-    "silent_loss": 14,
+    "silent_loss": 0,
     "states": 32366,
     "unmapped": 10,
     "unstable": 0

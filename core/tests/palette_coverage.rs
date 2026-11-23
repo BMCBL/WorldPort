@@ -183,6 +183,27 @@ fn coverage_never_regresses_against_the_baseline() {
 }
 
 #[test]
+fn no_state_is_lost_without_saying_so() {
+    // The strongest statement this gate can make: a state may fail to survive a
+    // conversion, but never silently. Every family that loses information is in
+    // the mapper's approximate list, so a new silent loss is a new bug rather
+    // than a tolerance that drifted.
+    let mut offenders = Vec::new();
+    for (key, row) in coverage() {
+        if row.silent_loss != 0 {
+            offenders.push(format!("{key}: {} silent losses", row.silent_loss));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "states were lost without a declared reason:
+{}",
+        offenders.join("
+")
+    );
+}
+
+#[test]
 fn every_state_lands_in_exactly_one_bucket() {
     // A classification that silently drops a state would make the whole report
     // lie about its own totals.

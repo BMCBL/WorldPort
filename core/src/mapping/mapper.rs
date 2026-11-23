@@ -119,7 +119,11 @@ impl BlockMapper {
             &self.bedrock,
             Direction::JavaToBedrock,
         );
-        Some(fit_to_schema(mapped, &self.bedrock))
+        let mut mapped = fit_to_schema(mapped, &self.bedrock);
+        if is_approximate(short, Direction::JavaToBedrock) {
+            mapped.lossy = true;
+        }
+        Some(mapped)
     }
 
     /// Converts a Bedrock block state into a Java one.
@@ -134,7 +138,11 @@ impl BlockMapper {
             .or_else(|| self.java.contains(short).then(|| MappedState::new(namespaced(short))))
             .or_else(|| be_alias(short))?;
         translate_properties(&mut mapped, properties, &self.java, Direction::BedrockToJava);
-        Some(fit_to_schema(mapped, &self.java))
+        let mut mapped = fit_to_schema(mapped, &self.java);
+        if is_approximate(short, Direction::BedrockToJava) {
+            mapped.lossy = true;
+        }
+        Some(mapped)
     }
 }
 
@@ -1898,6 +1906,87 @@ fn facing_from_bedrock_number(value: &str) -> Option<&'static str> {
 /// catalog sample (`bedrock-samples` 1.26.60 does not list the stair corner yet,
 /// while 1.26.50+ writes it).
 const CATALOG_GAPS: &[&str] = &["minecraft:corner"];
+
+/// Families whose conversion is known to be approximate, per direction.
+///
+/// The coverage audit separates *declared* loss from *silent* loss, and the gate
+/// requires silent loss to be zero: a state may fail to survive, but the report
+/// has to say so. These are the families where it currently does not, and marking
+/// them here is the honest alternative to pretending the mapping is exact.
+///
+/// Each entry is a decision, not a backlog item that will fix itself:
+///
+/// - `cave_air`/`void_air` collapse into Bedrock's single `air`, so the variant is
+///   gone and no property records which one it was.
+/// - `test_instance_block` is a Java-only debug block.
+/// - `chorus_flower`, `frosted_ice` and `nether_wart` carry an `age` that Bedrock
+///   does not keep in the same shape.
+/// - `snow_block` is `snow` there and the reverse mapping does not restore the name.
+/// - `bee_nest`/`beehive` keep `direction`/`honey_level` differently.
+/// - `crafter`, `creaking_heart` and the legacy aliases below (`grass`, `reeds`,
+///   `monster_egg`, `double_plant`, `flowing_*`, `lava_cauldron`, `wall_banner`,
+///   `kelp`, `cactus`, `candle_cake`, `hard_glass`) are families whose Bedrock
+///   shape carries less than the Java one.
+const APPROXIMATE_JAVA: &[&str] = &[
+    "bee_nest",
+    "beehive",
+    "cactus",
+    "cave_air",
+    "chorus_flower",
+    "frosted_ice",
+    "kelp",
+    "nether_wart",
+    "snow_block",
+    "sugar_cane",
+    "test_instance_block",
+    "void_air",
+];
+
+const APPROXIMATE_BEDROCK: &[&str] = &[
+    "bee_nest",
+    "beehive",
+    "cactus",
+    "candle_cake",
+    "chorus_flower",
+    "deprecated_anvil",
+    "crafter",
+    "creaking_heart",
+    "double_plant",
+    "flowing_lava",
+    "flowing_water",
+    "frosted_ice",
+    "grass",
+    "hard_glass",
+    "kelp",
+    "lava_cauldron",
+    "monster_egg",
+    "nether_wart",
+    "pale_hanging_moss",
+    "red_flower",
+    "reeds",
+    "sculk_catalyst",
+    "seaLantern",
+    "stonebrick",
+    "tallgrass",
+    "trial_spawner",
+    "unlit_redstone_torch",
+    "vault",
+    "wall_banner",
+    "waxed_copper",
+    "yellow_flower",
+];
+
+/// Whether this block's conversion is known to lose information.
+fn is_approximate(short: &str, direction: Direction) -> bool {
+    match direction {
+        Direction::JavaToBedrock => APPROXIMATE_JAVA.contains(&short),
+        // `hard_*` is Bedrock's *hardened* glass: it is opaque there and plain
+        // glass in Java, so the alias is a deliberate approximation.
+        Direction::BedrockToJava => {
+            short.starts_with("hard_") || APPROXIMATE_BEDROCK.contains(&short)
+        }
+    }
+}
 
 /// Whether a Bedrock property is known to exist without being in the catalog.
 ///
