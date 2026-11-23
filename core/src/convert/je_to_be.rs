@@ -1177,9 +1177,7 @@ fn convert_section(
         let Some(interest) = interest_kinds.get_mut(index).and_then(Option::take) else {
             continue;
         };
-        for _ in 0..*usage {
-            interests.record(interest);
-        }
+        interests.record_many(interest, u64::from(*usage));
     }
 
     if out_of_range > 0 {

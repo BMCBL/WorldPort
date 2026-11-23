@@ -480,6 +480,31 @@ fn read_chunk(
             }
         }
 
+        // Common sparse-world case: an all-air palette with no fluid layer
+        // has no meaningful 4096-cell work. The decoder already validated the
+        // uniform palette's indices, so emit only the compact air + biome NBT.
+        let uniform_air = |storage: Option<(&Vec<bedrock_world::BlockState>, &Vec<u16>)>| {
+            storage.is_none_or(|(states, _)| {
+                states.len() == 1 && states[0].name == "minecraft:air"
+            })
+        };
+        if uniform_air(primary) && uniform_air(liquid) {
+            let mut section = IndexMap::new();
+            section.insert("Y".to_string(), NbtTag::Byte(section_y));
+            section.insert(
+                "block_states".to_string(),
+                block_states_nbt(
+                    vec![compound([("Name", tag_string("minecraft:air"))])],
+                    &[],
+                ),
+            );
+            if let Some(biome) = section_biomes(biomes.as_deref(), section_y) {
+                section.insert("biomes".to_string(), biome);
+            }
+            sections.push(NbtTag::Compound(section));
+            continue;
+        }
+
         let mut palette: Vec<NbtTag> = vec![compound([("Name", tag_string("minecraft:air"))])];
         let mut indices = vec![0_u16; 4096];
         let mut section_has_blocks = false;

@@ -95,9 +95,22 @@ pub struct InterestInventory {
 impl InterestInventory {
     /// Records one interest block.
     pub fn record(&mut self, interest: BlockInterest) {
-        *self.by_name.entry(interest.bedrock_name()).or_default() += 1;
-        *self.by_kind.entry(interest.kind()).or_default() += 1;
-        self.total += 1;
+        self.record_many(interest, 1);
+    }
+
+    /// Accounts for an entire palette entry's usage in constant time.
+    ///
+    /// Avoids repeating two BTreeMap lookups for each of the 4096 block
+    /// positions when a section has many village-interest blocks.
+    pub fn record_many(&mut self, interest: BlockInterest, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let by_name = self.by_name.entry(interest.bedrock_name()).or_default();
+        *by_name = by_name.saturating_add(count);
+        let by_kind = self.by_kind.entry(interest.kind()).or_default();
+        *by_kind = by_kind.saturating_add(count);
+        self.total = self.total.saturating_add(count);
     }
 
     /// True when the terrain holds no interest block.
@@ -202,6 +215,19 @@ mod tests {
         ] {
             assert_eq!(classify(block), None, "{block}");
         }
+    }
+
+    #[test]
+    fn palette_bulk_accounting_matches_single_block_accounting() {
+        let mut per_block = InterestInventory::default();
+        let mut per_palette = InterestInventory::default();
+        let interest = BlockInterest::Workstation("farmer");
+        for _ in 0..4096 {
+            per_block.record(interest);
+        }
+        per_palette.record_many(interest, 4096);
+        per_palette.record_many(interest, 0);
+        assert_eq!(per_block, per_palette);
     }
 
     #[test]
