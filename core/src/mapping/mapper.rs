@@ -107,12 +107,44 @@ impl BlockMapper {
         // that actually differ. Trying the alias first renamed blocks that had
         // already converged, such as 26.2's `iron_chain`, into a name the target
         // version cannot express - and lost every property with it.
-        let mut mapped = je_special(short, properties)
-            .or_else(|| {
-                (self.bedrock.contains(short) || KNOWN_UNLISTED.contains(&short))
-                    .then(|| MappedState::new(namespaced(short)))
-            })
-            .or_else(|| je_alias(short))?;
+        //
+        // The shared name has to *express* the source state, though. Bedrock keeps
+        // retired names as property-less stubs - `stonecutter` is one, with
+        // `stonecutter_block` beside it - and preferring the stub dropped every
+        // property, which the roundtrip then reported as a rename. A same-name
+        // candidate that cannot hold the properties in hand is skipped.
+        // A retired Bedrock stub can shadow the block that replaced it: the old
+        // `stonecutter` exists with no properties beside `stonecutter_block`, and
+        // taking the stub drops the state. Only a stub that declares nothing while
+        // the source carries properties is skipped - anything else is a real
+        // block whose property names simply differ, which the translator handles.
+        // Prefer an alias over a same-name Bedrock block *only* when the
+        // same-name one is a property-less stub and the alias carries properties.
+        // Bedrock keeps retired names beside their replacement (`stonecutter`
+        // beside `stonecutter_block`), but plenty of real blocks have no
+        // properties at all (`barrier`, coral), so "no properties" alone cannot
+        // mean "stub".
+        let same_name = (self.bedrock.contains(short) || KNOWN_UNLISTED.contains(&short))
+            .then(|| MappedState::new(namespaced(short)));
+        let alias = je_alias(short);
+        let same_name_is_stub = same_name.as_ref().is_some_and(|candidate| {
+            self.bedrock
+                .block(&candidate.name)
+                .is_some_and(|schema| schema.properties().is_empty())
+                && !properties.is_empty()
+                && alias.as_ref().is_some_and(|alternative| {
+                    self.bedrock
+                        .block(&alternative.name)
+                        .is_some_and(|schema| !schema.properties().is_empty())
+                })
+        });
+        let mut mapped = je_special(short, properties).or_else(|| {
+            if same_name_is_stub {
+                alias
+            } else {
+                same_name.or(alias)
+            }
+        })?;
         translate_properties(
             &mut mapped,
             properties,
@@ -207,6 +239,24 @@ const KNOWN_UNLISTED: &[&str] = &[
     "waxed_chiseled_copper",
 ];
 
+/// Builds a mapper for converting a world of `source` version into `target`.
+///
+/// Versions are not interchangeable: a block that exists in one release may be
+/// absent in the other, and an alias that is right for one pair can be wrong for
+/// the next. The catalogs carry that knowledge, so the mapper is built from the
+/// pair rather than from a single "current" schema, and every conversion picks its
+/// pair from the versions actually involved.
+///
+/// `None` for either side means "no catalog for that release", which is reported
+/// rather than silently approximated with a neighbouring version.
+#[must_use]
+pub fn for_versions(
+    java: Option<&BlockCatalog>,
+    bedrock: Option<&BlockCatalog>,
+) -> Option<BlockMapper> {
+    Some(BlockMapper::new(java?.clone(), bedrock?.clone()))
+}
+
 /// Java-to-Bedrock identifier aliases for names that differ per edition.
 const JE_ALIASES: &[(&str, &str)] = &[
     ("bricks", "brick_block"),
@@ -215,6 +265,20 @@ const JE_ALIASES: &[(&str, &str)] = &[
     ("end_stone_bricks", "end_bricks"),
     ("end_stone_brick_stairs", "end_brick_stairs"),
     ("cobblestone_stairs", "normal_stone_stairs"),
+    // Bedrock calls the plain stone slab "normal_stone"; the stairs already had
+    // this alias, the slab did not, so every stone slab became air.
+    ("stone_slab", "normal_stone_slab"),
+    // Bedrock splits these where Java keeps one block with a property, or names
+    // them after the block entity that owns them.
+    ("cave_vines", "cave_vines_head_with_berries"),
+    ("cave_vines_plant", "cave_vines_body_with_berries"),
+    // Bedrock renamed the block; the two names describe the same thing, so the
+    // roundtrip is a rename rather than a loss and both sides declare it.
+    ("stonecutter", "stonecutter_block"),
+    // Lit furnaces are separate Bedrock blocks, not a `lit` property.
+    ("blast_furnace", "lit_blast_furnace"),
+    ("smoker", "lit_smoker"),
+    ("furnace", "lit_furnace"),
     ("prismarine_brick_stairs", "prismarine_bricks_stairs"),
     ("cobweb", "web"),
     ("magma_block", "magma"),
@@ -339,6 +403,26 @@ fn be_alias(short: &str) -> Option<MappedState> {
         "end_bricks" => return Some(MappedState::new("minecraft:end_stone_bricks")),
         "end_brick_stairs" => return Some(MappedState::new("minecraft:end_stone_brick_stairs")),
         "normal_stone_stairs" => return Some(MappedState::new("minecraft:cobblestone_stairs")),
+        "normal_stone_slab" => return Some(MappedState::new("minecraft:stone_slab")),
+        "cave_vines_head_with_berries" => {
+            return Some(MappedState::new("minecraft:cave_vines").lossy());
+        }
+        "cave_vines_body_with_berries" => {
+            return Some(MappedState::new("minecraft:cave_vines_plant").lossy());
+        }
+        "stonecutter_block" => {
+            // Java called it `stonecutter` from 1.14; the reverse rule cannot hold
+            // for a release whose catalog predates the block.
+            return Some(MappedState::new("minecraft:stonecutter").lossy());
+        }
+        "lit_furnace" => return Some(MappedState::new("minecraft:furnace").lossy()),
+        "lit_blast_furnace" => {
+            return Some(MappedState::new("minecraft:blast_furnace").lossy());
+        }
+        "lit_smoker" => return Some(MappedState::new("minecraft:smoker").lossy()),
+        "sticky_piston_arm_collision" => {
+            return Some(MappedState::new("minecraft:piston_head").lossy());
+        }
         "prismarine_bricks_stairs" => {
             return Some(MappedState::new("minecraft:prismarine_brick_stairs"));
         }
@@ -1949,12 +2033,18 @@ const APPROXIMATE_JAVA: &[&str] = &[
     "kelp",
     "nether_wart",
     "snow_block",
+    "stonecutter",
     "sugar_cane",
     "test_instance_block",
     "void_air",
 ];
 
 const APPROXIMATE_BEDROCK: &[&str] = &[
+    // Bedrock splits lit furnaces into their own blocks; a Java release before
+    // 1.14 has no `lit` property, so the state cannot come back.
+    "lit_blast_furnace",
+    "lit_furnace",
+    "lit_smoker",
     "bee_nest",
     "beehive",
     "cactus",

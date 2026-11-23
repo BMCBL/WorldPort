@@ -157,6 +157,10 @@ pub fn convert(
         format!("bedrock {source_version}"),
         format!("java {} ({})", target.catalog.version(), target.data_version),
     );
+    // Both sides of the mapping come from the versions actually involved: the
+    // world's build for reading, the requested target for writing. A pair that
+    // falls back to a neighbouring catalog is reported, because an alias that is
+    // correct for one release pair can be wrong for another.
     if bedrock.is_none() {
         report.warn(
             WarningCode::Lossy,
