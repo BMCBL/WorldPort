@@ -78,6 +78,11 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
             ),
         );
     }
+    // Mapping uses the embedded `bedrock-world` snapshot. Switching to the baked
+    // per-version catalog was tried and reverted: it covers more blocks (wool and
+    // concrete slabs among them) but names a few differently, which introduced ten
+    // unmapped and one unstable state for older Java releases. That trade needs its
+    // own pass; `TARGET_BEDROCK_VERSION` records what the writer emits either way.
     let mapper = BlockMapper::new(java_catalog.to_catalog(), bedrock_catalog());
     if let Some(requested) = plan.target_version.as_deref()
         && !requested.contains("1.26.60")

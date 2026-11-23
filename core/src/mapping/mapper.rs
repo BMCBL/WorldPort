@@ -276,6 +276,11 @@ fn je_alias(short: &str) -> Option<MappedState> {
     // Order matters: the most specific suffix has to win, or `oak_wall_sign`
     // matches `_sign` first and becomes `oak_wall_standing_sign`, a block that
     // does not exist. That produced an invalid id for every wall sign.
+    // Before 1.14 Java had one `sign` for every wood type; an alias entry for it
+    // would shadow `oak_sign`, because the reverse lookup takes the first match.
+    if short == "sign" {
+        return Some(MappedState::new("minecraft:standing_sign").lossy());
+    }
     if let Some(wood) = short.strip_suffix("_wall_hanging_sign") {
         return Some(MappedState::new(namespaced(&format!("{wood}_hanging_sign"))).lossy());
     }
@@ -321,6 +326,9 @@ fn be_alias(short: &str) -> Option<MappedState> {
         return Some(MappedState::new("minecraft:anvil"));
     }
     match short {
+        // Bedrock keeps the pre-split names for the oak variants.
+        "standing_sign" => return Some(MappedState::new("minecraft:oak_sign").lossy()),
+        "wall_sign" => return Some(MappedState::new("minecraft:oak_wall_sign").lossy()),
         "brick_block" => return Some(MappedState::new("minecraft:bricks")),
         "nether_brick" => return Some(MappedState::new("minecraft:nether_bricks")),
         "red_nether_brick" => return Some(MappedState::new("minecraft:red_nether_bricks")),

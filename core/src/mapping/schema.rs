@@ -401,6 +401,12 @@ fn compare_version(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
+/// Bedrock release this converter writes.
+///
+/// Kept in step with `be::write::target_block_state_version`: the catalog chosen
+/// for mapping has to describe the states the writer emits.
+pub const TARGET_BEDROCK_VERSION: &str = "1.26.60.0";
+
 /// Bedrock block-state storage version reported by the embedded catalog.
 #[must_use]
 pub fn bedrock_format_version() -> u32 {

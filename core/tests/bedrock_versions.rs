@@ -11,9 +11,9 @@ use worldport_core::mapping::schema::{
 #[test]
 fn every_configured_version_loads() {
     let versions = bedrock_catalog_versions();
-    assert!(versions.len() >= 9, "expected the bundled set: {versions:?}");
+    assert_eq!(versions.len(), 59, "every Chunker registry is bundled: {versions:?}");
     assert_eq!(versions.first().copied(), Some("1.12.0.28"));
-    assert_eq!(versions.last().copied(), Some("1.26.60.0"));
+    assert_eq!(versions.last().copied(), Some("1.26.70.0"));
     for version in &versions {
         let catalog = bedrock_catalog_for(version).unwrap_or_else(|| panic!("{version}"));
         assert!(!catalog.is_empty(), "{version}: empty catalog");

@@ -22,20 +22,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Versions worth carrying: every Bedrock storage-format change plus the releases
-# players actually still open. Chunker has 59; bundling all of them multiplies the
-# binary for the long tail of builds nobody reads.
-BUNDLED: tuple[str, ...] = (
-    "1.12.0.28",
-    "1.14.20.1",
-    "1.16.101.01",
-    "1.17.41.01",
-    "1.18.31.04",
-    "1.19.83.01",
-    "1.20.80.05",
-    "1.21.60.0",
-    "1.26.60.0",
-)
+# Every version Chunker extracted. A world reports the build that saved it, and the
+# closest catalog at or below that build is what makes an old save readable, so the
+# long tail is the point rather than a cost to trim.
+BUNDLED: tuple[str, ...] = ()
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -79,8 +69,9 @@ def main() -> int:
         print(f"missing {source}", file=sys.stderr)
         return 2
 
+    versions = BUNDLED or tuple(sorted(p.name for p in source.iterdir() if p.is_dir()))
     manifest: dict[str, str] = {}
-    for version in BUNDLED:
+    for version in versions:
         registry = source / version / "block_states.json"
         if not registry.is_file():
             print(f"skip {version}: no registry", file=sys.stderr)

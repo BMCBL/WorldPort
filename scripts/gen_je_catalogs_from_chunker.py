@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "mappings" / "data" / "java"
 CHUNKER = ROOT / "_refs" / "chunker" / "cli" / "data" / "java"
 
+# Chunker did not record metadata for the first three registries it extracted.
+# These are the DataVersions those releases shipped with.
+KNOWN_DATA_VERSIONS = {"1.13": 1519, "1.13.1": 1628, "1.13.2": 1631}
+
 
 def compact(blocks: dict) -> dict:
     """Chunker: name -> {properties, states}  ->  minecraft:name -> {properties}."""
@@ -44,8 +48,13 @@ def main(versions: list[str]) -> int:
             print(f"skip {version}: no {blocks_file}", file=sys.stderr)
             continue
         blocks = json.loads(blocks_file.read_text(encoding="utf-8"))
-        metadata = json.loads((source / "version.json").read_text(encoding="utf-8"))
-        data_version = metadata.get("world_version")
+        metadata_path = source / "version.json"
+        metadata = (
+            json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata_path.is_file()
+            else {}
+        )
+        data_version = metadata.get("world_version") or KNOWN_DATA_VERSIONS.get(version)
         if not isinstance(data_version, int):
             print(f"skip {version}: no world_version", file=sys.stderr)
             continue
