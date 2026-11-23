@@ -150,5 +150,77 @@
     "states": 23960,
     "unmapped": 620,
     "unstable": 1
+  },
+  "to be 1.12.0.28 JE->BE": {
+    "declared_loss": 868,
+    "exact": 7012,
+    "silent_loss": 16,
+    "states": 32366,
+    "unmapped": 15751,
+    "unstable": 0
+  },
+  "to be 1.14.20.1 JE->BE": {
+    "declared_loss": 868,
+    "exact": 7060,
+    "silent_loss": 30,
+    "states": 32366,
+    "unmapped": 15699,
+    "unstable": 0
+  },
+  "to be 1.16.101.01 JE->BE": {
+    "declared_loss": 926,
+    "exact": 9135,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 14478,
+    "unstable": 0
+  },
+  "to be 1.17.41.01 JE->BE": {
+    "declared_loss": 936,
+    "exact": 12356,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 12514,
+    "unstable": 0
+  },
+  "to be 1.18.31.04 JE->BE": {
+    "declared_loss": 960,
+    "exact": 12976,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 12105,
+    "unstable": 0
+  },
+  "to be 1.19.83.01 JE->BE": {
+    "declared_loss": 1084,
+    "exact": 15736,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 11035,
+    "unstable": 0
+  },
+  "to be 1.20.80.05 JE->BE": {
+    "declared_loss": 1078,
+    "exact": 18660,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 8897,
+    "unstable": 0
+  },
+  "to be 1.21.60.0 JE->BE": {
+    "declared_loss": 1148,
+    "exact": 24673,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 3807,
+    "unstable": 0
+  },
+  "to be 1.26.60.0 JE->BE": {
+    "declared_loss": 1152,
+    "exact": 28963,
+    "silent_loss": 14,
+    "states": 32366,
+    "unmapped": 10,
+    "unstable": 0
   }
 }

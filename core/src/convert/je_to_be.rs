@@ -82,11 +82,32 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     if let Some(requested) = plan.target_version.as_deref()
         && !requested.contains("1.26.60")
     {
+        // Name the cost instead of saying "unsupported": how many block states this
+        // Java world can express that the requested release cannot hold. Measured
+        // from the catalogs, so it is the same number the coverage gate records.
+        // The mapper has to be rebuilt against the *requested* release: measuring
+        // with the current one reports zero, because every block we write has an id
+        // in the version we write.
+        let loss = crate::mapping::schema::bedrock_catalog_at_or_below(requested).map(|target| {
+            let probe = BlockMapper::new(java_catalog.to_catalog(), target.clone());
+            let audit = crate::mapping::audit::audit(&probe, java_catalog.catalog(), &target, true);
+            (
+                audit.count(&crate::mapping::audit::Outcome::Unmapped),
+                audit.states,
+            )
+        });
+        let detail = match loss {
+            Some((0, states)) => format!("the release holds all {states} Java block states"),
+            Some((count, states)) => format!(
+                "{count} of {states} Java block states have no id there and would be dropped"
+            ),
+            None => "no bundled catalog covers that release".to_string(),
+        };
         report.warn(
             WarningCode::Lossy,
             "bedrock-target",
             format!(
-                "Bedrock target {requested} is not supported yet; writing 1.26.60 block states"
+                "Bedrock target {requested} is not written yet (output stays 1.26.60): {detail}"
             ),
         );
     }

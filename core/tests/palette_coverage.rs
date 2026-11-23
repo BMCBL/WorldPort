@@ -85,6 +85,13 @@ fn coverage() -> BTreeMap<String, Recorded> {
             format!("be {version} BE->JE"),
             record(&audit(&mapper, &catalog, &java, false)),
         );
+        // Writing into that release: what a Java world would lose. Recorded so the
+        // cost of a downgrade cannot grow unnoticed; it is never zero, because
+        // older releases genuinely lack blocks.
+        rows.insert(
+            format!("to be {version} JE->BE"),
+            record(&audit(&mapper, &java, &catalog, true)),
+        );
     }
     rows
 }
@@ -94,7 +101,9 @@ fn no_java_state_is_unmapped_or_unstable() {
     // Every block a Java world can hold has to reach Bedrock: a gap here is a
     // silently dropped block, which is the failure mode players notice first.
     for (key, row) in coverage() {
-        if !key.ends_with("JE->BE") {
+        // A downgrade row targets an older release on purpose, so unmapped states
+        // are the point of measuring it; only the current target must be complete.
+        if !key.ends_with("JE->BE") || key.starts_with("to be ") {
             continue;
         }
         assert_eq!(row.unmapped, 0, "{key}: {row:?}");

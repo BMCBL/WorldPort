@@ -49,6 +49,21 @@ fn main() {
         });
     }
 
+    // Downgrade: writing a Java world into an older Bedrock release. Measured by
+    // mapping the Java catalog against each older Bedrock catalog, which is what
+    // the writer would have to satisfy.
+    for version in worldport_core::mapping::schema::bedrock_catalog_versions() {
+        let catalog = worldport_core::mapping::schema::bedrock_catalog_for(version)
+            .expect("bundled bedrock catalog");
+        let java = JavaCatalog::bundled("26.2").expect("newest bundled Java catalog").to_catalog();
+        let mapper = BlockMapper::new(java.clone(), catalog.clone());
+        rows.push(Row {
+            version: format!("to be {version}"),
+            direction: "JE->BE",
+            coverage: audit(&mapper, &java, &catalog, true),
+        });
+    }
+
     if json {
         let mut out: BTreeMap<String, BTreeMap<&str, u64>> = BTreeMap::new();
         for row in &rows {
