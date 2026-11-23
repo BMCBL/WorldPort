@@ -891,8 +891,8 @@ fn convert_section(
     // `slot_primary[i][v]` is `0` for "no block" and `palette index + 1`
     // otherwise; `slot_liquid[i]` is the liquid palette slot (`0` = none,
     // `1` = water, `2` = lava) that the entry's blocks contribute.
-    let mut slot_primary: Vec<[u32; 2]> = vec![[0; 2]; entries.len()];
-    let mut slot_liquid: Vec<[u16; 2]> = vec![[0; 2]; entries.len()];
+    let mut slot_primary: Vec<u32> = vec![0; entries.len()];
+    let mut slot_liquid: Vec<u16> = vec![0; entries.len()];
     let mut needs_lava = false;
     for (index, (name, properties)) in entries.iter().enumerate() {
         if !crate::mapping::is_vanilla(name) {
@@ -912,42 +912,37 @@ fn convert_section(
             // Fluid entries only fill the liquid layer; they never enter the
             // primary palette.
             let fluid: u16 = if short == "water" { 1 } else { 2 };
-            slot_liquid[index] = [fluid, fluid];
+            slot_liquid[index] = fluid;
             needs_lava |= fluid == 2;
             continue;
         }
-        let declared_waterlogged = properties
+        // A palette entry's waterlogged state is fixed by the entry itself, not
+        // by the block's position, so exactly one variant is ever referenced.
+        // Resolving both doubled the mapping work, allocated states no block
+        // used, and could widen the packed palette for nothing.
+        let waterlogged = properties
             .get("waterlogged")
             .is_some_and(|value| value == "true");
-        for variant in 0..2usize {
-            let with_water = variant == 1;
-            let mapped = resolve_je_entry(mapper, report, name, properties, with_water, policy)?;
-            if mapped.name == "minecraft:air" {
-                continue;
-            }
-            if mapped.lossy {
-                report.warn(
-                    WarningCode::Lossy,
-                    mapped.name.clone(),
-                    format!("{} lost states the Bedrock block cannot express", mapped.name),
-                );
-            }
-            let state = to_block_state(&mapped, mapper.bedrock());
-            let key = render_bedrock_state(&state);
-            let target = *primary_index_map.entry(key).or_insert_with(|| {
-                primary_palette.push(state);
-                (primary_palette.len() - 1) as u16
-            });
-            slot_primary[index][variant] = u32::from(target) + 1;
-            if with_water {
-                slot_liquid[index][variant] = 1;
-            }
+        let mapped = resolve_je_entry(mapper, report, name, properties, waterlogged, policy)?;
+        if mapped.name == "minecraft:air" {
+            continue;
         }
-        // A block that declares `waterlogged=true` in its own state is
-        // water-filled even when the per-block flag is absent, matching the
-        // source's own declaration.
-        if declared_waterlogged {
-            slot_liquid[index][0] = 1;
+        if mapped.lossy {
+            report.warn(
+                WarningCode::Lossy,
+                mapped.name.clone(),
+                format!("{} lost states the Bedrock block cannot express", mapped.name),
+            );
+        }
+        let state = to_block_state(&mapped, mapper.bedrock());
+        let key = render_bedrock_state(&state);
+        let target = *primary_index_map.entry(key).or_insert_with(|| {
+            primary_palette.push(state);
+            (primary_palette.len() - 1) as u16
+        });
+        slot_primary[index] = u32::from(target) + 1;
+        if waterlogged {
+            slot_liquid[index] = 1;
         }
     }
     if needs_lava && liquid_palette.len() == 2 {
@@ -964,18 +959,12 @@ fn convert_section(
                 if let Some(usage) = palette_usage.get_mut(entry_index) {
                     *usage = usage.saturating_add(1);
                 }
-                let waterlogged = entries.get(entry_index).is_some_and(|(_, properties)| {
-                    properties
-                        .get("waterlogged")
-                        .is_some_and(|value| value == "true")
-                });
-                let variant = usize::from(waterlogged);
-                let mapped = slot_primary[entry_index][variant];
+                let mapped = slot_primary[entry_index];
                 if mapped != 0 {
                     any_block = true;
                     primary[be_offset] = u16::try_from(mapped - 1).unwrap_or(0);
                 }
-                let fluid = slot_liquid[entry_index][variant];
+                let fluid = slot_liquid[entry_index];
                 if fluid != 0 {
                     has_liquid = true;
                     liquid[be_offset] = fluid;
