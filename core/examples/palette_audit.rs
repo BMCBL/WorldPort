@@ -40,7 +40,7 @@ fn main() {
     for version in worldport_core::mapping::schema::bedrock_catalog_versions() {
         let catalog = worldport_core::mapping::schema::bedrock_catalog_for(version)
             .expect("bundled bedrock catalog");
-        let java = JavaCatalog::bundled("26.2").expect("newest bundled Java catalog").to_catalog();
+        let java = JavaCatalog::bundled("26.4").expect("newest bundled Java catalog").to_catalog();
         let mapper = BlockMapper::new(java.clone(), catalog.clone());
         rows.push(Row {
             version: format!("be {version}"),
@@ -55,7 +55,7 @@ fn main() {
     for version in worldport_core::mapping::schema::bedrock_catalog_versions() {
         let catalog = worldport_core::mapping::schema::bedrock_catalog_for(version)
             .expect("bundled bedrock catalog");
-        let java = JavaCatalog::bundled("26.2").expect("newest bundled Java catalog").to_catalog();
+        let java = JavaCatalog::bundled("26.4").expect("newest bundled Java catalog").to_catalog();
         let mapper = BlockMapper::new(java.clone(), catalog.clone());
         rows.push(Row {
             version: format!("to be {version}"),
