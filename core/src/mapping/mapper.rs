@@ -103,12 +103,16 @@ impl BlockMapper {
         properties: &BTreeMap<String, String>,
     ) -> Option<MappedState> {
         let short = short_name(name);
+        // A name both editions share is used as-is; an alias is only for names
+        // that actually differ. Trying the alias first renamed blocks that had
+        // already converged, such as 26.2's `iron_chain`, into a name the target
+        // version cannot express - and lost every property with it.
         let mut mapped = je_special(short, properties)
-            .or_else(|| je_alias(short))
             .or_else(|| {
                 (self.bedrock.contains(short) || KNOWN_UNLISTED.contains(&short))
                     .then(|| MappedState::new(namespaced(short)))
-            })?;
+            })
+            .or_else(|| je_alias(short))?;
         translate_properties(
             &mut mapped,
             properties,
@@ -127,8 +131,8 @@ impl BlockMapper {
     ) -> Option<MappedState> {
         let short = short_name(name);
         let mut mapped = be_special(short, properties)
-            .or_else(|| be_alias(short))
-            .or_else(|| self.java.contains(short).then(|| MappedState::new(namespaced(short))))?;
+            .or_else(|| self.java.contains(short).then(|| MappedState::new(namespaced(short))))
+            .or_else(|| be_alias(short))?;
         translate_properties(&mut mapped, properties, &self.java, Direction::BedrockToJava);
         Some(fit_to_schema(mapped, &self.java))
     }
@@ -226,6 +230,9 @@ const JE_ALIASES: &[(&str, &str)] = &[
     ("void_air", "air"),
     ("moving_piston", "movingBlock"),
     ("piston_head", "pistonArmCollision"),
+    // Bedrock 1.26 named the plain chain after its material once copper chains
+    // arrived; the plain name no longer exists there.
+    ("chain", "iron_chain"),
     ("waxed_copper_block", "waxed_copper"),
     ("oak_button", "wooden_button"),
     ("oak_pressure_plate", "wooden_pressure_plate"),
@@ -361,6 +368,22 @@ fn be_alias(short: &str) -> Option<MappedState> {
 fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<MappedState> {
     let get = |key: &str| properties.get(key).map(String::as_str);
 
+    if short == "pale_moss_carpet" {
+        // Java spells the sides plainly; Bedrock prefixes them with the family
+        // and inverts the sense of `bottom` into `upper_block_bit`.
+        let mut mapped = MappedState::new("minecraft:pale_moss_carpet");
+        mapped = mapped.with("upper_block_bit", bit(get("bottom") != Some("true")));
+        for key in ["north", "east", "south", "west"] {
+            let value = match get(key).unwrap_or("none") {
+                "low" => "short",
+                "tall" => "tall",
+                _ => "none",
+            };
+            mapped = mapped.with(format!("pale_moss_carpet_side_{key}"), value);
+        }
+        return Some(mapped);
+    }
+
     // Doors: Bedrock keeps `upper_block_bit`/`door_hinge_bit`; oak uses `wooden_door`.
     // `cardinal_direction` is rotated one quarter-turn from Java facing, and both
     // the 1.21.60+ and legacy properties are emitted so the schema keeps the right one.
@@ -485,6 +508,24 @@ fn je_special(short: &str, properties: &BTreeMap<String, String>) -> Option<Mapp
         }
         mapped = mapped.with("open_bit", bit(get("powered") == Some("true")));
         return Some(mapped.lossy());
+    }
+    if short == "pale_moss_carpet" {
+        // Bedrock spells the sides with a family prefix and hangs the carpet off
+        // `upper_block_bit`, whose sense is inverted against Java's `bottom`.
+        let mut mapped = MappedState::new("minecraft:pale_moss_carpet");
+        mapped = mapped.with("bottom", bool_str(get("upper_block_bit") != Some("1")));
+        for key in ["north", "east", "south", "west"] {
+            let value = get(&format!("pale_moss_carpet_side_{key}")).unwrap_or("none");
+            mapped = mapped.with(
+                key,
+                match value {
+                    "short" => "low",
+                    "tall" => "tall",
+                    _ => "none",
+                },
+            );
+        }
+        return Some(mapped);
     }
     if short == "decorated_pot" {
         let mut mapped = MappedState::new("minecraft:decorated_pot");

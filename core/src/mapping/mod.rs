@@ -6,6 +6,7 @@
 //! states from one edition into the other; everything it cannot express is
 //! reported instead of silently guessed.
 
+pub mod audit;
 pub mod biomes;
 pub mod effects;
 pub mod enchantments;
