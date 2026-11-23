@@ -1045,6 +1045,8 @@ fn convert_section(
     let mut primary = vec![0_u16; SECTION_BLOCKS];
 
     let mut liquid_palette: Vec<BlockState> = vec![air_state(), water_state()];
+    let mut fluid_slots: BTreeMap<(&'static str, u8), u16> =
+        BTreeMap::from([(("minecraft:water", 0), 1)]);
     let mut liquid = vec![0_u16; SECTION_BLOCKS];
     let mut has_liquid = false;
 
@@ -1069,7 +1071,6 @@ fn convert_section(
     // `1` = water, `2` = lava) that the entry's blocks contribute.
     let mut slot_primary: Vec<u32> = vec![0; entries.len()];
     let mut slot_liquid: Vec<u16> = vec![0; entries.len()];
-    let mut needs_lava = false;
     for (index, (name, properties)) in entries.iter().enumerate() {
         if !crate::mapping::is_vanilla(name) {
             // Mod/addon block: pruned, so both variants stay empty.
@@ -1085,11 +1086,30 @@ fn convert_section(
             continue;
         }
         if short == "water" || short == "lava" {
-            // Fluid entries only fill the liquid layer; they never enter the
-            // primary palette.
-            let fluid: u16 = if short == "water" { 1 } else { 2 };
-            slot_liquid[index] = fluid;
-            needs_lava |= fluid == 2;
+            // Each flowing/falling level is a different fluid palette state.
+            // Preserve Java's level (0..=15) as Bedrock's liquid_depth.
+            let fluid = if short == "water" {
+                "minecraft:water"
+            } else {
+                "minecraft:lava"
+            };
+            let depth = properties
+                .get("level")
+                .and_then(|value| value.parse::<u8>().ok())
+                .filter(|depth| *depth <= 15);
+            if depth.is_none() && properties.contains_key("level") {
+                report.warn(
+                    WarningCode::Lossy,
+                    name.clone(),
+                    format!("invalid fluid level for {name}; defaulted to source level 0"),
+                );
+            }
+            slot_liquid[index] = resolve_fluid_slot(
+                fluid,
+                depth.unwrap_or(0),
+                &mut fluid_slots,
+                &mut liquid_palette,
+            )?;
             continue;
         }
         // A palette entry's waterlogged state is fixed by the entry itself, not
@@ -1121,10 +1141,6 @@ fn convert_section(
             slot_liquid[index] = 1;
         }
     }
-    if needs_lava && liquid_palette.len() == 2 {
-        liquid_palette.push(lava_state());
-    }
-
     let mut any_block = false;
     let mut out_of_range: u64 = 0;
     for x in 0..16_usize {
@@ -1257,6 +1273,25 @@ fn decode_indices(data: Option<&[i64]>, count: usize, bits: u32) -> Vec<u16> {
         }
     }
     values
+}
+
+/// Resolves a distinct fluid palette slot once per Java palette entry.
+fn resolve_fluid_slot(
+    name: &'static str,
+    depth: u8,
+    slots: &mut BTreeMap<(&'static str, u8), u16>,
+    palette: &mut Vec<BlockState>,
+) -> Result<u16> {
+    if let Some(&existing) = slots.get(&(name, depth)) {
+        return Ok(existing);
+    }
+    let slot = u16::try_from(palette.len())
+        .map_err(|_| WorldPortError::other("Bedrock fluid palette exceeds u16"))?;
+    let mut state = if name == "minecraft:lava" { lava_state() } else { water_state() };
+    state.states.insert("liquid_depth".to_string(), NbtTag::Int(i32::from(depth)));
+    palette.push(state);
+    slots.insert((name, depth), slot);
+    Ok(slot)
 }
 
 fn water_state() -> BlockState {
@@ -1434,6 +1469,23 @@ mod tests {
             }).unwrap();
             assert_eq!(encode_air_section(y).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn distinct_java_fluid_levels_survive_bedrock_palette() {
+        let mut palette = vec![air_state(), water_state()];
+        let mut slots = BTreeMap::from([(("minecraft:water", 0_u8), 1_u16)]);
+        let source = resolve_fluid_slot("minecraft:water", 0, &mut slots, &mut palette).unwrap();
+        let flowing = resolve_fluid_slot("minecraft:water", 7, &mut slots, &mut palette).unwrap();
+        let falling = resolve_fluid_slot("minecraft:water", 8, &mut slots, &mut palette).unwrap();
+        let lava = resolve_fluid_slot("minecraft:lava", 7, &mut slots, &mut palette).unwrap();
+        assert_eq!(source, 1);
+        assert_ne!(flowing, falling);
+        assert_ne!(flowing, lava);
+        assert_eq!(flowing, resolve_fluid_slot("minecraft:water", 7, &mut slots, &mut palette).unwrap());
+        assert_eq!(palette[usize::from(flowing)].states.get("liquid_depth"), Some(&NbtTag::Int(7)));
+        assert_eq!(palette[usize::from(falling)].states.get("liquid_depth"), Some(&NbtTag::Int(8)));
+        assert_eq!(palette[usize::from(lava)].states.get("liquid_depth"), Some(&NbtTag::Int(7)));
     }
 
     #[test]

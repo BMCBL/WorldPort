@@ -549,10 +549,12 @@ fn read_chunk(
             section_has_blocks = block_count != 0;
         }
 
-        // Standalone fluids (no primary block) come from the liquid layer.
+        // Standalone fluids use the source palette's depth, not the depth
+        // of the first water/lava cell encountered. Cache the mapped slot once
+        // per source entry: the 4096-cell traversal then only reads an array.
         if let Some((liquid_states, liquid_packed)) = liquid {
-            let mut water_palette: Option<u16> = None;
-            let mut lava_palette: Option<u16> = None;
+            let mut source_slots: Vec<Option<u16>> = vec![None; liquid_states.len()];
+            let mut variants: BTreeMap<(&'static str, String), u16> = BTreeMap::new();
             for x in 0..16_usize {
                 for z in 0..16_usize {
                     for local_y in 0..16_usize {
@@ -561,32 +563,44 @@ fn read_chunk(
                         if indices[je_index] != 0 {
                             continue;
                         }
-                        let Some(liquid_index) = liquid_packed.get(offset).copied() else {
+                        let Some(source_index) = liquid_packed.get(offset).copied().map(usize::from)
+                        else {
                             continue;
                         };
-                        let Some(state) = liquid_states.get(usize::from(liquid_index)) else {
+                        let Some(state) = liquid_states.get(source_index) else {
                             continue;
                         };
-                        let (slot, target) = match state.name.as_str() {
-                            "minecraft:water" => (&mut water_palette, "minecraft:water"),
-                            "minecraft:lava" => (&mut lava_palette, "minecraft:lava"),
-                            _ => continue,
+                        let target_index = if let Some(cached) = source_slots[source_index] {
+                            cached
+                        } else {
+                            let resolved = if let Some(name) = java_fluid_name(&state.name) {
+                                let key = (name, state_depth(state));
+                                if let Some(&existing) = variants.get(&key) {
+                                    existing
+                                } else {
+                                    let slot = u16::try_from(palette.len()).map_err(|_| {
+                                        WorldPortError::other("Java fluid palette exceeds u16")
+                                    })?;
+                                    palette.push(fluid_palette_entry(name, &key.1));
+                                    variants.insert(key, slot);
+                                    slot
+                                }
+                            } else {
+                                0
+                            };
+                            source_slots[source_index] = Some(resolved);
+                            resolved
                         };
-                        let index = *slot.get_or_insert_with(|| {
-                            palette.push(compound([
-                                ("Name", tag_string(target)),
-                                (
-                                    "Properties",
-                                    compound([(
-                                        "level",
-                                        tag_string(state_depth(state)),
-                                    )]),
-                                ),
-                            ]));
-                            (palette.len() - 1) as u16
-                        });
-                        indices[je_index] = index;
+                        if target_index == 0 {
+                            continue;
+                        }
+                        indices[je_index] = target_index;
                         section_has_blocks = true;
+                        // A standalone liquid also contributes to the surface
+                        // heightmap; the primary layer may be entirely air.
+                        let column = z * 16 + x;
+                        let top = i16::from(section_y) * 16 + local_y as i16 + 1;
+                        height_map[column] = height_map[column].max(top);
                     }
                 }
             }
@@ -595,7 +609,7 @@ fn read_chunk(
         any_blocks |= section_has_blocks;
         let mut section = IndexMap::new();
         section.insert("Y".to_string(), NbtTag::Byte(section_y));
-        section.insert("block_states".to_string(), block_states_nbt(&palette, &indices));
+        section.insert("block_states".to_string(), block_states_nbt(palette, &indices));
         if let Some(biome) = section_biomes(biomes.as_deref(), section_y) {
             section.insert("biomes".to_string(), biome);
         }
@@ -608,6 +622,7 @@ fn read_chunk(
     // asked to keep, and the reason is recorded so a skipped chunk is never
     // silent.
     let has_optional = !actors.is_empty()
+        || (features.biomes && biomes.as_ref().is_some_and(|storages| !storages.is_empty()))
         || chunk.records.iter().any(|record| match record.key.tag {
             ChunkRecordTag::BlockEntity => features.block_entities,
             ChunkRecordTag::Entity => features.entities,
@@ -753,6 +768,12 @@ fn map_palette_state(
         );
         return Ok(0);
     }
+    // Bedrock also stores ordinary liquids in primary storage. Preserve
+    // liquid_depth as Java's level instead of losing it in generic mapping.
+    if let Some(name) = java_fluid_name(&state.name) {
+        palette.push(fluid_palette_entry(name, &state_depth(state)));
+        return Ok(u32::try_from(palette.len()).unwrap_or(u32::MAX));
+    }
     // Merge the liquid layer into `waterlogged` where Java has it.
     let mut properties = state_properties(state);
     if waterlogged {
@@ -816,6 +837,21 @@ fn state_properties(state: &bedrock_world::BlockState) -> BTreeMap<String, Strin
         .collect()
 }
 
+fn java_fluid_name(name: &str) -> Option<&'static str> {
+    match name {
+        "minecraft:water" | "minecraft:flowing_water" => Some("minecraft:water"),
+        "minecraft:lava" | "minecraft:flowing_lava" => Some("minecraft:lava"),
+        _ => None,
+    }
+}
+
+fn fluid_palette_entry(name: &str, depth: &str) -> NbtTag {
+    compound([
+        ("Name", tag_string(name)),
+        ("Properties", compound([("level", tag_string(depth))])),
+    ])
+}
+
 fn state_depth(state: &bedrock_world::BlockState) -> String {
     state
         .states
@@ -843,11 +879,12 @@ fn palette_entry(state: &MappedState) -> NbtTag {
     NbtTag::Compound(entry)
 }
 
-fn block_states_nbt(palette: &[NbtTag], indices: &[u16]) -> NbtTag {
+fn block_states_nbt(palette: Vec<NbtTag>, indices: &[u16]) -> NbtTag {
+    let palette_len = palette.len();
     let mut states = IndexMap::new();
-    states.insert("palette".to_string(), tag_list(palette.to_vec()));
-    if palette.len() > 1 {
-        let bits = palette_bits(palette.len());
+    states.insert("palette".to_string(), tag_list(palette));
+    if palette_len > 1 {
+        let bits = palette_bits(palette_len);
         states.insert("data".to_string(), pack_indices(indices, bits));
     }
     NbtTag::Compound(states)
@@ -1600,6 +1637,31 @@ mod tests {
         // The overworld starts at y=-64 (section -4); the nether and end at 0.
         assert_eq!((-64_i32).div_euclid(16), -4);
         assert_eq!(0_i32.div_euclid(16), 0);
+    }
+
+    #[test]
+    fn standalone_fluid_depth_maps_to_java_level() {
+        for (name, expected) in [
+            ("minecraft:flowing_water", "minecraft:water"),
+            ("minecraft:flowing_lava", "minecraft:lava"),
+        ] {
+            let mut states = BTreeMap::new();
+            states.insert("liquid_depth".to_string(), NbtTag::Int(7));
+            let source = bedrock_world::BlockState {
+                name: name.to_string(),
+                states,
+                version: None,
+            };
+            let entry = fluid_palette_entry(
+                java_fluid_name(&source.name).expect("recognized fluid"),
+                &state_depth(&source),
+            );
+            assert_eq!(entry.get_str("Name"), Some(expected));
+            assert_eq!(
+                entry.get("Properties").and_then(|properties| properties.get_str("level")),
+                Some("7"),
+            );
+        }
     }
 
     #[test]
