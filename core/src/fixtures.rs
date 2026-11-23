@@ -648,7 +648,7 @@ fn write_maps(root: &Path) -> Result<()> {
         colors,
     };
     crate::map_item::write_java_map(&dir, &map, FIXTURE_DATA_VERSION, true)?;
-    crate::map_item::write_idcounts(&dir, map.id)?;
+    crate::map_item::write_idcounts(&dir, map.id, FIXTURE_DATA_VERSION)?;
     Ok(())
 }
 
