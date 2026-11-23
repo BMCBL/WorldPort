@@ -1,0 +1,172 @@
+name: Build WorldPort
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            library: worldport_native.dll
+            asset: worldport-native-abi1-windows-x86_64-msvc.dll
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            library: worldport_native.dll
+            asset: worldport-native-abi1-windows-aarch64-msvc.dll
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            library: libworldport_native.so
+            asset: worldport-native-abi1-linux-x86_64-gnu.so
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            library: libworldport_native.so
+            asset: worldport-native-abi1-linux-aarch64-gnu.so
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config
+      - name: Build native component
+        shell: pwsh
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+          NATIVE_LIBRARY: ${{ matrix.library }}
+          NATIVE_ASSET: ${{ matrix.asset }}
+        run: |
+          rustup target add $env:NATIVE_TARGET
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --locked --profile native-release --target $env:NATIVE_TARGET -p worldport-native
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $file = Join-Path 'target' "$env:NATIVE_TARGET/native-release/$env:NATIVE_LIBRARY"
+          New-Item -ItemType Directory -Path 'artifacts' | Out-Null
+          # The registry only recognises this exact name, so the crate's own
+          # platform-conventional file name is never what ships.
+          $asset = Join-Path 'artifacts' $env:NATIVE_ASSET
+          Copy-Item -LiteralPath $file -Destination $asset
+          $sha = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$asset.sha256", "$sha  $env:NATIVE_ASSET`n", [Text.Encoding]::ASCII)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: artifacts/
+          if-no-files-found: error
+
+  plugin:
+    name: Wasm plugin
+    needs: native
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-assets
+          merge-multiple: true
+      - name: Test and package plugin
+        run: |
+          rustup target add wasm32-wasip2
+          mkdir -p artifacts
+          (cd native-assets && sha256sum --check --strict *.sha256)
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          metadata = json.loads(
+              subprocess.check_output(
+                  ['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1']
+              )
+          )
+          version = next(
+              package['version']
+              for package in metadata['packages']
+              if package['name'] == 'worldport-native'
+          )
+          directory = Path('native-assets')
+          digests = []
+          assets = []
+          for checksum in sorted(directory.glob('worldport-native-*.sha256')):
+              digest, name = checksum.read_text(encoding='ascii').split()
+              # `worldport-native-abi1-windows-x86_64-msvc.dll` is the registry
+              # name; the plugin keys its baked digest table by os-arch-env.
+              match = re.fullmatch(
+                  r'worldport-native-abi\d+-([a-z0-9]+-[a-z0-9]+-[a-z0-9]+)\.(?:dll|so|dylib)',
+                  name,
+              )
+              assert match, name
+              digests.append(f'{match.group(1)}={digest}')
+              assets.append(
+                  {
+                      'name': name,
+                      'digest': f'sha256:{digest}',
+                      'size': (directory / name).stat().st_size,
+                  }
+              )
+          assert len(assets) == 4, 'all native targets must provide a digest'
+          index = {'tag_name': f'v{version}', 'assets': assets}
+          Path('artifacts/worldport-native.json').write_text(
+              json.dumps(index, indent=2) + '\n', encoding='utf-8'
+          )
+          Path('artifacts/components.env').write_text(
+              '\n'.join(digests) + '\n', encoding='utf-8'
+          )
+          PY
+          export WORLDPORT_NATIVE_COMPONENTS="$(cat artifacts/components.env)"
+          export BMCBL_PLUGIN_PACKAGE_OUT_DIR="$PWD/artifacts"
+          cd plugin
+          cargo test --locked --lib
+          cargo build --locked --release --target wasm32-wasip2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worldport-plugin
+          path: |
+            artifacts/*.bmcblx
+            artifacts/worldport-native.json
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [native, plugin]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish the verified build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          packages=(artifacts/worldport-*.bmcblx)
+          [[ ${#packages[@]} == 1 && -f "${packages[0]}" ]]
+          file="${packages[0]##*/}"
+          version="${file#worldport-}"
+          version="${version%.bmcblx}"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          tag="v$version"
+          # The tag is what users install by, so it has to be the version the
+          # package itself declares; a mismatch would publish an uninstallable
+          # component because the plugin refuses anything older than itself.
+          [[ "$GITHUB_REF_NAME" == "$tag" ]]
+          (cd artifacts && sha256sum --check --strict worldport-native-*.sha256)
+          [[ "$(jq -er '.tag_name' artifacts/worldport-native.json)" == "$tag" ]]
+          gh release create "$tag" artifacts/worldport-*.bmcblx artifacts/worldport-native-* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest
