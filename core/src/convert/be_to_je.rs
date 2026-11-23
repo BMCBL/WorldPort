@@ -184,6 +184,7 @@ pub fn convert(
         .build()
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted = 0_u64;
+    let profile_totals = crate::convert::profile::Totals::default();
     // One key scan for every dimension; filtering three times would walk the
     // whole database three times.
     let all_positions = world.chunk_positions(Default::default())?;
@@ -221,7 +222,9 @@ pub fn convert(
         let entity_dir = dimension_dir.join("entities");
         for ((region_x, region_z), region_positions) in by_region {
             options.check_cancelled()?;
-            let outcomes: Vec<Result<(Option<ConvertedChunk>, ReportBuilder)>> = pool.install(|| {
+            let outcomes: Vec<
+                Result<(Option<ConvertedChunk>, ReportBuilder, crate::convert::profile::ChunkTimings)>,
+            > = pool.install(|| {
                 region_positions
                     .par_iter()
                     .map(|pos| {
@@ -241,7 +244,8 @@ pub fn convert(
             let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(region_positions.len());
             let mut entities: Vec<(u8, u8, Vec<u8>)> = Vec::new();
             for (pos, outcome) in region_positions.iter().zip(outcomes) {
-                let (chunk, worker) = outcome?;
+                let (chunk, worker, timings) = outcome?;
+                profile_totals.add(&timings);
                 report.merge(worker);
                 let je_pos = JeChunkPos::new(pos.x, pos.z);
                 let Some(chunk) = chunk else {
@@ -285,6 +289,7 @@ pub fn convert(
         }
     }
     report.end_stage();
+    crate::convert::profile::report(&profile_totals.snapshot());
 
     report.begin_stage("structures");
     options.report(Progress::new("structures", 0, None));
@@ -317,12 +322,23 @@ fn convert_position(
     features: &crate::convert::Features,
     policy: crate::convert::UnknownDataPolicy,
     compression_level: u32,
-) -> Result<(Option<ConvertedChunk>, ReportBuilder)> {
+) -> Result<(Option<ConvertedChunk>, ReportBuilder, crate::convert::profile::ChunkTimings)> {
+    let mut profiler = crate::convert::profile::Profiler::new();
     let mut report = ReportBuilder::new("", "", "", "");
-    let Some((nbt, entities)) =
-        read_chunk(world, pos, mapper, target, features, policy, &mut report)?
-    else {
-        return Ok((None, report));
+    profiler.start();
+    let read = read_chunk(
+        world,
+        pos,
+        mapper,
+        target,
+        features,
+        policy,
+        &mut report,
+        &mut profiler,
+    );
+    profiler.stop(crate::convert::profile::map);
+    let Some((nbt, entities)) = read? else {
+        return Ok((None, report, profiler.timings()));
     };
     // Encode into the worker's buffer, compress immediately, then hand the
     // buffer back for the next chunk. Keeping the uncompressed payload for the
@@ -331,8 +347,12 @@ fn convert_position(
     // compressed bytes resident.
     let level = Compression::new(compression_level);
     let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
+    profiler.start();
     je_nbt::encode_into(&mut scratch, "", &nbt)?;
+    profiler.stop(crate::convert::profile::encode);
+    profiler.start();
     let payload = crate::je::anvil::compress(RegionCompression::Zlib, &scratch, level)?;
+    profiler.stop(crate::convert::profile::compress);
     let entities = if entities.is_empty() {
         None
     } else {
@@ -353,7 +373,12 @@ fn convert_position(
         scratch = Vec::with_capacity(64 * 1024);
     }
     SCRATCH.with_borrow_mut(|slot| *slot = scratch);
-    Ok((Some(ConvertedChunk { payload, entities }), report))
+    profiler.count_chunk();
+    Ok((
+        Some(ConvertedChunk { payload, entities }),
+        report,
+        profiler.timings(),
+    ))
 }
 
 fn compression_level(plan: &ConversionPlan) -> Compression {
@@ -369,6 +394,7 @@ fn read_chunk(
     features: &crate::convert::Features,
     policy: crate::convert::UnknownDataPolicy,
     report: &mut ReportBuilder,
+    profiler: &mut crate::convert::profile::Profiler,
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
     // Only fetch the records this conversion was asked to convert: a skipped
     // category should not cost a point lookup and its ordering work.
@@ -379,6 +405,8 @@ fn read_chunk(
         hardcoded_spawn_areas: features.chunk_metadata,
     };
     let (chunk, biome_data) = world.chunk_snapshot_selected(pos, selection)?;
+    // Everything below is CPU work on already-read records.
+    profiler.mark_mapping_start();
     let biomes = biome_data.map(|data| data.storages);
     let mut sections: Vec<NbtTag> = Vec::new();
     let mut height_map_blocking = [0_i16; 256];
