@@ -30,6 +30,78 @@ pub fn write_world(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes a Java world with `side * side` chunks of solid stone.
+///
+/// Used to check that JE->BE memory stays bounded as the world grows: the
+/// LevelDB writer keeps writes in its WAL overlay until an explicit flush, so a
+/// large world is the only way to observe whether the write path is bounded.
+pub fn write_flat_world(root: &Path, side: i32) -> Result<()> {
+    io_result(root, std::fs::create_dir_all(root))?;
+    write_level(root)?;
+    let region_dir = root.join("dimensions/minecraft/overworld/region");
+    io_result(&region_dir, std::fs::create_dir_all(&region_dir))?;
+
+    // One section at y=-4: a single stone layer, so chunk payloads stay small.
+    let mut section = IndexMap::new();
+    section.insert("Y".to_string(), NbtTag::Byte(-4));
+    section.insert(
+        "block_states".to_string(),
+        block_states_palette(
+            &[("minecraft:air", None), ("minecraft:stone", None)],
+            |_, _, _| 1_u16,
+        ),
+    );
+    section.insert(
+        "biomes".to_string(),
+        compound([(
+            "palette",
+            tag_list(vec![tag_string("minecraft:plains")]),
+        )]),
+    );
+
+    let mut by_region: std::collections::BTreeMap<(i32, i32), Vec<(u8, u8, Vec<u8>)>> =
+        Default::default();
+    for chunk_x in 0..side {
+        for chunk_z in 0..side {
+            let chunk = compound([
+                ("DataVersion", NbtTag::Int(FIXTURE_DATA_VERSION)),
+                ("xPos", NbtTag::Int(chunk_x)),
+                ("zPos", NbtTag::Int(chunk_z)),
+                ("yPos", NbtTag::Int(-4)),
+                ("Status", tag_string("minecraft:full")),
+                ("sections", tag_list(vec![NbtTag::Compound(section.clone())])),
+                (
+                    "Heightmaps",
+                    compound([(
+                        "WORLD_SURFACE",
+                        NbtTag::LongArray(vec![0_i64; 37]),
+                    )]),
+                ),
+                ("isLightOn", NbtTag::Byte(0)),
+                (
+                    "structures",
+                    compound([("starts", empty_compound()), ("References", empty_compound())]),
+                ),
+                ("block_entities", tag_list(Vec::new())),
+                ("block_ticks", tag_list(Vec::new())),
+                ("fluid_ticks", tag_list(Vec::new())),
+            ]);
+            let payload = je_nbt::encode("", &chunk)?;
+            let local_x = u8::try_from(chunk_x.rem_euclid(32)).unwrap_or(0);
+            let local_z = u8::try_from(chunk_z.rem_euclid(32)).unwrap_or(0);
+            by_region
+                .entry((chunk_x.div_euclid(32), chunk_z.div_euclid(32)))
+                .or_default()
+                .push((local_x, local_z, payload));
+        }
+    }
+    for ((region_x, region_z), entries) in by_region {
+        let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
+        write_region_file(&path, entries, flate2::Compression::new(1))?;
+    }
+    Ok(())
+}
+
 fn write_level(root: &Path) -> Result<()> {
     let data = compound([
         ("DataVersion", NbtTag::Int(FIXTURE_DATA_VERSION)),
