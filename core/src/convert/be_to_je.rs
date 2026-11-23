@@ -1201,7 +1201,7 @@ fn write_maps(
             ),
         );
     }
-    crate::map_item::write_idcounts(&dir, i64::from(max_id))?;
+    crate::map_item::write_idcounts(&dir, i64::from(max_id), target.data_version)?;
     Ok(())
 }
 

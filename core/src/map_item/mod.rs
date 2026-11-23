@@ -170,12 +170,17 @@ pub fn write_java_map(
     Ok(path)
 }
 
-/// Writes Java's `idcounts.dat` (uncompressed big-endian NBT with the highest map id).
-pub fn write_idcounts(dir: &Path, max_id: i64) -> Result<()> {
+/// Writes the Java map ID counter in the target version's format.
+///
+/// Both modern `last_id.dat` and legacy `idcounts.dat` use GZip NBT.
+/// The map counter has used TAG_Int since the 1.13 era, not TAG_Short.
+pub fn write_idcounts(dir: &Path, max_id: i64, data_version: i32) -> Result<()> {
     io_result(dir, std::fs::create_dir_all(dir))?;
-    let root = compound([("map", NbtTag::Short(max_id as i16))]);
-    let bytes = je_nbt::encode("", &root)?;
-    io_result(&dir.join("idcounts.dat"), std::fs::write(dir.join("idcounts.dat"), bytes))
+    let id = i32::try_from(max_id)
+        .map_err(|_| crate::error::WorldPortError::other("Java map counter exceeds i32"))?;
+    let root = compound([("map", NbtTag::Int(id))]);
+    let name = if data_version >= 4786 { "last_id.dat" } else { "idcounts.dat" };
+    je_nbt::write_gzip(&dir.join(name), "", &root)
 }
 
 /// Reads a Bedrock `map_<id>` record.
@@ -292,6 +297,19 @@ mod tests {
             java_colors_to_rgba(&back.colors, &palette),
             java_colors_to_rgba(&map.colors, &palette)
         );
+    }
+
+    #[test]
+    fn java_map_counter_uses_compressed_int_and_versioned_name() {
+        for (version, filename) in [(4189, "idcounts.dat"), (4903, "last_id.dat")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_idcounts(dir.path(), 65_540, version).expect("map counter");
+            let path = dir.path().join(filename);
+            let root = je_nbt::read_gzip(&path).expect("gzip map counter").tag;
+            assert_eq!(root.get("map"), Some(&NbtTag::Int(65_540)));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(write_idcounts(dir.path(), i64::from(i32::MAX) + 1, 4903).is_err());
     }
 
     #[test]
