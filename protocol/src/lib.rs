@@ -387,6 +387,8 @@ mod tests {
                     done: 12,
                     total: 100,
                     message: String::new(),
+                    elapsed_ms: 2_000,
+                    eta_ms: 14_000,
                 },
             }],
         };
