@@ -439,9 +439,19 @@ fn read_chunk(
             // properties for every one of the 4096 blocks. Slots hold
             // `u32::MAX` until resolved and `palette index + 1` afterwards
             // (`0` = air or dropped), so the hot loop only touches a small vec.
-            let liquid_len = liquid.map_or(0, |(states, _)| states.len());
-            let stride = liquid_len + 1;
-            let mut mapped_slots = vec![u32::MAX; states.len() * stride];
+            //
+            // Two slots per primary entry (plain, waterlogged) rather than one
+            // per primary×liquid pair: a pathological section could otherwise
+            // allocate 4096×4096 entries (~64 MiB) for a single section. Which
+            // liquid entries count as water is precomputed once per palette
+            // instead of comparing the name for every block.
+            let water_flags: Vec<bool> = liquid.map_or_else(Vec::new, |(liquid_states, _)| {
+                liquid_states
+                    .iter()
+                    .map(|state| state.name == "minecraft:water")
+                    .collect()
+            });
+            let mut mapped_slots = vec![u32::MAX; states.len() * 2];
             for x in 0..16_usize {
                 for z in 0..16_usize {
                     for local_y in 0..16_usize {
@@ -452,14 +462,11 @@ fn read_chunk(
                         let Some(state) = states.get(usize::from(state_index)) else {
                             continue;
                         };
-                        let liquid_index = liquid
-                            .and_then(|(liquid_states, liquid_packed)| {
-                                let index = liquid_packed.get(offset).copied()?;
-                                let liquid_state = liquid_states.get(usize::from(index))?;
-                                (liquid_state.name == "minecraft:water").then_some(index)
-                            });
-                        let slot = usize::from(state_index) * stride
-                            + liquid_index.map_or(0, |index| usize::from(index) + 1);
+                        let waterlogged = liquid
+                            .and_then(|(_, liquid_packed)| liquid_packed.get(offset).copied())
+                            .and_then(|index| water_flags.get(usize::from(index)).copied())
+                            .unwrap_or(false);
+                        let slot = usize::from(state_index) * 2 + usize::from(waterlogged);
                         let mut mapped = mapped_slots[slot];
                         if mapped == u32::MAX {
                             mapped = map_palette_state(
@@ -467,7 +474,7 @@ fn read_chunk(
                                 report,
                                 &mut palette,
                                 state,
-                                liquid_index.is_some(),
+                                waterlogged,
                                 policy,
                             )?;
                             mapped_slots[slot] = mapped;
