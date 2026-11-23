@@ -699,6 +699,9 @@ name = "worldport-plugin"
 version = "0.1.0"
 dependencies = [
  "bmcbl_plugin_api",
+ "semver",
+ "serde",
+ "serde_json",
  "worldport-protocol",
 ]
 

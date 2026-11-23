@@ -11,6 +11,7 @@
 # Packaged plugin artifacts and native binaries
 /dist/*.bmcblx
 /dist/native/
+/dist/release/
 /dist/SHA256SUMS
 **/*.bmcblx
 *.dll

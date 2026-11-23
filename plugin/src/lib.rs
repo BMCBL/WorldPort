@@ -7,15 +7,17 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-use bmcbl_plugin_api::app::Job;
+use bmcbl_plugin_api::app::{Job, download_verified};
 use bmcbl_plugin_api::native::{self, InstanceHandle, ModuleHandle, Platform, RequestId};
 use bmcbl_plugin_api::prelude::*;
+use self::updates::Component;
 use worldport_protocol::{
     Command, ConversionRequest, Edition, Event, EventBatch, Features, PruningPolicy,
     ReportSummary, WarningRow, WorldInfo, decode_batch, encode_command,
 };
 
 mod page;
+mod updates;
 
 const PAGE_ID: &str = "convert";
 const EVENT_WAIT_MS: u32 = 10_000;
@@ -34,6 +36,19 @@ enum Native {
     #[default]
     Missing,
     Resolving(Job<Platform>),
+    /// Reading the plugin registry for this platform's component.
+    FetchingRegistry(Job<String>),
+    /// The registry was unreachable; reading the GitHub release index instead.
+    FetchingRelease(Job<String>),
+    /// Downloading the component BMCBL will verify and install.
+    Downloading {
+        component: Component,
+        job: Job<String>,
+    },
+    Installing {
+        component: Component,
+        job: Job<()>,
+    },
     Loading(Job<ModuleHandle>),
     Creating(ModuleHandle, Job<InstanceHandle>),
     Ready(InstanceHandle),
@@ -168,23 +183,50 @@ impl State {
     /// Loads the native module when an instance is not available yet.
     fn ensure_native(&mut self) -> PluginResult<()> {
         match &self.native {
-            Native::Ready(_) | Native::Resolving(_) | Native::Loading(_) | Native::Creating(..) => {
+            Native::Ready(_)
+            | Native::Resolving(_)
+            | Native::FetchingRegistry(_)
+            | Native::FetchingRelease(_)
+            | Native::Downloading { .. }
+            | Native::Installing { .. }
+            | Native::Loading(_)
+            | Native::Creating(..) => {
                 return Ok(());
             }
             Native::Missing => {}
         }
-        let Some(platform) = &self.platform else {
+        if self.platform.is_none() {
             self.native = Native::Resolving(native::platform()?);
             return Ok(());
-        };
+        }
         let Some(digest) = self.digest.clone() else {
-            return Err(plugin_error(
-                "native-missing",
-                format!("此插件包没有 {} 的原生组件。请安装匹配的库，并在此页填写它的 SHA-256。", platform_key(platform)),
-            ));
+            // No packaged or remembered component: fetch the one for this
+            // platform instead of asking the user to hunt down a file.
+            self.note("正在查找当前平台的原生转换组件");
+            self.native = Native::FetchingRegistry(updates::fetch_registry()?);
+            return Ok(());
         };
         self.note("正在加载原生转换组件");
         self.native = Native::Loading(native::load(&digest)?);
+        Ok(())
+    }
+
+    /// Starts downloading a component, or loads it when it is already installed.
+    fn begin_component_download(&mut self, component: Component) -> PluginResult<()> {
+        if self.digest.as_deref() == Some(component.sha256()) {
+            // Already present; asking the host to load it triggers approval.
+            self.native = Native::Loading(native::load(component.sha256())?);
+            return Ok(());
+        }
+        let Some(request) = component.request() else {
+            return Err(plugin_error(
+                "native-asset",
+                "原生组件缺少可校验的下载信息。",
+            ));
+        };
+        self.note(format!("正在下载原生组件 {}", component.version));
+        let job = download_verified(request)?;
+        self.native = Native::Downloading { component, job };
         Ok(())
     }
 
@@ -662,6 +704,93 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 }
                 Ok(None) => state.native = Native::Resolving(job),
                 Err(error) => state.native_error(format!("检测宿主平台失败：{}", error.message)),
+            }
+            Ok(true)
+        }
+        Native::FetchingRegistry(job) if job.is_ready(event) => {
+            match job.try_take() {
+                Ok(Some(text)) => {
+                    let platform = state.platform.clone().ok_or_else(|| {
+                        plugin_error("native-platform", "宿主机平台尚未确定")
+                    })?;
+                    match updates::registry_component(&text, &platform) {
+                        Ok(component) => state.begin_component_download(component)?,
+                        Err(error) => {
+                            // The registry is a preferred mirror, not a
+                            // requirement; a GitHub release works too.
+                            state.note(format!("插件目录不可用：{}", error.message));
+                            state.native =
+                                Native::FetchingRelease(updates::fetch_release_index()?);
+                        }
+                    }
+                }
+                Ok(None) => state.native = Native::FetchingRegistry(job),
+                Err(error) => {
+                    state.note(format!("读取插件目录失败：{}", error.message));
+                    state.native = Native::FetchingRelease(updates::fetch_release_index()?);
+                }
+            }
+            Ok(true)
+        }
+        Native::FetchingRelease(job) if job.is_ready(event) => {
+            match job.try_take() {
+                Ok(Some(text)) => {
+                    let platform = state.platform.clone().ok_or_else(|| {
+                        plugin_error("native-platform", "宿主机平台尚未确定")
+                    })?;
+                    match updates::release_component(&text, &platform) {
+                        Ok(component) => state.begin_component_download(component)?,
+                        Err(error) => {
+                            state.native_error(format!(
+                                "没有找到当前平台的原生转换组件：{}",
+                                error.message
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => state.native = Native::FetchingRelease(job),
+                Err(error) => {
+                    state.native_error(format!(
+                        "无法获取原生转换组件：{}",
+                        error.message
+                    ));
+                }
+            }
+            Ok(true)
+        }
+        Native::Downloading { component, job } if job.is_ready(event) => {
+            match job.try_take() {
+                Ok(Some(task)) => {
+                    state.note(format!(
+                        "正在下载原生组件 {}，校验通过后将请求授权",
+                        component.version
+                    ));
+                    let job = native::download(&task, component.sha256())?;
+                    state.native = Native::Installing { component, job };
+                }
+                Ok(None) => state.native = Native::Downloading { component, job },
+                Err(error) => {
+                    state.native_error(format!("下载原生组件失败：{}", error.message));
+                }
+            }
+            Ok(true)
+        }
+        Native::Installing { component, job } if job.is_ready(event) => {
+            match job.try_take() {
+                Ok(Some(())) => {
+                    let digest = component.sha256().to_owned();
+                    state.digest = Some(digest.clone());
+                    state.digest_input = digest.clone();
+                    let _ = storage_set(STORAGE_DIGEST, &digest);
+                    state.note(format!("原生组件 {} 已安装", component.version));
+                    // Loading now asks the host to approve the new library, which
+                    // is why this is a separate step from the download.
+                    state.native = Native::Loading(native::load(&digest)?);
+                }
+                Ok(None) => state.native = Native::Installing { component, job },
+                Err(error) => {
+                    state.native_error(format!("安装原生组件失败：{}", error.message));
+                }
             }
             Ok(true)
         }

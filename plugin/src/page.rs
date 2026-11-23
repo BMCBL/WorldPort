@@ -42,6 +42,11 @@ fn header(state: &State) -> View {
     let status = match &state.native {
         Native::Ready(_) => ("原生组件已就绪", ThemeToken::Accent),
         Native::Resolving(_) => ("正在识别宿主平台", ThemeToken::SecondaryText),
+        Native::FetchingRegistry(_) | Native::FetchingRelease(_) => {
+            ("正在查找原生组件", ThemeToken::SecondaryText)
+        }
+        Native::Downloading { .. } => ("正在下载原生组件", ThemeToken::SecondaryText),
+        Native::Installing { .. } => ("正在安装原生组件", ThemeToken::SecondaryText),
         Native::Loading(_) => ("正在加载原生组件", ThemeToken::SecondaryText),
         Native::Creating(..) => ("正在创建会话", ThemeToken::SecondaryText),
         Native::Missing if state.digest.is_some() || state.platform.is_none() => {

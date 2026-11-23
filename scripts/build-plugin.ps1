@@ -36,7 +36,19 @@ try {
             cargo @cargoArgs | Out-Host
             $path = Join-Path $targetDir "native-release/$library"
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-            [pscustomobject]@{ Platform = $platform; Path = $path; Library = $library; Digest = $hash }
+            # The registry only recognises <id>-native-abi<N>-<os>-<arch>-<env>.<ext>,
+            # so the release asset must use that name even though the crate emits
+            # a platform-conventional one.
+            $extension = if ($library.EndsWith('.dll')) { 'dll' } else { 'so' }
+            $assetName = "worldport-native-abi1-$platform.$extension"
+            [pscustomobject]@{
+                Platform = $platform
+                Path = $path
+                Library = $library
+                Digest = $hash
+                AssetName = $assetName
+                Size = (Get-Item -LiteralPath $path).Length
+            }
         }
     )
 
@@ -66,6 +78,33 @@ try {
         }
         "$((Get-FileHash -LiteralPath $package.FullName).Hash.ToLowerInvariant()) *$($package.Name)"
     ) | Set-Content -LiteralPath "$root/dist/SHA256SUMS" -Encoding ascii
+
+    # Release payloads: the files a GitHub release has to carry for the registry
+    # and for the plugin's own fallback index to find a native component.
+    $releaseDir = Join-Path $root 'dist/release'
+    New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+    $version = $packageVersion.Matches[0].Groups[1].Value
+    $assets = @()
+    foreach ($component in $components) {
+        $destination = Join-Path $releaseDir $component.AssetName
+        Copy-Item -LiteralPath $component.Path -Destination $destination -Force
+        $assets += [ordered]@{
+            name = $component.AssetName
+            digest = "sha256:$($component.Digest)"
+            size = $component.Size
+        }
+    }
+    # `release_component` in the plugin reads this document when the registry is
+    # unreachable, so it is generated from the same hashes, never typed by hand.
+    # Windows PowerShell 5.1 has no `utf8NoBOM` encoding name, and a BOM makes
+    # the JSON invalid for a strict parser, so write the bytes explicitly.
+    $indexJson = [ordered]@{ tag_name = "v$version"; assets = $assets } | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText(
+        (Join-Path $releaseDir 'worldport-native.json'),
+        $indexJson,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "release assets: $releaseDir"
     Write-Host "package: $($package.FullName) ($($package.Length) bytes)"
 } finally {
     Pop-Location
