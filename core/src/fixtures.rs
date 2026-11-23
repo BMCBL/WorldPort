@@ -285,7 +285,10 @@ fn write_chunk(root: &Path) -> Result<()> {
             tag_list(vec![compound([
                 ("i", tag_string("minecraft:oak_planks")),
                 ("x", NbtTag::Int(2)),
-                ("y", NbtTag::Int(-62)),
+                // The plank platform is the section's local y=1, i.e. world
+                // y=-63. A tick at -62 sits on air, and the converter
+                // (correctly) writes the state it actually finds there.
+                ("y", NbtTag::Int(-63)),
                 ("z", NbtTag::Int(2)),
                 ("t", NbtTag::Int(40)),
                 ("p", NbtTag::Int(0)),
@@ -698,7 +701,10 @@ fn write_player(root: &Path) -> Result<()> {
     ]);
     let path = root
         .join("playerdata")
-        .join("00000001-0002-0003-0004-000000000000.dat");
+        // The file name must be the player's own UUID: Java names the file
+        // after `UUID` in the payload, and a mismatch makes the identity
+        // ambiguous when a tool preserves one and derives the other.
+        .join("00000001-0000-0002-0000-000300000004.dat");
     je_nbt::write_gzip(&path, "", &player)
 }
 

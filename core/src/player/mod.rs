@@ -39,9 +39,28 @@ pub fn dimension_id(name: &str) -> i32 {
 
 /// Converts a Bedrock player record into Java `playerdata` NBT.
 #[must_use]
+/// The Java UUID this converter preserved in a Bedrock player record, if any.
+///
+/// Callers use it so the player file name and the NBT `UUID` cannot disagree.
+#[must_use]
+pub fn java_uuid_of(be: &NbtTag) -> Option<[i32; 4]> {
+    be.get_i32_array(JAVA_UUID_FIELD)
+        .and_then(|value| <[i32; 4]>::try_from(value).ok())
+}
+
 pub fn bedrock_to_java(be: &NbtTag, uuid: [i32; 4], data_version: i32) -> NbtTag {
-    let mut out = IndexMap::new();
+    // Start from the fields the Java source had and this converter does not
+    // model, then overwrite with everything derived from the Bedrock record, so
+    // edits made in Bedrock (position, inventory, health) still win.
+    let mut out: IndexMap<String, NbtTag> = be
+        .get(JAVA_RESIDUAL_FIELD)
+        .and_then(|value| value.as_compound())
+        .map(|fields| fields.clone())
+        .unwrap_or_default();
     out.insert("DataVersion".to_string(), NbtTag::Int(data_version));
+    // A UUID written by this converter wins: it is the player's real identity,
+    // while `uuid` is only a hash of the Bedrock storage key.
+    let uuid = java_uuid_of(be).unwrap_or(uuid);
     out.insert("UUID".to_string(), NbtTag::IntArray(uuid.to_vec()));
     if let Some(pos) = be.get_list("Pos") {
         out.insert("Pos".to_string(), double_list(pos));
@@ -116,10 +135,70 @@ pub fn bedrock_to_java(be: &NbtTag, uuid: [i32; 4], data_version: i32) -> NbtTag
     NbtTag::Compound(out)
 }
 
+/// Bedrock player field that carries the Java UUID across a conversion.
+///
+/// Bedrock itself has no player UUID: a local player lives under the fixed
+/// `~local_player` key, and the Java side rebuilds an identity by hashing that
+/// key. Without this field a roundtrip changed the player's UUID, which breaks
+/// anything that references the player (advancements, map ownership, external
+/// tools). Bedrock ignores unknown player fields, so this is safe to write.
+pub const JAVA_UUID_FIELD: &str = "WorldPortJavaUUID";
+
+/// Bedrock player field that carries the Java fields this converter does not map.
+///
+/// A Bedrock player record has no equivalent for `Air`, `Fire`, `Motion`,
+/// `Brain`, `Score` and a dozen others, so a whitelist conversion silently
+/// dropped them and a roundtrip produced a subtly different player. The unmapped
+/// remainder travels in this field and is merged back, which makes the
+/// "only the local player is converted" promise an honest one.
+pub const JAVA_RESIDUAL_FIELD: &str = "WorldPortJavaResidual";
+
+/// Java fields that are either mapped explicitly or meaningless after a
+/// conversion, and therefore must not be carried as residual.
+const OWNED_JAVA_FIELDS: &[&str] = &[
+    "DataVersion",
+    "UUID",
+    "Pos",
+    "Rotation",
+    "Health",
+    "XpLevel",
+    "XpP",
+    "XpTotal",
+    "foodLevel",
+    "foodSaturationLevel",
+    "Inventory",
+    "EnderItems",
+    "active_effects",
+    "SpawnX",
+    "SpawnY",
+    "SpawnZ",
+    "SpawnDimension",
+    "SpawnAngle",
+    "SpawnForced",
+    "Dimension",
+];
+
 /// Converts Java `playerdata` NBT into a Bedrock player record.
-#[must_use]
 pub fn java_to_bedrock(je: &NbtTag) -> NbtTag {
     let mut out = IndexMap::new();
+    if let Some(uuid) = je.get_i32_array("UUID") {
+        out.insert(JAVA_UUID_FIELD.to_string(), NbtTag::IntArray(uuid.to_vec()));
+    }
+    // Everything this converter does not map travels verbatim, so a roundtrip
+    // does not quietly drop vanilla state.
+    if let Some(fields) = je.as_compound() {
+        let residual: Vec<(String, NbtTag)> = fields
+            .iter()
+            .filter(|(key, _)| !OWNED_JAVA_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if !residual.is_empty() {
+            out.insert(
+                JAVA_RESIDUAL_FIELD.to_string(),
+                NbtTag::Compound(residual.into_iter().collect()),
+            );
+        }
+    }
     if let Some(pos) = je.get_list("Pos") {
         out.insert("Pos".to_string(), float_list(pos));
     }
@@ -256,20 +335,21 @@ fn java_effects(list: &[NbtTag]) -> NbtTag {
                 .get_int("Id")
                 .and_then(|id| u16::try_from(id).ok())
                 .and_then(crate::mapping::effects::effect_name)?;
-            Some(compound([
-                ("id", tag_string(id)),
-                (
-                    "amplifier",
-                    NbtTag::Int(effect.get_int("Amplifier").unwrap_or(0) as i32),
-                ),
-                (
-                    "duration",
-                    NbtTag::Int(effect.get_int("Duration").unwrap_or(0) as i32),
-                ),
-                ("ambient", NbtTag::Byte(0)),
-                ("show_particles", NbtTag::Byte(1)),
-                ("show_icon", NbtTag::Byte(1)),
-            ]))
+            // Java reads a missing flag as its default, so the cosmetic flags
+            // are only written when they differ. That keeps the output identical
+            // whether the source spelled the defaults out or omitted them, which
+            // is what makes a roundtrip comparable.
+            let mut entry = IndexMap::new();
+            entry.insert("id".to_string(), tag_string(id));
+            entry.insert(
+                "amplifier".to_string(),
+                NbtTag::Int(effect.get_int("Amplifier").unwrap_or(0) as i32),
+            );
+            entry.insert(
+                "duration".to_string(),
+                NbtTag::Int(effect.get_int("Duration").unwrap_or(0) as i32),
+            );
+            Some(NbtTag::Compound(entry))
         })
         .collect();
     tag_list(entries)

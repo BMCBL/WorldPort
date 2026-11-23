@@ -178,6 +178,12 @@ pub struct ConversionPlan {
     pub overwrite: bool,
     /// Stop after this many chunks (testing aid; `None` converts everything).
     pub chunk_limit: Option<usize>,
+    /// Which Java player becomes Bedrock's local player.
+    ///
+    /// Matched against the player file stem (the UUID), case-insensitively, as
+    /// a full value or a prefix. `None` picks the most recently played player -
+    /// never an arbitrary one - and reports the choice.
+    pub player: Option<String>,
 }
 
 impl ConversionPlan {
@@ -195,6 +201,7 @@ impl ConversionPlan {
             compression_level: 6,
             overwrite: false,
             chunk_limit: None,
+            player: None,
         }
     }
 }
@@ -326,7 +333,6 @@ pub fn run(plan: &ConversionPlan, options: &ConversionOptions) -> Result<Convers
             source.as_str()
         )));
     }
-    prepare_target(&plan.target, plan.overwrite)?;
     options.check_cancelled()?;
     match (source, target) {
         (Edition::Java, Edition::Bedrock) => je_to_be::convert(plan, options),
@@ -344,7 +350,7 @@ fn prepare_target(target: &Path, overwrite: bool) -> Result<()> {
         if !empty {
             if !overwrite {
                 return Err(WorldPortError::invalid(format!(
-                    "{} already exists; enable overwrite or choose another directory",
+                    "{} is not empty; choose a new or empty output directory",
                     target.display()
                 )));
             }

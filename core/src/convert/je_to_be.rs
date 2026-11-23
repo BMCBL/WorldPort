@@ -5,6 +5,8 @@
 //! as skipped for now.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use bedrock_nbt::NbtTag;
@@ -35,7 +37,14 @@ use crate::report::{ReportBuilder, WarningCode};
 
 /// Converts a Java world into a Bedrock world.
 pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<crate::report::ConversionReport> {
-    let mut world = JavaWorld::open(&plan.source)?;
+    let world = JavaWorld::open(&plan.source)?;
+    if world.data_version() < super::be_to_je::MIN_TARGET_DATA_VERSION {
+        return Err(WorldPortError::unsupported(format!(
+            "Java source DataVersion {} can be inspected, but full conversion requires Minecraft Java 1.18 or newer",
+            world.data_version()
+        )));
+    }
+    super::prepare_target(&plan.target, plan.overwrite)?;
     let mut report = ReportBuilder::new(
         "java",
         "bedrock",
@@ -112,21 +121,13 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         for window in positions.chunks(256) {
             options.check_cancelled()?;
             let outcomes: Vec<Result<ChunkOutcome>> = pool.install(|| {
-                window
-                    .par_iter()
-                    .map(|pos| {
-                        options.check_cancelled()?;
-                        convert_position(
-                            &world,
-                            &mapper,
-                            dimension,
-                            *pos,
-                            &uid_counter,
-                            current_tick,
-                            plan.pruning.blocks,
-                        )
-                    })
-                    .collect()
+                window.par_iter().map(|pos| {
+                    options.check_cancelled()?;
+                    convert_position(
+                        &world, &mapper, dimension, *pos, &uid_counter,
+                        current_tick, &plan.features, plan.pruning.blocks,
+                    )
+                }).collect()
             });
             for outcome in outcomes {
                 let outcome = outcome?;
@@ -187,7 +188,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     report.begin_stage("players");
     options.report(Progress::new("players", 0, None));
     if plan.features.players {
-        write_player(&mut output, &world, &mut report)?;
+        write_player(&mut output, &world, plan.player.as_deref(), &mut report)?;
     }
     report.end_stage();
 
@@ -286,10 +287,21 @@ fn write_maps(
 fn write_player(
     output: &mut BedrockOutput,
     world: &JavaWorld,
+    selector: Option<&str>,
     report: &mut ReportBuilder,
 ) -> Result<()> {
     // Modern worlds keep `playerdata/<uuid>.dat`; classic ones embed `Data.Player`.
-    let player = if let Some((_, path)) = world.player_files()?.into_iter().next() {
+    // Taking "the first file" would be arbitrary: a world played by several
+    // accounts has several files and the choice would follow sort order. A
+    // selector wins when given; otherwise the most recently played player is
+    // used, and the decision is always reported so it is never silent.
+    let chosen = choose_player(world, selector, report)?;
+    let player = if let Some((stem, path)) = chosen {
+        report.warn(
+            WarningCode::Notice,
+            "player",
+            format!("converted player {stem} as the Bedrock local player"),
+        );
         je_nbt::read_gzip(&path).ok()
     } else {
         world
@@ -317,6 +329,103 @@ fn write_player(
     );
     report.counters().players += 1;
     Ok(())
+}
+
+/// Picks which Java player becomes Bedrock's local player.
+///
+/// The default is local-to-local: Java marks the single-player owner in
+/// `level.dat` as `Data.SingleplayerUUID`, and that player is the one a Bedrock
+/// `~local_player` record corresponds to. Only when that marker is missing or
+/// does not resolve does this fall back, and any fallback is reported - a
+/// conversion must never silently pick a different account.
+fn choose_player(
+    world: &JavaWorld,
+    selector: Option<&str>,
+    report: &mut ReportBuilder,
+) -> Result<Option<(String, PathBuf)>> {
+    let mut players = world.player_files()?;
+    if players.is_empty() {
+        return Ok(None);
+    }
+    if let Some(selector) = selector {
+        let needle = selector.to_ascii_lowercase();
+        let matched = players
+            .iter()
+            .position(|(stem, _)| {
+                let stem = stem.to_ascii_lowercase();
+                stem == needle || stem.starts_with(&needle)
+            })
+            .ok_or_else(|| {
+                WorldPortError::unsupported(format!(
+                    "no player matches {selector:?}; this world has {}",
+                    players
+                        .iter()
+                        .map(|(stem, _)| stem.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+        return Ok(Some(players.remove(matched)));
+    }
+    // Local to local: the world itself names its single-player owner.
+    if let Some(uuid) = singleplayer_uuid(world)
+        && let Some(index) = players
+            .iter()
+            .position(|(stem, _)| stem.eq_ignore_ascii_case(&uuid))
+    {
+        if players.len() > 1 {
+            report.warn(
+                WarningCode::Notice,
+                "player",
+                format!(
+                    "converted {uuid}, the world's single-player owner; {} other player                      file(s) were left alone. Pass --player <uuid> to convert a different one",
+                    players.len() - 1
+                ),
+            );
+        }
+        return Ok(Some(players.remove(index)));
+    }
+    if players.len() == 1 {
+        return Ok(players.into_iter().next());
+    }
+    // No marker and several accounts: prefer the most recently played file, and
+    // say so. Sorting by write time is deterministic on a real save.
+    players.sort_by_key(|(_, path)| {
+        std::cmp::Reverse(
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_millis())
+                .unwrap_or(0),
+        )
+    });
+    let alternatives: Vec<String> = players.iter().skip(1).map(|(stem, _)| stem.clone()).collect();
+    report.warn(
+        WarningCode::Notice,
+        "player",
+        format!(
+            "this world names no single-player owner and has {} players; converted the most              recently played one. Pass --player <uuid> to choose another. Others: {}",
+            players.len(),
+            alternatives.join(", ")
+        ),
+    );
+    Ok(Some(players.remove(0)))
+}
+
+/// The single-player owner Java records in `level.dat`, as a dashed UUID.
+fn singleplayer_uuid(world: &JavaWorld) -> Option<String> {
+    let raw = world.data().get_i32_array("SingleplayerUUID")?;
+    let value = <[i32; 4]>::try_from(raw).ok()?;
+    // Java stores the UUID as four big-endian ints.
+    Some(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        value[0] as u32,
+        (value[1] >> 16) as u16,
+        value[1] as u16,
+        (value[2] >> 16) as u16,
+        ((u64::from(value[2] as u32) & 0xFFFF) << 32) | u64::from(value[3] as u32)
+    ))
 }
 
 fn create_options(world: &JavaWorld) -> Result<CreateOptions> {
@@ -437,6 +546,7 @@ fn convert_position(
     pos: JeChunkPos,
     uid_counter: &AtomicI64,
     current_tick: i64,
+    features: &super::Features,
     policy: crate::convert::UnknownDataPolicy,
 ) -> Result<ChunkOutcome> {
     let mut profiler = crate::convert::profile::Profiler::new();
@@ -492,6 +602,7 @@ fn convert_position(
         dimension,
         uid_counter,
         current_tick,
+        features,
         policy,
         &mut interests,
         &mut structures,
@@ -533,6 +644,7 @@ fn convert_chunk(
     dimension: JeDimension,
     uid_counter: &AtomicI64,
     current_tick: i64,
+    features: &super::Features,
     policy: crate::convert::UnknownDataPolicy,
     interests: &mut crate::poi::InterestInventory,
     structures: &mut Vec<crate::structure::StructureArea>,
@@ -574,8 +686,10 @@ fn convert_chunk(
                 if let Some(biome) = convert_biomes(section) {
                     sections.push(SectionWrite {
                         y,
-                        primary: vec![0; SECTION_BLOCKS],
-                        primary_palette: vec![air_state()],
+                        // A section with only biome data needs a subchunk
+                        // header, but no expanded block indices.
+                        primary: Vec::new(),
+                        primary_palette: Vec::new(),
                         liquid: None,
                         liquid_palette: Vec::new(),
                         biomes: biome,
@@ -605,19 +719,34 @@ fn convert_chunk(
     // Scheduled ticks resolve their block state by position. Read them before
     // the sections are consumed, and only then snapshot the section data the
     // lookup needs (most chunks carry no ticks, so this copy is rare).
-    let pending_ticks = crate::tick::read_java_chunk(chunk);
+    let pending_ticks = if features.ticks {
+        crate::tick::read_java_chunk(chunk)
+    } else {
+        Vec::new()
+    };
+    // Only sections that carry real block indices can answer a state lookup: a
+    // biome-only section is stored with empty `primary`, and treating that as
+    // "all air" made every scheduled tick in it resolve to air.
     let tick_sections: Vec<(i8, Vec<u16>, Vec<BlockState>)> = if pending_ticks.is_empty() {
         Vec::new()
     } else {
         sections
             .iter()
+            .filter(|section| !section.primary.is_empty())
             .map(|section| (section.y, section.primary.clone(), section.primary_palette.clone()))
             .collect()
     };
 
     let had_sections = !sections.is_empty();
     for section in sections {
+        let y = section.y;
+        report.counters().sections += 1;
+        if section.primary.is_empty() {
+            sink.put_raw(keys.subchunk(y).encode(), encode_air_section(y)?);
+            continue;
+        }
         let base_y = i32::from(section.y) * 16;
+        let mut blocks = 0;
         for x in 0..16_usize {
             for z in 0..16_usize {
                 let mut top = 0_i32;
@@ -625,19 +754,14 @@ fn convert_chunk(
                     let index = x * 256 + z * 16 + y;
                     if section.primary.get(index).copied().unwrap_or(0) != 0 {
                         top = base_y + y as i32 + 1;
+                        blocks += 1;
                     }
                 }
                 let column = z * 16 + x;
                 height_map[column] = height_map[column].max(i16::try_from(top).unwrap_or(i16::MAX));
             }
         }
-        report.counters().sections += 1;
-        for index in &section.primary {
-            if *index != 0 {
-                report.counters().blocks += 1;
-            }
-        }
-        let y = section.y;
+        report.counters().blocks += blocks;
         let bytes = encode_section(section)?;
         sink.put_raw(keys.subchunk(y).encode(), bytes);
     }
@@ -654,7 +778,7 @@ fn convert_chunk(
 
     // Block entities: translate payloads into one `BlockEntity` record.
     let mut block_entities: Vec<NbtTag> = Vec::new();
-    if let Some(entities) = chunk.get_list("block_entities") {
+    if features.block_entities && let Some(entities) = chunk.get_list("block_entities") {
         for entity in entities {
             if let Some(converted) = crate::block_entity::java_to_bedrock(entity, report) {
                 block_entities.push(NbtTag::Compound(converted));
@@ -671,15 +795,12 @@ fn convert_chunk(
     }
 
     // Entities: legacy inline `Entities` plus the 1.17+ `entities/` region file.
-    let mut je_entities: Vec<NbtTag> = chunk
-        .get_list("Entities")
-        .map(<[NbtTag]>::to_vec)
-        .unwrap_or_default();
-    je_entities.extend(REGIONS.with_borrow_mut(|cache| {
-        world.read_entity_chunk_cached(cache, dimension, pos)
-    })?);
-    if !je_entities.is_empty() {
-        for entity in &je_entities {
+    if features.entities {
+        let inline = chunk.get_list("Entities").unwrap_or_default();
+        let external = REGIONS.with_borrow_mut(|cache| {
+            world.read_entity_chunk_cached(cache, dimension, pos)
+        })?;
+        for entity in inline.iter().chain(external.iter()) {
             let uid = uid_counter.fetch_add(1, Ordering::Relaxed);
             let Some(payload) = crate::entity::java_to_bedrock(entity, uid, report) else {
                 continue;
@@ -738,7 +859,7 @@ fn convert_chunk(
     // Structure metadata from the Java starts already in hand. Only the four
     // structures Bedrock also tracks as hardcoded spawn areas become areas;
     // the rest keep their blocks and are counted by the caller.
-    if let Some(starts) = chunk
+    if features.chunk_metadata && let Some(starts) = chunk
         .get("structures")
         .and_then(|value| value.get("starts"))
         .and_then(|value| value.as_compound())
@@ -824,6 +945,31 @@ fn air_state() -> BlockState {
     }
 }
 
+fn encode_air_section(y: i8) -> Result<bytes::Bytes> {
+    static AIR: OnceLock<std::result::Result<[bytes::Bytes; 256], String>> = OnceLock::new();
+    let sections = AIR.get_or_init(|| {
+        let template = encode_section(SectionWrite {
+            y: 0,
+            primary: vec![0; SECTION_BLOCKS],
+            primary_palette: vec![air_state()],
+            liquid: None,
+            liquid_palette: Vec::new(),
+            biomes: [0; 64],
+        })
+        .map_err(|error| error.to_string())?;
+        // The v9 header is version, storage count, then signed section Y.
+        Ok(std::array::from_fn(|y| {
+            let mut bytes = template.to_vec();
+            bytes[2] = y as u8;
+            bytes::Bytes::from(bytes)
+        }))
+    });
+    match sections {
+        Ok(sections) => Ok(sections[usize::from(y.to_ne_bytes()[0])].clone()),
+        Err(error) => Err(WorldPortError::other(error.clone())),
+    }
+}
+
 /// Section conversion result: the storage write (when non-empty) plus the
 /// village-interest blocks found in the section.
 struct SectionOutcome {
@@ -856,6 +1002,19 @@ fn convert_section(
             interests: Default::default(),
         });
     }
+    let data = block_states.get_i64_array("data");
+    if data.is_none_or(<[i64]>::is_empty)
+        && let [entry] = palette
+        && matches!(
+            entry.get_str("Name").unwrap_or("minecraft:air"),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
+    {
+        return Ok(SectionOutcome {
+            write: None,
+            interests: Default::default(),
+        });
+    }
     let entries: Vec<(String, BTreeMap<String, String>)> = palette
         .iter()
         .map(|entry| {
@@ -876,7 +1035,6 @@ fn convert_section(
         })
         .collect();
 
-    let data = block_states.get_i64_array("data");
     let bits = palette_bits(entries.len());
     let indices = decode_indices(data, SECTION_BLOCKS, bits);
 
@@ -1262,6 +1420,21 @@ pub const fn target_edition() -> Edition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_air_subchunk_matches_the_normal_encoder() {
+        for y in [-4, 0, 19] {
+            let expected = encode_section(SectionWrite {
+                y,
+                primary: vec![0; SECTION_BLOCKS],
+                primary_palette: vec![air_state()],
+                liquid: None,
+                liquid_palette: Vec::new(),
+                biomes: [0; 64],
+            }).unwrap();
+            assert_eq!(encode_air_section(y).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn decodes_java_packed_indices() {

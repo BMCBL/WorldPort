@@ -15,6 +15,12 @@ pub const MAX_WARNING_ROWS: usize = 2048;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WarningCode {
+    /// A choice the converter made that the user may want to know about.
+    ///
+    /// Not a defect: "this world had three players, the most recently played
+    /// one was converted" belongs here, because silently picking one would be
+    /// worse than saying which one was picked.
+    Notice,
     /// A Bedrock or Java block state had no mapping.
     UnmappedBlock,
     /// An entity identifier had no mapping.
@@ -47,6 +53,7 @@ impl WarningCode {
             Self::DroppedField => "dropped-field",
             Self::Lossy => "lossy",
             Self::Pruned => "pruned",
+            Self::Notice => "notice",
             Self::Skipped => "skipped",
             Self::UnsupportedFeature => "unsupported-feature",
         }

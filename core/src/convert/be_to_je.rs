@@ -4,20 +4,22 @@
 //! `level.dat`. Entities, players, maps and ticks follow in M3.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bedrock_nbt::NbtTag;
 use bedrock_world::world::{OpenOptions, World};
 use bedrock_world::{
-    ChunkKey, ChunkPos, ChunkRecordTag, ChunkVersion, Dimension, SubChunkDecodeMode, SubChunkFormat,
+    ChunkKey, ChunkPos, ChunkRecordTag, ChunkSnapshotSelection, ChunkVersion, Dimension,
+    SubChunkDecodeMode, SubChunkFormat,
 };
-use flate2::Compression;
+use flate2::{Compression, write::ZlibEncoder};
 use indexmap::IndexMap;
 use rayon::prelude::*;
 
 use crate::convert::{ConversionOptions, ConversionPlan, Progress};
 use crate::error::{Result, WorldPortError, io_result};
-use crate::je::anvil::{RegionCompression, ZlibEncode, write_region_file, write_region_compressed};
+use crate::je::anvil::{ZlibEncode, write_region_compressed};
 use crate::je::nbt as je_nbt;
 use crate::je::{JeBlockPos, JeChunkPos, JeDimension};
 use crate::mapping::biomes::java_biome_name;
@@ -140,9 +142,10 @@ pub fn convert(
         plan.target.display().to_string(),
     );
     let target = JavaTarget::resolve(plan)?;
+    super::prepare_target(&plan.target, plan.overwrite)?;
     let mapper = BlockMapper::new(target.catalog.to_catalog(), bedrock_catalog());
     report.set_versions(
-        "bedrock 1.26.60",
+        format!("bedrock {}", crate::be::inspect::version_label(&level_dat.root)),
         format!("java {} ({})", target.catalog.version(), target.data_version),
     );
 
@@ -155,7 +158,11 @@ pub fn convert(
 
     report.begin_stage("players");
     options.report(Progress::new("players", 0, None));
-    let player_uuid = write_players(&plan.target, &world, &target, &mut report)?;
+    let player_uuid = if plan.features.players {
+        write_players(&plan.target, &world, &target, &mut report)?
+    } else {
+        None
+    };
     report.end_stage();
 
     report.begin_stage("poi");
@@ -178,6 +185,11 @@ pub fn convert(
     )?;
     report.end_stage();
 
+    report.begin_stage("chunk-index");
+    // One key scan for every dimension; filtering three times would walk the
+    // whole database three times.
+    let all_positions = world.chunk_positions(Default::default())?;
+    report.end_stage();
     report.begin_stage("terrain");
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(plan.jobs)
@@ -185,9 +197,6 @@ pub fn convert(
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted = 0_u64;
     let profile_totals = crate::convert::profile::Totals::default();
-    // One key scan for every dimension; filtering three times would walk the
-    // whole database three times.
-    let all_positions = world.chunk_positions(Default::default())?;
     for (dimension, je_dimension) in [
         (Dimension::Overworld, JeDimension::Overworld),
         (Dimension::Nether, JeDimension::Nether),
@@ -222,24 +231,14 @@ pub fn convert(
         let entity_dir = dimension_dir.join("entities");
         for ((region_x, region_z), region_positions) in by_region {
             options.check_cancelled()?;
-            let outcomes: Vec<
-                Result<(Option<ConvertedChunk>, ReportBuilder, crate::convert::profile::ChunkTimings)>,
-            > = pool.install(|| {
-                region_positions
-                    .par_iter()
-                    .map(|pos| {
-                        options.check_cancelled()?;
-                        convert_position(
-                            &world,
-                            *pos,
-                            &mapper,
-                            &target,
-                            &plan.features,
-                            plan.pruning.blocks,
-                            plan.compression_level,
-                        )
-                    })
-                    .collect()
+            let outcomes: Vec<_> = pool.install(|| {
+                region_positions.par_iter().map(|pos| {
+                    options.check_cancelled()?;
+                    convert_position(
+                        &world, *pos, &mapper, &target, &plan.features,
+                        plan.pruning.blocks, plan.compression_level,
+                    )
+                }).collect()
             });
             let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(region_positions.len());
             let mut entities: Vec<(u8, u8, Vec<u8>)> = Vec::new();
@@ -304,6 +303,26 @@ thread_local! {
     /// Per-worker NBT encode buffer, swapped in and out per chunk.
     static SCRATCH: std::cell::RefCell<Vec<u8>> =
         std::cell::RefCell::new(Vec::with_capacity(64 * 1024));
+    static ENCODER: std::cell::RefCell<Option<(u32, ZlibEncoder<Vec<u8>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn compress_chunk(payload: &[u8], level: u32) -> Result<Vec<u8>> {
+    ENCODER.with_borrow_mut(|slot| {
+        if slot.as_ref().is_some_and(|(current, _)| *current != level) {
+            *slot = None;
+        }
+        let (_, encoder) = slot.get_or_insert_with(|| {
+            (level, ZlibEncoder::new(Vec::with_capacity(4096), Compression::new(level)))
+        });
+        let compressed = encoder
+            .write_all(payload)
+            .and_then(|()| encoder.reset(Vec::with_capacity(4096)));
+        if compressed.is_err() {
+            *slot = None;
+        }
+        compressed.map_err(|error| WorldPortError::nbt(format!("zlib: {error}")))
+    })
 }
 
 /// One chunk encoded for the Java region writer.
@@ -345,13 +364,12 @@ fn convert_position(
     // region writer meant allocating (and holding) a fresh buffer per chunk;
     // compressing here lets one buffer serve every chunk and keeps only the
     // compressed bytes resident.
-    let level = Compression::new(compression_level);
     let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
     profiler.start();
     je_nbt::encode_into(&mut scratch, "", &nbt)?;
     profiler.stop(crate::convert::profile::encode);
     profiler.start();
-    let payload = crate::je::anvil::compress(RegionCompression::Zlib, &scratch, level)?;
+    let payload = compress_chunk(&scratch, compression_level)?;
     profiler.stop(crate::convert::profile::compress);
     let entities = if entities.is_empty() {
         None
@@ -362,11 +380,7 @@ fn convert_position(
             ("Position", NbtTag::IntArray(vec![pos.x, pos.z])),
         ]);
         je_nbt::encode_into(&mut scratch, "", &entity_chunk)?;
-        Some(crate::je::anvil::compress(
-            RegionCompression::Zlib,
-            &scratch,
-            level,
-        )?)
+        Some(compress_chunk(&scratch, compression_level)?)
     };
     // Keep a modest buffer; a pathological chunk must not pin a huge one.
     if scratch.capacity() > 8 * 1024 * 1024 {
@@ -396,18 +410,13 @@ fn read_chunk(
     report: &mut ReportBuilder,
     profiler: &mut crate::convert::profile::Profiler,
 ) -> Result<Option<(NbtTag, Vec<NbtTag>)>> {
-    // Only fetch the records this conversion was asked to convert: a skipped
-    // category should not cost a point lookup and its ordering work.
-    let selection = bedrock_world::ChunkSnapshotSelection {
+    let selection = ChunkSnapshotSelection {
         entities: features.entities,
         block_entities: features.block_entities,
         pending_ticks: features.ticks,
         hardcoded_spawn_areas: features.chunk_metadata,
     };
     let (chunk, biome_data) = world.chunk_snapshot_selected(pos, selection)?;
-    // Everything below is CPU work on already-read records.
-    profiler.mark_mapping_start();
-    let biomes = biome_data.map(|data| data.storages);
     // Actor records live under their own keys (digp + actorprefix), outside the
     // chunk record batch, so they are read once here: the keep/drop decision
     // below needs to know whether the chunk holds entities, and the entity
@@ -417,13 +426,14 @@ fn read_chunk(
     } else {
         Vec::new()
     };
+    profiler.mark_mapping_start();
+    let biomes = biome_data.map(|data| data.storages);
     // Minimum build height of the target dimension: Java heightmaps are
     // relative to it and `yPos` is its section index.
     let min_y = pos.y_range(ChunkVersion::New).0;
     let mut sections: Vec<NbtTag> = Vec::new();
     // Heightmaps start at "no block yet", which is the minimum height itself.
-    let mut height_map_blocking = [0_i16; 256];
-    let mut height_map_surface = [0_i16; 256];
+    let mut height_map = [0_i16; 256];
     let mut any_blocks = false;
 
     // Union of subchunk layers and biome storages decides which sections to emit.
@@ -493,8 +503,11 @@ fn read_chunk(
                     .collect()
             });
             let mut mapped_slots = vec![u32::MAX; states.len() * 2];
+            let mut block_count = 0;
+            let section_bottom = i16::from(section_y) * 16;
             for x in 0..16_usize {
                 for z in 0..16_usize {
+                    let mut column_height = 0;
                     for local_y in 0..16_usize {
                         let offset = x * 256 + z * 16 + local_y;
                         let Some(state_index) = packed.get(offset).copied() else {
@@ -525,17 +538,15 @@ fn read_chunk(
                         }
                         indices[(local_y << 8) | (z << 4) | x] =
                             u16::try_from(mapped - 1).unwrap_or(0);
-                        section_has_blocks = true;
-                        report.counters().blocks += 1;
-                        let world_y = i32::from(section_y) * 16 + local_y as i32;
-                        let column = z * 16 + x;
-                        height_map_blocking[column] =
-                            height_map_blocking[column].max(i16::try_from(world_y + 1).unwrap_or(0));
-                        height_map_surface[column] =
-                            height_map_surface[column].max(i16::try_from(world_y + 1).unwrap_or(0));
+                        block_count += 1;
+                        column_height = section_bottom + local_y as i16 + 1;
                     }
+                    let height = &mut height_map[z * 16 + x];
+                    *height = (*height).max(column_height);
                 }
             }
+            report.counters().blocks += block_count;
+            section_has_blocks = block_count != 0;
         }
 
         // Standalone fluids (no primary block) come from the liquid layer.
@@ -623,11 +634,12 @@ fn read_chunk(
         NbtTag::String(target.status().to_string()),
     );
     root.insert("sections".to_string(), tag_list(sections));
+    let heights = packed_heightmap(&height_map, min_y);
     root.insert(
         "Heightmaps".to_string(),
         compound([
-            ("MOTION_BLOCKING", packed_heightmap(&height_map_blocking, min_y)),
-            ("WORLD_SURFACE", packed_heightmap(&height_map_surface, min_y)),
+            ("MOTION_BLOCKING", heights.clone()),
+            ("WORLD_SURFACE", heights),
         ]),
     );
     root.insert("isLightOn".to_string(), NbtTag::Byte(0));
@@ -1001,7 +1013,20 @@ fn write_players(
 ) -> Result<Option<[i32; 4]>> {
     let ids = world.players()?;
     let mut chosen: Option<[i32; 4]> = None;
+    // Only the local player is converted.
+    //
+    // A Bedrock world also stores `player_<xuid>` records, but those are
+    // identities the game created when that account joined a server. Nothing in
+    // the world maps an XUID to a Java UUID, and inventing one (by hashing the
+    // key, as this used to do) produces a player file that no launcher will ever
+    // load and that no other tool can match to the original account. Converting
+    // only the local player keeps the promise honest; the rest are reported.
+    let mut server_players = 0_u64;
     for id in &ids {
+        if !matches!(id, bedrock_world::PlayerId::Local) {
+            server_players += 1;
+            continue;
+        }
         let Some(player) = world.player(id)? else {
             continue;
         };
@@ -1013,7 +1038,11 @@ fn write_players(
             .storage_key()
             .map(|key| key.to_vec())
             .unwrap_or_default();
-        let uuid = crate::player::offline_uuid(&key);
+        // The file name and the NBT `UUID` must agree, so resolve the identity
+        // once: a UUID carried over from the Java source wins, and the derived
+        // hash is only the fallback for players Bedrock created itself.
+        let uuid = crate::player::java_uuid_of(&player.nbt)
+            .unwrap_or_else(|| crate::player::offline_uuid(&key));
         let java = crate::player::bedrock_to_java(&player.nbt, uuid, target.data_version);
         let path = target
             .players_dir(root)
@@ -1021,6 +1050,15 @@ fn write_players(
         je_nbt::write_gzip(&path, "", &java)?;
         report.counters().players += 1;
         chosen.get_or_insert(uuid);
+    }
+    if server_players > 0 {
+        report.warn(
+            WarningCode::UnsupportedFeature,
+            "server-players",
+            format!(
+                "{server_players} server player record(s) were not converted: an Xbox                  identity has no Java UUID to map to"
+            ),
+        );
     }
     if chosen.is_none() && !ids.is_empty() {
         report.warn(
@@ -1295,10 +1333,9 @@ fn write_java_level(
     root.insert("WasModded".to_string(), NbtTag::Byte(0));
     root.insert("ServerBrands".to_string(), tag_list(vec![tag_string("vanilla")]));
     root.insert("LastPlayed".to_string(), NbtTag::Long(0));
-    root.insert(
-        "singleplayer_uuid".to_string(),
-        NbtTag::IntArray(player_uuid.unwrap_or([0, 0, 0, 0]).to_vec()),
-    );
+    if target.split_data && let Some(uuid) = player_uuid {
+        root.insert("singleplayer_uuid".to_string(), NbtTag::IntArray(uuid.to_vec()));
+    }
     root.insert("version".to_string(), NbtTag::Int(19133));
 
     // Gamerules: Bedrock flat keys -> Java names (legacy names before 26.1,
@@ -1395,59 +1432,15 @@ fn write_java_level(
         root.insert("DayTime".to_string(), NbtTag::Long(current_tick));
     }
 
+    let mut world_gen = java_worldgen(level.root.get_int("RandomSeed").unwrap_or(0));
+    if !target.split_data {
+        root.insert("WorldGenSettings".into(), NbtTag::Compound(std::mem::take(&mut world_gen)));
+    }
     let level_dat_path = world_root.join("level.dat");
     je_nbt::write_gzip(&level_dat_path, "", &compound([("Data", NbtTag::Compound(root))]))?;
 
     if target.split_data {
         // 26.x split world data files.
-        let mut world_gen = IndexMap::new();
-        world_gen.insert(
-            "seed".to_string(),
-            NbtTag::Long(level.root.get_int("RandomSeed").unwrap_or(0)),
-        );
-        world_gen.insert("generate_structures".to_string(), NbtTag::Byte(1));
-        world_gen.insert("bonus_chest".to_string(), NbtTag::Byte(0));
-        world_gen.insert(
-            "dimensions".to_string(),
-            compound([
-                (
-                    "minecraft:overworld",
-                    compound([
-                        ("type", tag_string("minecraft:overworld")),
-                        (
-                            "generator",
-                            compound([("type", tag_string("minecraft:noise"))]),
-                        ),
-                    ]),
-                ),
-                (
-                    "minecraft:the_nether",
-                    compound([
-                        ("type", tag_string("minecraft:the_nether")),
-                        (
-                            "generator",
-                            compound([
-                                ("type", tag_string("minecraft:noise")),
-                                ("settings", tag_string("minecraft:nether")),
-                            ]),
-                        ),
-                    ]),
-                ),
-                (
-                    "minecraft:the_end",
-                    compound([
-                        ("type", tag_string("minecraft:the_end")),
-                        (
-                            "generator",
-                            compound([
-                                ("type", tag_string("minecraft:noise")),
-                                ("settings", tag_string("minecraft:end")),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ]),
-        );
         write_split(&data_dir, "world_gen_settings", world_gen, target.data_version)?;
 
         // Bedrock omits `dofiretick` unless it was toggled; a missing key means
@@ -1466,8 +1459,8 @@ fn write_java_level(
         write_split(&data_dir, "game_rules", rules, target.data_version)?;
 
         let mut weather = IndexMap::new();
-        weather.insert("raining".to_string(), tag_string(rain.to_string()));
-        weather.insert("thundering".to_string(), tag_string(thunder.to_string()));
+        weather.insert("raining".to_string(), NbtTag::Byte(i8::from(rain)));
+        weather.insert("thundering".to_string(), NbtTag::Byte(i8::from(thunder)));
         weather.insert("rain_time".to_string(), NbtTag::Int(rain_time));
         weather.insert("thunder_time".to_string(), NbtTag::Int(thunder_time));
         weather.insert("clear_weather_time".to_string(), NbtTag::Int(0));
@@ -1487,6 +1480,35 @@ fn write_java_level(
 
     let _ = plan;
     Ok(())
+}
+
+fn java_worldgen(seed: i64) -> IndexMap<String, NbtTag> {
+    let mut dimensions = IndexMap::new();
+    for (dimension, settings) in [
+        ("minecraft:overworld", "minecraft:overworld"),
+        ("minecraft:the_nether", "minecraft:nether"),
+        ("minecraft:the_end", "minecraft:end"),
+    ] {
+        let biome_source = if dimension == "minecraft:the_end" {
+            compound([("type", tag_string("minecraft:the_end"))])
+        } else {
+            compound([("type", tag_string("minecraft:multi_noise")), ("preset", tag_string(settings))])
+        };
+        dimensions.insert(dimension.to_owned(), compound([
+            ("type", tag_string(dimension)),
+            ("generator", compound([
+                ("type", tag_string("minecraft:noise")),
+                ("settings", tag_string(settings)),
+                ("biome_source", biome_source),
+            ])),
+        ]));
+    }
+    IndexMap::from([
+        ("seed".into(), NbtTag::Long(seed)),
+        ("generate_structures".into(), NbtTag::Byte(1)),
+        ("bonus_chest".into(), NbtTag::Byte(0)),
+        ("dimensions".into(), NbtTag::Compound(dimensions)),
+    ])
 }
 
 fn write_split(
