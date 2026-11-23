@@ -69,7 +69,7 @@ impl RegionCache {
             self.open.insert(
                 path.to_path_buf(),
                 CachedRegion {
-                    region: RegionFile::open(path, false)?,
+                    region: RegionFile::open_read_only(path)?,
                     last_used: clock,
                 },
             );
@@ -399,7 +399,7 @@ impl JavaWorld {
     pub fn chunk_positions(&self, dimension: JeDimension) -> Result<Vec<JeChunkPos>> {
         let mut positions = Vec::new();
         for (region_x, region_z, path) in self.region_files(dimension)? {
-            let region = RegionFile::open(&path, false)?;
+            let region = RegionFile::open_read_only(&path)?;
             for (local_x, local_z) in region.occupied_slots() {
                 positions.push(JeChunkPos::new(
                     region_x * 32 + i32::from(local_x),

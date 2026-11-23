@@ -68,6 +68,26 @@ pub struct RegionFile {
 }
 
 impl RegionFile {
+    /// Opens a region file for reading only.
+    ///
+    /// A read-only world directory, a read-only medium or a file without write
+    /// permission could not be opened by [`Self::open`], which requests write
+    /// access because it also serves writers.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let file = io_result(path, File::options().read(true).open(path))?;
+        let length = io_result(path, file.metadata())?.len();
+        let mut this = Self {
+            path: path.to_path_buf(),
+            file,
+            locations: [Location::default(); SLOTS],
+            timestamps: [0; SLOTS],
+            header_dirty: false,
+            next_sector: u32::try_from(length.div_ceil(SECTOR_BYTES)).unwrap_or(u32::MAX),
+        };
+        this.read_header()?;
+        Ok(this)
+    }
+
     /// Opens a region file, creating an empty one when `create` is set.
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         let exists = path.exists();
@@ -78,8 +98,9 @@ impl RegionFile {
             ));
         }
         let file = if exists {
-            // A reader that never writes must not request write access: it
-            // fails on read-only media and takes an exclusive lock needlessly.
+            // Readers and writers share this constructor, and a writer appends
+            // to an existing file, so write access is requested here. A
+            // read-only source needs `open_read_only`.
             io_result(path, File::options().read(true).write(true).open(path))?
         } else {
             let file = io_result(
@@ -154,6 +175,16 @@ impl RegionFile {
         }
         let compression = header[4];
         let payload_len = length - 1;
+        // The declared length must fit the sectors the header allocated for
+        // this chunk. Without this check a corrupt or hostile `.mca` can make
+        // the reader allocate an arbitrary buffer before the read fails.
+        let capacity = u64::from(location.sector_count) * SECTOR_BYTES;
+        if u64::try_from(length).unwrap_or(u64::MAX) > capacity {
+            return Err(WorldPortError::nbt(format!(
+                "chunk at {},{} declares {length} bytes but its header allocates {capacity}",
+                local_x, local_z
+            )));
+        }
         let mut compressed = vec![0_u8; payload_len];
         self.file
             .read_exact(&mut compressed)
@@ -429,15 +460,42 @@ pub fn compress(kind: RegionCompression, payload: &[u8], level: Compression) -> 
     }
 }
 
+/// Largest decompressed chunk the reader accepts.
+///
+/// A real chunk is a few hundred KiB; the cap stops a decompression bomb from
+/// expanding a tiny `.mca` entry into gigabytes before NBT parsing fails.
+const MAX_DECOMPRESSED_CHUNK: u64 = 64 * 1024 * 1024;
+
 fn decompress(path: &Path, compression: u8, payload: &[u8]) -> Result<Vec<u8>> {
     let mut decoded = Vec::with_capacity(payload.len().saturating_mul(3).max(1024));
+    let mut bounded = |decoded: &mut Vec<u8>| -> Result<()> {
+        // `take` stops the decoder at the cap instead of reading everything and
+        // checking afterwards.
+        if decoded.len() as u64 >= MAX_DECOMPRESSED_CHUNK {
+            return Err(WorldPortError::nbt(format!(
+                "chunk in {} decompresses beyond {MAX_DECOMPRESSED_CHUNK} bytes",
+                path.display()
+            )));
+        }
+        Ok(())
+    };
     match compression {
-        1 => GzDecoder::new(payload)
-            .read_to_end(&mut decoded)
-            .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?,
-        2 => ZlibDecoder::new(payload)
-            .read_to_end(&mut decoded)
-            .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?,
+        1 => {
+            let mut reader =
+                GzDecoder::new(payload).take(MAX_DECOMPRESSED_CHUNK);
+            reader
+                .read_to_end(&mut decoded)
+                .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?;
+            bounded(&mut decoded)?;
+        }
+        2 => {
+            let mut reader =
+                ZlibDecoder::new(payload).take(MAX_DECOMPRESSED_CHUNK);
+            reader
+                .read_to_end(&mut decoded)
+                .map_err(|error| WorldPortError::io(path, std::io::Error::other(error)))?;
+            bounded(&mut decoded)?;
+        }
         3 => return Ok(payload.to_vec()),
         other => {
             return Err(WorldPortError::unsupported(format!(
@@ -481,6 +539,67 @@ mod tests {
             region.read_chunk(31, 31).expect("read").as_deref(),
             Some(second.as_slice())
         );
+    }
+
+    #[test]
+    fn read_only_constructor_opens_a_write_protected_file() {
+        let dir = std::env::temp_dir().join("worldport-region-readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("r.0.0.mca");
+
+        // Write a region normally, then drop write permission on the file.
+        write_region_file(
+            &path,
+            vec![(0, 0, crate::je::nbt::encode("", &crate::nbt::compound([
+                ("xPos", bedrock_nbt::NbtTag::Int(0)),
+            ])).expect("encode"))],
+            Compression::new(1),
+        )
+        .expect("write region");
+
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+
+        // `open(.., false)` asks for write access and would fail here; the
+        // read-only constructor must still open and read the chunk.
+        let mut region = RegionFile::open_read_only(&path).expect("open read only");
+        assert!(region.read_chunk(0, 0).expect("read").is_some());
+
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&path, permissions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn declared_length_beyond_the_allocated_sectors_is_rejected() {
+        let dir = std::env::temp_dir().join("worldport-region-oversize");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("r.0.0.mca");
+        write_region_file(
+            &path,
+            vec![(0, 0, vec![0_u8; 32])],
+            Compression::new(1),
+        )
+        .expect("write region");
+
+        // Rewrite the chunk's length prefix to claim far more than one sector.
+        let mut bytes = std::fs::read(&path).expect("read file");
+        let header = 4096_usize * 2;
+        bytes[header..header + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("write file");
+
+        let mut region = RegionFile::open_read_only(&path).expect("open");
+        let error = region.read_chunk(0, 0).expect_err("must reject");
+        assert!(
+            error.to_string().contains("header allocates"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

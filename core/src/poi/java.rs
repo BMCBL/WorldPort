@@ -168,7 +168,7 @@ pub fn encode_chunk(chunk: &PoiChunk, data_version: i32) -> Result<Vec<u8>> {
 ///
 /// Returns `(local_x, local_z, chunk)` in slot order.
 pub fn read_region(path: &Path) -> Result<Vec<(u8, u8, PoiChunk)>> {
-    let mut region = RegionFile::open(path, false)?;
+    let mut region = RegionFile::open_read_only(path)?;
     let mut chunks = Vec::new();
     for (local_x, local_z) in region.occupied_slots() {
         if let Some(chunk) = read_chunk(&mut region, local_x, local_z)? {
