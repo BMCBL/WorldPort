@@ -84,6 +84,12 @@ impl Instance {
         batch.events.into_iter().map(|item| item.event).collect()
     }
 
+    fn cancel(&self, request: u64) {
+        let cancel = api().cancel_command.expect("cancel_command");
+        // SAFETY: the instance belongs to this test and remains alive.
+        assert_eq!(unsafe { cancel(self.id, request) }, abi::OK);
+    }
+
     fn wait_for(&self, mut matches: impl FnMut(&Event) -> bool) -> Event {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -193,8 +199,32 @@ fn abi_converts_a_fixture_world() {
     assert!(!running);
     assert!(last_report.is_some_and(|report| report.chunks >= 1));
 
+    let cancelled_target = temp_dir("cancelled");
+    instance.submit(4, &Command::Start {
+        request: request(&target, &cancelled_target, Edition::Java),
+    });
+    instance.cancel(4);
+    let cancelled = instance.wait_for(|event| matches!(
+        event, Event::Cancelled | Event::Finished { .. } | Event::Failed { .. }
+    ));
+    assert!(matches!(cancelled, Event::Cancelled), "{cancelled:?}");
+
+    let java_target = temp_dir("je-no-players");
+    let mut no_players = request(&target, &java_target, Edition::Java);
+    no_players.features.players = false;
+    instance.submit(5, &Command::Start { request: no_players });
+    let finished = instance.wait_for(|event| matches!(event, Event::Finished { .. } | Event::Failed { .. }));
+    let Event::Finished { report } = finished else {
+        panic!("Bedrock to Java conversion failed: {finished:?}");
+    };
+    assert_eq!(report.players, 0);
+    let java = worldport_core::je::world::JavaWorld::open(&java_target).expect("converted Java world");
+    assert!(java.player_files().expect("player files").is_empty());
+
     drop(instance);
     assert!(WAKES.load(Ordering::Relaxed) > 0, "events woke the host");
     let _ = std::fs::remove_dir_all(&source);
     let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&java_target);
+    let _ = std::fs::remove_dir_all(&cancelled_target);
 }

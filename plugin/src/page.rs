@@ -11,14 +11,14 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
         return View::column().full_width().finish();
     }
     let mut page = View::column().full_width().gap(12).padding(0);
-    page = page
-        .child(header(state))
-        .child(source_panel(state))
-        .child(target_panel(state));
-    if let Some(info) = &state.info {
-        page = page.child(info_card(info));
+    page = page.child(header(state));
+    if !state.native_ready() {
+        page = page.child(native_setup(state));
     }
-    page = page.child(content_panel(state));
+    page = page
+        .child(source_panel(state))
+        .child(target_panel(state))
+        .child(content_panel(state));
     if state.show_advanced {
         page = page.child(advanced_panel(state));
     }
@@ -32,9 +32,6 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
     if let Some(feedback) = feedback(state) {
         page = page.child(feedback);
     }
-    if !state.native_ready() && state.digest.is_none() {
-        page = page.child(native_setup(state));
-    }
     if !state.log.is_empty() {
         page = page.child(log_panel(state));
     }
@@ -44,9 +41,12 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
 fn header(state: &State) -> View {
     let status = match &state.native {
         Native::Ready(_) => ("原生组件已就绪", ThemeToken::Accent),
+        Native::Resolving(_) => ("正在识别宿主平台", ThemeToken::SecondaryText),
         Native::Loading(_) => ("正在加载原生组件", ThemeToken::SecondaryText),
         Native::Creating(..) => ("正在创建会话", ThemeToken::SecondaryText),
-        Native::Missing if state.digest.is_some() => ("原生组件待加载", ThemeToken::SecondaryText),
+        Native::Missing if state.digest.is_some() || state.platform.is_none() => {
+            ("原生组件待加载", ThemeToken::SecondaryText)
+        }
         Native::Missing => ("原生组件未配置", ThemeToken::Danger),
     };
     row()
@@ -58,7 +58,7 @@ fn header(state: &State) -> View {
 }
 
 fn source_panel(state: &State) -> View {
-    let mut body = panel().child(heading("plug", "源世界"));
+    let mut body = panel().child(heading("folder", "源存档"));
     body = body.child(
         row()
             .full_width()
@@ -77,13 +77,19 @@ fn source_panel(state: &State) -> View {
     );
     if state.detecting {
         body = body.child(detail("正在读取世界信息…"));
+    } else if let Some(info) = &state.info {
+        body = body.child(info_card(info));
     }
     body.finish_view()
 }
 
 fn target_panel(state: &State) -> View {
-    let java_target = state.direction != "bedrock";
-    let mut body = panel().child(heading("settings", "输出"));
+    let java_target = match state.direction.as_str() {
+        "bedrock" => false,
+        "java" => true,
+        _ => state.info.as_ref().is_none_or(|info| info.edition == "bedrock"),
+    };
+    let mut body = panel().child(heading("settings", "目标存档"));
     body = body.child(
         row()
             .full_width()
@@ -261,11 +267,6 @@ fn advanced_panel(state: &State) -> View {
                     Some(state.compression.to_string()),
                 ))),
         )
-        .child(View::node(checkbox(
-            "覆盖已存在的输出目录",
-            state.overwrite,
-            "overwrite",
-        )))
         .finish_view()
 }
 
@@ -276,13 +277,12 @@ fn actions(state: &State) -> View {
     } else {
         body = body.child(View::node(button("开始转换", "start")));
     }
-    if let Some(report) = &state.report {
+    if state.report.is_some() {
         body = body.child(compact_action(
             "打开输出目录",
             "open-output",
             ThemeToken::SecondaryText,
         ));
-        let _ = report;
     }
     body.finish_view()
 }
@@ -290,6 +290,7 @@ fn actions(state: &State) -> View {
 fn progress_panel(state: &State) -> View {
     let stage = match state.stage.as_str() {
         "terrain" => "转换区块",
+        "chunk-index" => "读取区块索引",
         "maps" => "转换地图",
         "players" => "转换玩家",
         "level.dat" => "写入世界设置",
@@ -358,13 +359,16 @@ fn feedback(state: &State) -> Option<View> {
 }
 
 fn native_setup(state: &State) -> View {
-    panel()
+    let body = panel()
         .background(ThemeToken::Surface)
         .child(heading("alert", "启用原生转换组件"))
         .child(detail(
-            "WorldPort 的文件读写在内置原生组件里完成（Wasm 沙箱没有文件系统）。\
-             先构建 worldport_native.dll，在「设置 → 插件」批准它，再把它的 SHA-256 填到这里。",
-        ))
+            "请在「设置 → 插件 → 权限」批准与当前系统匹配的 WorldPort 原生库。",
+        ));
+    if state.digest.is_some() && !state.show_advanced {
+        return body.finish_view();
+    }
+    body
         .child(
             row()
                 .full_width()

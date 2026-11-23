@@ -1,14 +1,14 @@
 //! WorldPort `.bmcblx` plugin: a converter page registered on BMCBL's tools tab.
 //!
 //! The page only renders and forwards commands. Conversion runs in the
-//! separately approved native module (`worldport_native.dll`) through BMCBL's
+//! separately approved native module for the host platform through BMCBL's
 //! native ABI, because the WebAssembly sandbox has no filesystem access.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use bmcbl_plugin_api::app::Job;
-use bmcbl_plugin_api::native::{self, InstanceHandle, ModuleHandle, RequestId};
+use bmcbl_plugin_api::native::{self, InstanceHandle, ModuleHandle, Platform, RequestId};
 use bmcbl_plugin_api::prelude::*;
 use worldport_protocol::{
     Command, ConversionRequest, Edition, Event, EventBatch, Features, PruningPolicy,
@@ -33,6 +33,7 @@ enum Native {
     /// No digest configured (or the user must approve the library first).
     #[default]
     Missing,
+    Resolving(Job<Platform>),
     Loading(Job<ModuleHandle>),
     Creating(ModuleHandle, Job<InstanceHandle>),
     Ready(InstanceHandle),
@@ -46,6 +47,7 @@ enum Browse {
 
 struct State {
     native: Native,
+    platform: Option<Platform>,
     source: String,
     target: String,
     info: Option<WorldInfo>,
@@ -59,7 +61,6 @@ struct State {
     show_advanced: bool,
     jobs: u32,
     compression: u32,
-    overwrite: bool,
     running: bool,
     stage: String,
     done: u64,
@@ -72,7 +73,7 @@ struct State {
     digest: Option<String>,
     digest_input: String,
     pending: Option<Command>,
-    submit: Option<Job<RequestId>>,
+    submit: Option<(Job<RequestId>, bool)>,
     cancel_job: Option<Job<()>>,
     request: Option<RequestId>,
     read: Option<Job<Vec<u8>>>,
@@ -84,6 +85,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             native: Native::default(),
+            platform: None,
             source: String::new(),
             target: String::new(),
             info: None,
@@ -95,7 +97,6 @@ impl Default for State {
             show_advanced: false,
             jobs: 0,
             compression: 6,
-            overwrite: false,
             running: false,
             stage: String::new(),
             done: 0,
@@ -141,12 +142,7 @@ impl State {
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        self.digest = stored.or_else(|| {
-            option_env!("WORLDPORT_NATIVE_SHA256")
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
+        self.digest = stored;
         self.digest_input = self.digest.clone().unwrap_or_default();
     }
 
@@ -172,18 +168,32 @@ impl State {
     /// Loads the native module when an instance is not available yet.
     fn ensure_native(&mut self) -> PluginResult<()> {
         match &self.native {
-            Native::Ready(_) | Native::Loading(_) | Native::Creating(..) => return Ok(()),
+            Native::Ready(_) | Native::Resolving(_) | Native::Loading(_) | Native::Creating(..) => {
+                return Ok(());
+            }
             Native::Missing => {}
         }
+        let Some(platform) = &self.platform else {
+            self.native = Native::Resolving(native::platform()?);
+            return Ok(());
+        };
         let Some(digest) = self.digest.clone() else {
             return Err(plugin_error(
                 "native-missing",
-                "还没有原生组件摘要：在「设置 → 插件」批准 worldport_native.dll 后，把它的 SHA-256 填到本页。",
+                format!("此插件包没有 {} 的原生组件。请安装匹配的库，并在此页填写它的 SHA-256。", platform_key(platform)),
             ));
         };
         self.note("正在加载原生转换组件");
         self.native = Native::Loading(native::load(&digest)?);
         Ok(())
+    }
+
+    fn native_error(&mut self, message: String) {
+        self.running = false;
+        self.detecting = false;
+        self.stage.clear();
+        self.pending = None;
+        self.problem = Some(message);
     }
 
     fn dispatch(&mut self, command: Command) -> PluginResult<()> {
@@ -207,7 +217,10 @@ impl State {
         }
         let bytes = encode_command(&command)
             .map_err(|error| plugin_error("encode-command", error.to_string()))?;
-        self.submit = Some(native::submit_command(instance, &bytes)?);
+        self.submit = Some((
+            native::submit_command(instance, &bytes)?,
+            matches!(command, Command::Start { .. }),
+        ));
         Ok(())
     }
 
@@ -231,7 +244,7 @@ impl State {
             pruning: PruningPolicy::default(),
             jobs: self.jobs,
             compression_level: self.compression,
-            overwrite: self.overwrite,
+            overwrite: false,
         };
         self.problem = None;
         self.message = Some("正在启动转换…".to_string());
@@ -239,10 +252,21 @@ impl State {
         self.unmapped_total = 0;
         self.report = None;
         self.persist_paths();
-        self.dispatch(Command::Start { request })
+        self.dispatch(Command::Start { request })?;
+        self.request = None;
+        self.running = true;
+        self.stage = "start".to_string();
+        self.done = 0;
+        self.total = 0;
+        Ok(())
     }
 
     fn cancel(&mut self) -> PluginResult<()> {
+        if matches!(self.pending, Some(Command::Start { .. })) {
+            self.pending = None;
+            self.apply_event(Event::Cancelled);
+            return Ok(());
+        }
         if let (Native::Ready(instance), Some(request)) = (&self.native, self.request) {
             self.cancel_job = Some(native::cancel_command(*instance, request)?);
             self.message = Some("正在取消…".to_string());
@@ -305,7 +329,7 @@ impl State {
                 total,
                 message,
             } => {
-                self.running = stage != "start";
+                self.running = true;
                 self.stage = stage;
                 self.done = done;
                 self.total = total;
@@ -334,6 +358,7 @@ impl State {
             }
             Event::Failed { message } => {
                 self.running = false;
+                self.stage.clear();
                 self.problem = Some(message);
             }
             Event::Cancelled => {
@@ -379,7 +404,13 @@ impl Plugin for WorldPort {
             if let PluginEventKind::Action(action) = &event.kind
                 && event.page_id.as_deref().is_none_or(|page| page == PAGE_ID)
             {
-                changed |= handle_action(state, action)?;
+                match handle_action(state, action) {
+                    Ok(action_changed) => changed |= action_changed,
+                    Err(error) => {
+                        state.problem = Some(error.message);
+                        changed = true;
+                    }
+                }
             }
             changed |= advance_jobs(state, &event)?;
             if state.native_ready() && state.read.is_none() {
@@ -405,8 +436,17 @@ fn handle_action(
     action: &bmcbl_plugin_api::ActionEvent,
 ) -> PluginResult<bool> {
     let value = action.value.clone().unwrap_or_default();
+    if state.running && action.action_id != "cancel" {
+        return Ok(false);
+    }
     match action.action_id.as_str() {
-        "source-input" => state.source = value,
+        "source-input" => {
+            if state.source != value {
+                state.source = value;
+                state.info = None;
+                state.version.clear();
+            }
+        }
         "target-input" => state.target = value,
         "browse-source" => {
             state.browse = Some(Browse::Source);
@@ -420,13 +460,16 @@ fn handle_action(
             if state.source.trim().is_empty() {
                 return Err(plugin_error("missing-path", "请先填写源世界目录。"));
             }
-            state.detecting = true;
             state.problem = None;
             state.dispatch(Command::Detect {
                 path: state.source.trim().to_string(),
             })?;
+            state.detecting = true;
         }
-        "direction" => state.direction = value,
+        "direction" => {
+            state.direction = value;
+            state.version.clear();
+        }
         "version" => state.version = value,
         "feature-blocks" => state.features.blocks = value == "true",
         "feature-block-entities" => state.features.block_entities = value == "true",
@@ -440,7 +483,6 @@ fn handle_action(
         "advanced" => state.show_advanced = !state.show_advanced,
         "jobs" => state.jobs = value.parse().unwrap_or(0),
         "compression" => state.compression = value.parse().unwrap_or(6),
-        "overwrite" => state.overwrite = value == "true",
         "start" => state.start()?,
         "cancel" => state.cancel()?,
         "open-output" => {
@@ -452,15 +494,21 @@ fn handle_action(
         }
         "digest-input" => state.digest_input = value,
         "save-digest" => {
+            if !matches!(state.native, Native::Missing) {
+                return Ok(false);
+            }
             let digest = state.digest_input.trim().to_string();
             if digest.is_empty() {
                 let _ = storage_delete(STORAGE_DIGEST);
-                state.digest = None;
+                state.digest = state.platform.as_ref().and_then(packaged_digest);
             } else {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(plugin_error("invalid-digest", "SHA-256 必须包含 64 个十六进制字符。"));
+                }
+                let digest = digest.to_ascii_lowercase();
                 storage_set(STORAGE_DIGEST, &digest)?;
                 state.digest = Some(digest);
             }
-            state.native = Native::Missing;
             state.message = Some("已保存原生组件摘要".to_string());
         }
         other => {
@@ -486,16 +534,87 @@ fn handle_action(
     Ok(true)
 }
 
+fn platform_key(platform: &Platform) -> String {
+    format!("{}-{}-{}", platform.os, platform.arch, platform.environment)
+}
+
+fn packaged_digest(platform: &Platform) -> Option<String> {
+    digest_for_platform(option_env!("WORLDPORT_NATIVE_COMPONENTS")?, &platform_key(platform))
+        .map(str::to_owned)
+}
+
+fn digest_for_platform<'a>(components: &'a str, key: &str) -> Option<&'a str> {
+    components.lines()
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(platform, digest)| (platform == key).then_some(digest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, PAGE_ID, ReportSummary, State, ViewNode, digest_for_platform, page};
+
+    #[test]
+    fn selects_by_os_architecture_and_abi() {
+        let components = "linux-x86_64-gnu=linux\nwindows-x86_64-msvc=windows\nwindows-aarch64-msvc=arm";
+        assert_eq!(digest_for_platform(components, "windows-x86_64-msvc"), Some("windows"));
+        assert_eq!(digest_for_platform(components, "windows-aarch64-msvc"), Some("arm"));
+        assert_eq!(digest_for_platform(components, "linux-x86_64-musl"), None);
+    }
+
+    #[test]
+    fn reopening_tool_shows_latest_progress_and_result() {
+        let mut state = State::default();
+        state.apply_event(Event::Stage {
+            stage: "terrain".to_owned(),
+            done: 47,
+            total: 100,
+            message: String::new(),
+        });
+        assert!(!page::render(&state, "another-page")
+            .nodes
+            .iter()
+            .any(|node| matches!(node, ViewNode::Progress(_))));
+        assert!(page::render(&state, PAGE_ID).nodes.iter().any(|node| {
+            matches!(node, ViewNode::Progress(progress) if progress.value == 47 && progress.total == Some(100))
+        }));
+
+        state.apply_event(Event::Cancelled);
+        assert!(!page::render(&state, PAGE_ID)
+            .nodes
+            .iter()
+            .any(|node| matches!(node, ViewNode::Progress(_))));
+
+        state.apply_event(Event::State {
+            running: false,
+            stage: String::new(),
+            done: 100,
+            total: 100,
+            warnings: Vec::new(),
+            last_report: Some(ReportSummary::default()),
+        });
+        assert!(page::render(&state, PAGE_ID).nodes.iter().any(|node| {
+            matches!(node, ViewNode::Button(button) if button.action_id == "open-output")
+        }));
+    }
+}
+
 fn advance_jobs(state: &mut State, event: &PluginEvent) -> PluginResult<bool> {
     let mut changed = false;
     // Native lifecycle.
     changed |= advance_lifecycle(state, event)?;
-    if state.submit.as_ref().is_some_and(|job| job.is_ready(event)) {
-        let job = state.submit.take().expect("matched submit job");
+    if state.submit.as_ref().is_some_and(|(job, _)| job.is_ready(event)) {
+        let (job, start) = state.submit.take().expect("matched submit job");
         match job.try_take() {
-            Ok(Some(request)) => state.request = Some(request),
-            Ok(None) => {}
-            Err(error) => state.problem = Some(format!("提交原生命令失败：{}", error.message)),
+            Ok(Some(request)) if start => state.request = Some(request),
+            Ok(_) => {}
+            Err(error) => {
+                if start {
+                    state.running = false;
+                    state.stage.clear();
+                }
+                state.detecting = false;
+                state.problem = Some(format!("提交原生命令失败：{}", error.message));
+            }
         }
         changed = true;
     }
@@ -531,6 +650,21 @@ fn advance_jobs(state: &mut State, event: &PluginEvent) -> PluginResult<bool> {
 fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<bool> {
     let native = std::mem::replace(&mut state.native, Native::Missing);
     match native {
+        Native::Resolving(job) if job.is_ready(event) => {
+            match job.try_take() {
+                Ok(Some(platform)) => {
+                    state.digest = packaged_digest(&platform).or(state.digest.take());
+                    state.digest_input = state.digest.clone().unwrap_or_default();
+                    state.platform = Some(platform);
+                    if state.pending.is_some() && let Err(error) = state.ensure_native() {
+                        state.native_error(error.message);
+                    }
+                }
+                Ok(None) => state.native = Native::Resolving(job),
+                Err(error) => state.native_error(format!("检测宿主平台失败：{}", error.message)),
+            }
+            Ok(true)
+        }
         Native::Loading(job) if job.is_ready(event) => {
             match job.try_take() {
                 Ok(Some(module)) => {
@@ -539,8 +673,8 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 }
                 Ok(None) => state.native = Native::Loading(job),
                 Err(error) => {
-                    state.problem = Some(format!(
-                        "加载原生组件失败（先在设置里批准 worldport_native.dll）：{}",
+                    state.native_error(format!(
+                        "加载原生组件失败（请在设置里批准当前平台的库）：{}",
                         error.message
                     ));
                 }
@@ -556,7 +690,7 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 Ok(None) => state.native = Native::Creating(module, job),
                 Err(error) => {
                     let _ = native::unload(module);
-                    state.problem = Some(format!("创建原生会话失败：{}", error.message));
+                    state.native_error(format!("创建原生会话失败：{}", error.message));
                 }
             }
             Ok(true)
@@ -569,20 +703,11 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
 }
 
 fn suggest_target(source: &str, info: &WorldInfo) -> String {
-    let path = std::path::Path::new(source);
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("world");
     let suffix = if info.edition == "java" {
         "bedrock"
     } else {
         "java"
     };
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-    parent
-        .join(format!("{name}-{suffix}"))
-        .display()
-        .to_string()
+    // The guest receives host paths, including Windows backslashes.
+    format!("{}-{suffix}", source.trim_end_matches(['\\', '/']))
 }

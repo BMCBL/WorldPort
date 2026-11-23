@@ -25,7 +25,7 @@ id = "worldport"
 name = "WorldPort"
 description = "Bedrock 与 Java 世界双向转换：方块、方块实体、实体与完整 NBT、地图、计划刻"
 tags = ["world", "converter", "bedrock", "java"]
-capabilities = ["ui.page", "toast"]
+capabilities = ["ui.page", "storage.kv", "toast"]
 readme = "README.md"
 icon = "assets/icon.png"
 

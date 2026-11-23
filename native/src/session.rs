@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,10 +35,6 @@ const EVENTS: usize = 256;
 const EVENTS_PER_BATCH: usize = 32;
 /// Minimum interval between two progress events.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
-
-struct Request {
-    command: Vec<u8>,
-}
 
 #[derive(Default)]
 struct PendingEvents {
@@ -124,9 +120,10 @@ struct SessionState {
 }
 
 pub struct Session {
-    inbox: Sender<Request>,
+    inbox: SyncSender<Command>,
     pub(crate) events: Arc<Events>,
     cancel: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<u64>>>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -134,10 +131,11 @@ pub struct Session {
 impl Session {
     /// Starts the worker thread for one instance.
     pub fn start(wake: EventWake) -> std::io::Result<Self> {
-        let (inbox, receiver) = channel::<Request>();
+        let (inbox, receiver) = sync_channel::<Command>(COMMANDS);
         let events = Arc::new(Events::new(wake));
         let state = Arc::new(Mutex::new(SessionState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let worker = std::thread::Builder::new()
             .name("worldport-native".into())
@@ -145,13 +143,14 @@ impl Session {
                 let events = Arc::clone(&events);
                 let state = Arc::clone(&state);
                 let cancel = Arc::clone(&cancel);
+                let active = Arc::clone(&active);
                 let stop = Arc::clone(&stop);
                 move || {
                     while !stop.load(Ordering::Relaxed) {
                         let Ok(request) = receiver.recv() else {
                             break;
                         };
-                        run(&events, &state, &cancel, &stop, request);
+                        run(&events, &state, &cancel, &active, request);
                     }
                 }
             })?;
@@ -159,6 +158,7 @@ impl Session {
             inbox,
             events,
             cancel,
+            active,
             stop,
             worker: Some(worker),
         })
@@ -166,24 +166,42 @@ impl Session {
 
     /// Queues a command for the worker.
     pub fn submit(&self, request: u64, command: &[u8]) -> i32 {
-        match decode_command(command) {
-            Ok(Command::Cancel) => {
-                self.cancel.store(true, Ordering::Relaxed);
-                abi::OK
+        let Ok(command) = decode_command(command) else {
+            return abi::INVALID_ARGUMENT;
+        };
+        if matches!(command, Command::Cancel) {
+            self.cancel.store(true, Ordering::Relaxed);
+            return abi::OK;
+        }
+        let is_start = matches!(command, Command::Start { .. });
+        let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if is_start {
+            if active.is_some() {
+                return abi::BUSY;
             }
-            Ok(_) => self
-                .inbox
-                .send(Request {
-                    command: command.to_vec(),
-                })
-                .map_or(abi::CLOSED, |()| abi::OK),
-            Err(_) => abi::INVALID_ARGUMENT,
+            self.cancel.store(false, Ordering::Relaxed);
+            *active = Some(request);
+        }
+        match self.inbox.try_send(command) {
+            Ok(()) => abi::OK,
+            Err(error) => {
+                if is_start {
+                    *active = None;
+                }
+                match error {
+                    TrySendError::Full(_) => abi::BUSY,
+                    TrySendError::Disconnected(_) => abi::CLOSED,
+                }
+            }
         }
     }
 
     /// Requests cancellation of the running conversion.
-    pub fn cancel(&self, _request: u64) -> i32 {
-        self.cancel.store(true, Ordering::Relaxed);
+    pub fn cancel(&self, request: u64) -> i32 {
+        let active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if *active == Some(request) {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
         abi::OK
     }
 
@@ -203,15 +221,9 @@ fn run(
     events: &Arc<Events>,
     state: &Arc<Mutex<SessionState>>,
     cancel: &Arc<AtomicBool>,
-    stop: &Arc<AtomicBool>,
-    request: Request,
+    active: &Mutex<Option<u64>>,
+    command: Command,
 ) {
-    let Ok(command) = decode_command(&request.command) else {
-        events.publish(Event::Failed {
-            message: "无法解析原生命令。".to_string(),
-        });
-        return;
-    };
     match command {
         Command::BrowseSource => match pick_folder("选择要转换的世界目录") {
             Some(path) => events.publish(Event::Picked {
@@ -242,8 +254,8 @@ fn run(
                 }),
             }
         }
-        Command::Start { request } => start_conversion(events, state, cancel, stop, request),
-        Command::Cancel => cancel.store(true, Ordering::Relaxed),
+        Command::Start { request } => start_conversion(events, state, cancel, active, request),
+        Command::Cancel => {}
         Command::Snapshot => {
             let snapshot = state
                 .lock()
@@ -265,25 +277,17 @@ fn start_conversion(
     events: &Arc<Events>,
     state: &Arc<Mutex<SessionState>>,
     cancel: &Arc<AtomicBool>,
-    stop: &Arc<AtomicBool>,
+    active: &Mutex<Option<u64>>,
     request: ConversionRequest,
 ) {
     {
         let mut current = state.lock().unwrap_or_else(|error| error.into_inner());
-        if current.running {
-            drop(current);
-            events.publish(Event::Failed {
-                message: "已有转换正在运行。".to_string(),
-            });
-            return;
-        }
         current.running = true;
         current.stage = "start".to_string();
         current.done = 0;
         current.total = 0;
         current.warnings.clear();
     }
-    cancel.store(false, Ordering::Relaxed);
 
     let target_path = request.target.clone();
     let plan = build_plan(&request);
@@ -302,6 +306,7 @@ fn start_conversion(
     let mut current = state.lock().unwrap_or_else(|error| error.into_inner());
     current.running = false;
     current.stage.clear();
+    *active.lock().unwrap_or_else(|error| error.into_inner()) = None;
     match outcome {
         Ok(report) => {
             let summary = summarize(&report, &target_path, started);
