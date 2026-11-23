@@ -270,6 +270,20 @@ impl RegionFile {
     }
 
     fn read_header(&mut self) -> Result<()> {
+        // A zero-length region file is a normal thing for a game to leave
+        // behind (an entities directory that never received a chunk); treat it
+        // as an empty region rather than an I/O error.
+        let length = io_result(&self.path, self.file.metadata())?.len();
+        if length == 0 {
+            return Ok(());
+        }
+        if length < HEADER_BYTES {
+            return Err(WorldPortError::nbt(format!(
+                "region file {} is {} bytes, shorter than the {HEADER_BYTES}-byte header",
+                self.path.display(),
+                length
+            )));
+        }
         let mut header = [0_u8; HEADER_BYTES as usize];
         self.file
             .seek(SeekFrom::Start(0))
@@ -571,6 +585,37 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         let _ = std::fs::set_permissions(&path, permissions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_length_region_file_is_an_empty_region() {
+        // Games leave 0-byte `.mca` files behind (an entities directory that
+        // never received a chunk). That is not corruption.
+        let dir = std::env::temp_dir().join("worldport-region-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("r.0.0.mca");
+        std::fs::write(&path, b"").expect("write empty file");
+
+        let mut region = RegionFile::open_read_only(&path).expect("open empty region");
+        assert!(region.read_chunk(0, 0).expect("read").is_none());
+        assert!(region.occupied_slots().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_header_is_rejected() {
+        let dir = std::env::temp_dir().join("worldport-region-short");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("r.0.0.mca");
+        std::fs::write(&path, vec![0_u8; 100]).expect("write short file");
+
+        let Err(error) = RegionFile::open_read_only(&path) else {
+            panic!("a truncated header must be rejected");
+        };
+        assert!(error.to_string().contains("shorter than"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

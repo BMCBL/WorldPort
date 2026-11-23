@@ -23,7 +23,16 @@ serde_json = "1.0.145"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 bytes = "1.10.1"
 rayon = "1.11.0"
-flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
+# `runtime_detection` enables `zlib-rs/std`, which is what lets zlib-rs call
+# `is_x86_feature_detected!` at all: without `std` every
+# `is_enabled_avx2_and_bmi2()` returns false and its AVX2 inflate path is dead
+# code. It costs nothing when the backend is not zlib-rs.
+#
+# Note that `bedrock-leveldb` requests flate2's `zlib-ng` backend on x86_64 and
+# aarch64, and flate2 prefers `any_c_zlib` over `zlib-rs`, so the backend that
+# actually runs is zlib-ng (which does its own runtime CPU dispatch). The
+# zlib-rs features are kept correct for platforms where zlib-ng is not used.
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 indexmap = { version = "2.12.1", features = ["serde"] }
 rustc-hash = "2.1.1"
 tracing = "0.1.43"
