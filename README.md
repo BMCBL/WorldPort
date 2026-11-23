@@ -61,6 +61,12 @@ cargo run -p worldport-cli -- chunk "<world>" --search --keys
 cargo build --profile native-release -p worldport-cli
 ```
 
+Java 的完整转换最低支持 1.18。更早的存档可用 `inspect --deep` 或 `chunk`
+读取区块及其 NBT。Region 读取支持 `.mca`、`.mcr`、外部 `.mcc`、gzip、zlib、
+原始 NBT 和 Java LZ4 block stream。解压大小上限为 64 MiB。
+JE 模块直接调用 `simd_cesu8` 和 `cesu8` 处理修订 UTF-8，使用 `flate2` 和
+`lz4-java-wrc` 处理压缩。x86-64 与 AArch64 的原生构建使用 zlib-ng 运行时派发。
+
 ## 插件（工具页）
 
 ```powershell
@@ -71,9 +77,11 @@ cargo build --profile native-release -p worldport-cli
 
 - `dist/worldport-0.1.0.bmcblx` —— 导入「下载 → 插件」后，「工具」页出现「世界转换」。
 - `dist/native/windows-x86_64-msvc/worldport_native.dll` —— 在「设置 → 插件」批准。
+- `dist/SHA256SUMS` —— 插件包和原生组件的 SHA-256。
 
-插件把 DLL 的 SHA-256 烘进包内，重新构建 DLL 后要重新打包（脚本会一起做）。
-页面里也能手动填写摘要（`native_sha256` 存在插件 KV，优先于烘入值）。
+插件按 BMCBL 返回的 OS、架构和 ABI 环境选择包内的 SHA-256，再由宿主加载已批准的库。
+打包脚本默认构建当前宿主目标，可通过 `-Targets` 指定具备工具链的 Windows MSVC 或 Linux GNU 目标。
+使用自行构建的动态库时，可以在页面的高级选项中填写摘要。重新导入正式插件包时使用该包附带的摘要。
 
 Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command` 提交命令，
 `read_events` 长轮询事件，取消走 `cancel_command`（越过队列立即生效）。
@@ -247,9 +255,21 @@ Wasm 沙箱没有文件系统，转换在原生组件里执行：`submit_command
 
 ## 性能记录
 
-- 测量脚本：`./scripts/bench.ps1 -World <dir> -Out <dir> -Runs 3`，加 `-Chunker`
-  用同样输入跑官方 CLI。脚本固定同时输出**墙钟时间、峰值工作集、产物大小**——
-  只看速度会把「用内存换时间」的改动当成优化。
+- `scripts/bench.ps1` 在同一份存档副本上轮换执行引擎。每项预热一次，默认实测五次。
+  `-Out` 指定一个新目录，各次转换有独立的输出路径。脚本记录墙钟时间、CPU 时间、
+  Windows 峰值工作集和峰值提交内存，以及输出大小、版本和各维度区块数。
+- 可选引擎是 `Cli`、`Baseline`、`Chunker`、`Dll` 和 `DllSingle`。
+  `-Baseline` 传入改动前单独保留的 release 可执行文件。Chunker 固定使用本地
+  1.21.0 JAR 和 Zulu 21。JE→BE 选 `-Format BEDROCK_R26_60`，BE→JE 选 `JAVA_26_2`。
+  `-ExtraArgs @('--no-maps') -ChunkerSettings '{"mapConversion":false}'` 可对照双方关闭地图物品后的耗时。
+  实际区块数或其他数据范围不同时，结果是同输入耗时比。
+- 用实际打包的原生库进行无头基准时，先编译 ABI runner，再与 CLI 或 Chunker 对照。
+
+  ~~~powershell
+  cargo build --locked --release --manifest-path bench-runner/Cargo.toml
+  ./scripts/bench.ps1 -World '<存档副本>' -Out '<新目录>' -Format JAVA_26_2 -Engines Cli,Dll,DllSingle -DllRunner bench-runner/target/release/worldport-bench-runner.exe -Dll dist/native/windows-x86_64-msvc/worldport_native.dll
+  ~~~
+
 - 内存定位：`World::open` 后 4.2 MiB，列 111,744 个区块坐标 32.4 MiB（并行扫描的
   run 缓冲已按表数收敛），整个 108k 区块转换峰值 276 MiB。Chunker 同任务 3943 MiB
   （JVM 堆上限 8 GB）。

@@ -201,6 +201,11 @@ struct ConvertArgs {
     /// Stop after this many chunks (testing aid).
     #[arg(long)]
     limit_chunks: Option<usize>,
+    /// Which Java player becomes Bedrock's local player (UUID or prefix).
+    ///
+    /// Defaults to the world's own single-player owner, so local maps to local.
+    #[arg(long)]
+    player: Option<String>,
     /// Skip entities (and their NBT).
     #[arg(long)]
     no_entities: bool,
@@ -510,10 +515,14 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
     println!("first        {} ({} chunks)", report.first_name, report.first_chunks);
     println!("second       {} ({} chunks)", report.second_name, report.second_chunks);
     println!("matched      {}", report.matched_chunks);
+    println!("full chunks  {}", report.compared_chunks);
     println!("only first   {}", report.only_first);
     println!("only second  {}", report.only_second);
     println!("differing    {} chunks", report.differing_chunks);
     println!("block diffs  {}", report.block_mismatches);
+    println!("block match  {:.4}% of {} occupied positions ({} source states)",
+        100.0 * report.block_match_ratio(report.compared_non_air_positions),
+        report.compared_non_air_positions, report.first_distinct_block_states);
     println!("biome diffs  {}", report.biome_mismatches);
     println!("entity diffs {}", report.entity_mismatches);
     println!("BE diffs     {}", report.block_entity_mismatches);
@@ -525,6 +534,9 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
         "ticks        {} vs {} ({} differ)",
         report.first_ticks, report.second_ticks, report.tick_mismatches
     );
+    println!("players      {} vs {} ({} differ)", report.first_players, report.second_players, report.player_mismatches);
+    println!("village POI  {} vs {} ({} differ)", report.first_poi, report.second_poi, report.poi_mismatches);
+    println!("structures   {} chunk(s) differ", report.structure_mismatches);
     if !report.level_dat.is_empty() {
         println!("level.dat");
         for (field, left, right) in &report.level_dat {
@@ -567,7 +579,7 @@ fn compare_worlds(args: CompareArgs) -> Result<()> {
 
 fn find_full_chunk(world: &JavaWorld, dimension: JeDimension) -> Result<(i32, i32)> {
     for (region_x, region_z, path) in world.region_files(dimension)? {
-        let mut region = RegionFile::open(&path, false)?;
+        let mut region = RegionFile::open_read_only(&path)?;
         for (local_x, local_z) in region.occupied_slots() {
             let Some(payload) = region.read_chunk(local_x, local_z)? else {
                 continue;
@@ -646,8 +658,9 @@ fn inspect_java(args: &InspectArgs) -> Result<InspectReport> {
             chunks: positions.len(),
         });
         if args.deep {
+            let before = deep.chunks;
             scan_java_chunks(&world, dimension, deep_budget, &mut deep)?;
-            deep_budget = deep_budget.saturating_sub(positions.len());
+            deep_budget -= deep.chunks - before;
         }
     }
     let players = world.player_files()?.len();
@@ -690,11 +703,12 @@ fn scan_java_chunks(
     if budget == 0 {
         return Ok(());
     }
-    for (region_x, region_z, path) in world.region_files(dimension)? {
-        let mut region = RegionFile::open(&path, false)
+    let max_chunks = deep.chunks.saturating_add(budget);
+    for (_, _, path) in world.region_files(dimension)? {
+        let mut region = RegionFile::open_read_only(&path)
             .with_context(|| format!("open {}", path.display()))?;
         for (local_x, local_z) in region.occupied_slots() {
-            if deep.chunks >= budget {
+            if deep.chunks >= max_chunks {
                 return Ok(());
             }
             let Some(payload) = region.read_chunk(local_x, local_z)? else {
@@ -704,7 +718,6 @@ fn scan_java_chunks(
                 continue;
             };
             let summary = summarize_je_chunk(&decoded.tag);
-            let _ = (region_x, region_z);
             deep.chunks += 1;
             deep.sections += u64::from(summary.sections);
             deep.non_empty_sections += u64::from(summary.non_empty_sections);
@@ -858,6 +871,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
     plan.features.chunk_metadata &= !args.no_chunk_metadata;
     plan.overwrite = args.overwrite;
     plan.chunk_limit = args.limit_chunks;
+    plan.player = args.player.clone();
     let options = ConversionOptions::default();
     let report = worldport_core::convert::run(&plan, &options)?;
     let json = serde_json::to_string_pretty(&report)?;
