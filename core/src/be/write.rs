@@ -31,6 +31,9 @@ pub struct BedrockOutput {
     pending: Vec<(Bytes, Bytes)>,
     pending_actors: Vec<(ChunkPos, ActorUid, Bytes)>,
     pending_chunks: usize,
+    /// True when this handle created the world, so every actor in it came from
+    /// this conversion and the global ownership scan can be skipped.
+    fresh_world: bool,
 }
 
 impl BedrockOutput {
@@ -57,6 +60,7 @@ impl BedrockOutput {
             pending: Vec::new(),
             pending_actors: Vec::new(),
             pending_chunks: 0,
+            fresh_world: true,
         })
     }
 
@@ -72,6 +76,7 @@ impl BedrockOutput {
             pending: Vec::new(),
             pending_actors: Vec::new(),
             pending_chunks: 0,
+            fresh_world: false,
         })
     }
 
@@ -116,7 +121,14 @@ impl BedrockOutput {
         if self.pending.is_empty() && self.pending_actors.is_empty() {
             return Ok(());
         }
-        let mut transaction = self.world.transaction();
+        // A world this handle created contains only actors from this
+        // conversion, so the global `digp` ownership scan would re-read the data
+        // being written on every commit batch.
+        let mut transaction = if self.fresh_world {
+            self.world.import_transaction()
+        } else {
+            self.world.transaction()
+        };
         for (key, value) in self.pending.drain(..) {
             transaction.put_raw_key(key, value);
         }
