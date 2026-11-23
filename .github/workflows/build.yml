@@ -107,8 +107,9 @@ jobs:
               digest, name = checksum.read_text(encoding='ascii').split()
               # `worldport-native-abi1-windows-x86_64-msvc.dll` is the registry
               # name; the plugin keys its baked digest table by os-arch-env.
+              # `x86_64` carries an underscore, so the class cannot be `[a-z0-9]`.
               match = re.fullmatch(
-                  r'worldport-native-abi\d+-([a-z0-9]+-[a-z0-9]+-[a-z0-9]+)\.(?:dll|so|dylib)',
+                  r'worldport-native-abi\d+-([a-z0-9_]+-[a-z0-9_]+-[a-z0-9_]+)\.(?:dll|so|dylib)',
                   name,
               )
               assert match, name
