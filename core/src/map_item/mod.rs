@@ -120,7 +120,7 @@ pub fn read_java_map(path: &Path, id: i64) -> Result<MapData> {
     })
 }
 
-/// Writes a Java `map_<id>.dat` file (gzip NBT with a `data` wrapper).
+/// Writes Java `map_<id>.dat` (pre-26.1) or numbered `<id>.dat` (26.1+).
 pub fn write_java_map(
     dir: &Path,
     map: &MapData,
@@ -159,7 +159,13 @@ pub fn write_java_map(
         ("data", data),
         ("DataVersion", NbtTag::Int(data_version)),
     ]);
-    let path = dir.join(format!("map_{}.dat", map.id));
+    // Java 26.1 moved maps to data/minecraft/maps/<id>.dat.
+    let filename = if data_version >= 4786 {
+        format!("{}.dat", map.id)
+    } else {
+        format!("map_{}.dat", map.id)
+    };
+    let path = dir.join(filename);
     je_nbt::write_gzip(&path, "", &root)?;
     Ok(path)
 }
@@ -289,10 +295,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_map_filename_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_java_map(dir.path(), &sample_map(), 4189, true).expect("write");
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("map_7.dat"));
+    }
+
+    #[test]
     fn java_map_file_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let map = sample_map();
         let path = write_java_map(dir.path(), &map, 4903, true).expect("write");
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("7.dat"));
         let back = read_java_map(&path, map.id).expect("read");
         assert_eq!(back.id, map.id);
         assert_eq!(back.scale, map.scale);

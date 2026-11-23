@@ -5,7 +5,7 @@
 //! - pre-1.21: `region/`, `DIM-1/region/`, `DIM1/region/` under the world root;
 //! - 1.21+: `dimensions/minecraft/{overworld,the_nether,the_end}/region/`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use bedrock_nbt::NbtTag;
@@ -506,18 +506,26 @@ impl JavaWorld {
     /// Bedrock map ids are 64-bit and Java's are 32-bit, so the id is read as
     /// `i64` and normalised by the caller when writing Java.
     pub fn map_files(&self) -> Result<Vec<(i64, PathBuf)>> {
-        let mut maps = Vec::new();
-        for dir in [self.maps_dir(), self.root.join("data")] {
+        // 26.1+ stores data/minecraft/maps/<id>.dat; older versions use
+        // data/map_<id>.dat. Prefer the modern copy when both exist.
+        let modern = self.root.join("data").join("minecraft").join("maps");
+        let mut directories = Vec::with_capacity(2);
+        if modern.is_dir() {
+            directories.push((modern, true));
+        }
+        directories.push((self.root.join("data"), false));
+        let mut maps: BTreeMap<i64, PathBuf> = BTreeMap::new();
+        for (dir, numbered) in directories {
             for (stem, path) in read_dat_stems(&dir)? {
-                if let Some(id) = stem.strip_prefix("map_").and_then(|id| id.parse::<i64>().ok())
-                    && !maps.iter().any(|(existing, _)| *existing == id)
-                {
-                    maps.push((id, path));
+                let id = stem.strip_prefix("map_")
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .or_else(|| numbered.then(|| stem.parse::<i64>().ok()).flatten());
+                if let Some(id) = id {
+                    maps.entry(id).or_insert(path);
                 }
             }
         }
-        maps.sort_by_key(|(id, _)| *id);
-        Ok(maps)
+        Ok(maps.into_iter().collect())
     }
 }
 
@@ -574,6 +582,26 @@ fn default_level_name(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_numbered_26x_maps_without_dropping_legacy_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        je_nbt::write_gzip(
+            &dir.path().join("level.dat"),
+            "",
+            &crate::nbt::compound([("Data", crate::nbt::empty_compound())]),
+        ).expect("level.dat");
+        let modern = dir.path().join("data").join("minecraft").join("maps");
+        std::fs::create_dir_all(&modern).expect("modern map directory");
+        let legacy = dir.path().join("data");
+        std::fs::write(modern.join("7.dat"), b"modern").expect("modern map");
+        std::fs::write(legacy.join("map_3.dat"), b"legacy").expect("legacy map");
+        std::fs::write(legacy.join("map_7.dat"), b"duplicate").expect("duplicate map");
+        let world = JavaWorld::open(dir.path()).expect("world");
+        let files = world.map_files().expect("maps");
+        assert_eq!(files.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3, 7]);
+        assert_eq!(files[1].1, modern.join("7.dat"));
+    }
 
     #[test]
     fn parses_region_file_names() {
