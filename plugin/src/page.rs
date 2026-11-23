@@ -19,7 +19,17 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
     let mut page = View::column().full_width().gap(12).padding(0);
     page = page.child(header(state));
     if !state.native_ready() {
+        // Without the native component nothing on this page can work: the sandbox
+        // has no filesystem access, so every control below would only be decoration
+        // that fails on click. Show the one action that matters instead.
         page = page.child(native_setup(state));
+        if let Some(feedback) = feedback(state) {
+            page = page.child(feedback);
+        }
+        if !state.log.is_empty() {
+            page = page.child(log_panel(state));
+        }
+        return page.finish();
     }
     page = page
         .child(source_panel(state))
@@ -454,22 +464,38 @@ fn feedback(state: &State) -> Option<View> {
 }
 
 fn native_setup(state: &State) -> View {
-    let body = panel()
+    let busy = matches!(
+        state.native,
+        Native::Resolving(_)
+            | Native::FetchingRegistry(_)
+            | Native::FetchingRelease(_)
+            | Native::Downloading { .. }
+            | Native::Installing { .. }
+            | Native::Loading(_)
+            | Native::Creating(..)
+    );
+    let mut body = panel()
         .background(ThemeToken::Surface)
-        .child(heading("alert", "启用原生转换组件"))
+        .child(heading("alert", "安装原生转换组件"))
         .child(detail(
-            "请在「设置 → 插件 → 权限」批准与当前系统匹配的 WorldPort 原生库。",
+            "转换需要与当前系统匹配的原生库。点击下面的按钮即可自动下载并校验安装，\
+             之后在「设置 → 插件 → 权限」批准它。",
         ));
-    if state.digest.is_some() && !state.show_advanced {
-        return body.finish_view();
-    }
-    body
-        .child(
+    // The one action that matters while nothing is installed.
+    body = body.child(compact_action(
+        if busy { "正在安装…" } else { "自动安装" },
+        "install-native",
+        ThemeToken::Accent,
+    ));
+    if state.show_advanced {
+        // Only reachable from the advanced panel, which is hidden until the
+        // component is ready; kept for a build whose library has no registry entry.
+        body = body.child(detail("手动填写组件的 SHA-256：")).child(
             row()
                 .full_width()
                 .child(View::node(ViewNode::Input(InputNode {
                     value: state.digest_input.clone(),
-                    placeholder: "原生组件的 SHA-256".into(),
+                    placeholder: "64 位十六进制摘要".into(),
                     action_id: "digest-input".into(),
                     action_value: None,
                     style: ViewStyle {
@@ -479,8 +505,9 @@ fn native_setup(state: &State) -> View {
                     },
                 })))
                 .child(compact_action("保存", "save-digest", ThemeToken::Accent)),
-        )
-        .finish_view()
+        );
+    }
+    body.finish_view()
 }
 
 fn log_panel(state: &State) -> View {
