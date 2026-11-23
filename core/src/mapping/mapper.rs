@@ -286,6 +286,26 @@ fn be_alias(short: &str) -> Option<MappedState> {
     if let Some((source, _)) = JE_ALIASES.iter().find(|(_, target)| *target == short) {
         return Some(MappedState::new(namespaced(source)));
     }
+    // Bedrock still ships the pre-1.4 `hard_` spelling of hardened glass. Without
+    // this every pane and stained block in an old build becomes air; the Java
+    // names are simply the suffix.
+    if let Some(rest) = short.strip_prefix("hard_") {
+        let target = match rest {
+            "glass" => "glass",
+            "glass_pane" => "glass_pane",
+            other if other.starts_with(|c: char| c.is_ascii_lowercase())
+                && (other.ends_with("_stained_glass") || other.ends_with("_stained_glass_pane")) =>
+            {
+                other
+            }
+            _ => return None,
+        };
+        return Some(MappedState::new(namespaced(target)));
+    }
+    if short == "deprecated_anvil" {
+        // The id Bedrock kept for an old anvil variant; the block is an anvil.
+        return Some(MappedState::new("minecraft:anvil"));
+    }
     match short {
         "brick_block" => return Some(MappedState::new("minecraft:bricks")),
         "nether_brick" => return Some(MappedState::new("minecraft:nether_bricks")),

@@ -1,0 +1,11 @@
+{
+  "1.12.0.28": "mappings/data/bedrock/1.12.0.28/blocks.json.gz",
+  "1.14.20.1": "mappings/data/bedrock/1.14.20.1/blocks.json.gz",
+  "1.16.101.01": "mappings/data/bedrock/1.16.101.01/blocks.json.gz",
+  "1.17.41.01": "mappings/data/bedrock/1.17.41.01/blocks.json.gz",
+  "1.18.31.04": "mappings/data/bedrock/1.18.31.04/blocks.json.gz",
+  "1.19.83.01": "mappings/data/bedrock/1.19.83.01/blocks.json.gz",
+  "1.20.80.05": "mappings/data/bedrock/1.20.80.05/blocks.json.gz",
+  "1.21.60.0": "mappings/data/bedrock/1.21.60.0/blocks.json.gz",
+  "1.26.60.0": "mappings/data/bedrock/1.26.60.0/blocks.json.gz"
+}

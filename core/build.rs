@@ -67,6 +67,8 @@ fn main() {
     if baked == 0 {
         println!("cargo:warning=WorldPort: no Java block catalogs were baked");
     }
+
+    bake_bedrock(root, &out_dir);
 }
 
 fn bake(source: &Path) -> Option<Vec<u8>> {
@@ -131,4 +133,50 @@ fn write_str(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
     out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_le_bytes());
     out.extend_from_slice(bytes);
+}
+
+/// Bakes the per-version Bedrock catalogs, which come from Chunker's registries
+/// rather than from the single snapshot `bedrock-world` embeds.
+///
+/// Without these the converter only knows the version it writes, so an older
+/// world's ids are read against a catalog that never contained them.
+fn bake_bedrock(root: &Path, out_dir: &Path) {
+    let manifest = root.join("mappings/bedrock_versions.json");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    let versions: BTreeMap<String, String> = match fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    {
+        Some(versions) => versions,
+        None => {
+            println!(
+                "cargo:warning=WorldPort: cannot read {}; per-version Bedrock catalogs are unavailable",
+                manifest.display()
+            );
+            return;
+        }
+    };
+    let mut table = String::from(
+        "/// `(version label, baked LZ4 blob)` for every bundled Bedrock catalog.\n\
+         pub const BEDROCK_CATALOGS: &[(&str, &[u8])] = &[\n",
+    );
+    let mut baked = 0_usize;
+    for (version, relative) in &versions {
+        let source = root.join(relative);
+        println!("cargo:rerun-if-changed={}", source.display());
+        let Some(binary) = bake(&source) else {
+            continue;
+        };
+        let compressed = lz4_flex::block::compress_prepend_size(&binary);
+        let slug = version.replace('.', "_");
+        let file = format!("bedrock_catalog_{slug}.bin.lz4");
+        fs::write(out_dir.join(&file), &compressed).expect("write baked bedrock catalog");
+        table.push_str(&format!(
+            "    (\"{version}\", include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))),\n"
+        ));
+        baked += 1;
+    }
+    table.push_str("];\n");
+    fs::write(out_dir.join("bedrock_catalogs.rs"), table).expect("write bedrock catalog table");
+    println!("cargo:warning=WorldPort: baked {baked} Bedrock block catalogs");
 }

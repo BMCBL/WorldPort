@@ -318,6 +318,89 @@ pub fn bedrock_catalog() -> BlockCatalog {
     BlockCatalog { blocks }
 }
 
+mod baked_bedrock {
+    include!(concat!(env!("OUT_DIR"), "/bedrock_catalogs.rs"));
+}
+
+/// Bedrock block catalogs for older releases, baked from Chunker's registries.
+///
+/// `bedrock_catalog()` is the one snapshot `bedrock-world` embeds - the version
+/// WorldPort writes. A world saved before that snapshot was taken is full of ids
+/// the snapshot has never heard of, and one saved after it predates ids we emit,
+/// so reading an arbitrary world needs the catalog for *its* version.
+static BEDROCK_BY_VERSION: std::sync::OnceLock<Vec<(String, BlockCatalog)>> =
+    std::sync::OnceLock::new();
+
+fn bedrock_versions() -> &'static [(String, BlockCatalog)] {
+    BEDROCK_BY_VERSION.get_or_init(|| {
+        let mut catalogs = Vec::new();
+        for (version, blob) in baked_bedrock::BEDROCK_CATALOGS {
+            match JavaCatalog::parse_baked(blob) {
+                Ok(parsed) => catalogs.push(((*version).to_string(), parsed.catalog)),
+                Err(error) => tracing::warn!(
+                    %version,
+                    %error,
+                    "bundled Bedrock block catalog failed to load"
+                ),
+            }
+        }
+        catalogs.sort_by(|left, right| compare_version(&left.0, &right.0));
+        catalogs
+    })
+}
+
+/// Version labels for every bundled Bedrock catalog, oldest first.
+#[must_use]
+pub fn bedrock_catalog_versions() -> Vec<&'static str> {
+    bedrock_versions()
+        .iter()
+        .map(|(version, _)| version.as_str())
+        .collect()
+}
+
+/// The bundled Bedrock catalog for an exact version label.
+#[must_use]
+pub fn bedrock_catalog_for(version: &str) -> Option<BlockCatalog> {
+    bedrock_versions()
+        .iter()
+        .find(|(candidate, _)| candidate == version)
+        .map(|(_, catalog)| catalog.clone())
+}
+
+/// The newest bundled Bedrock catalog not newer than `version`.
+///
+/// A world reports a build such as `1.20.15.01`; the nearest catalog at or below
+/// it is the closest description of what that build could contain.
+#[must_use]
+pub fn bedrock_catalog_at_or_below(version: &str) -> Option<BlockCatalog> {
+    bedrock_versions()
+        .iter()
+        .filter(|(candidate, _)| compare_version(candidate, version) != std::cmp::Ordering::Greater)
+        .max_by(|left, right| compare_version(&left.0, &right.0))
+        .map(|(_, catalog)| catalog.clone())
+}
+
+/// Compares dotted version labels component by component, numerically.
+fn compare_version(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left), Some(right)) => {
+                let left = left.parse::<u32>().unwrap_or(0);
+                let right = right.parse::<u32>().unwrap_or(0);
+                match left.cmp(&right) {
+                    std::cmp::Ordering::Equal => {}
+                    other => return other,
+                }
+            }
+        }
+    }
+}
+
 /// Bedrock block-state storage version reported by the embedded catalog.
 #[must_use]
 pub fn bedrock_format_version() -> u32 {
