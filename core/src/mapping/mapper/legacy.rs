@@ -279,7 +279,10 @@ pub(super) fn legacy_be_family(
             };
             Some(MappedState::new(namespaced(&format!("{color}_{suffix}"))))
         }
-        "undyed_shulker_box" => Some(MappedState::new("minecraft:shulker_box")),
+        // Bedrock keeps `undyed_shulker_box`; Java's plain name is `shulker_box`.
+        // The reverse rule has to exist too, or the state maps to a block that
+        // cannot be mapped back and disappears from the audit as unstable.
+        "undyed_shulker_box" => Some(MappedState::new("minecraft:shulker_box").lossy()),
         "chain" => {
             let mut mapped = MappedState::new("minecraft:chain");
             if let Some(axis) = get("pillar_axis") {

@@ -278,6 +278,10 @@ fn je_alias(short: &str) -> Option<MappedState> {
     // does not exist. That produced an invalid id for every wall sign.
     // Before 1.14 Java had one `sign` for every wood type; an alias entry for it
     // would shadow `oak_sign`, because the reverse lookup takes the first match.
+    // Java's plain `shulker_box` is Bedrock's `undyed_shulker_box`.
+    if short == "shulker_box" {
+        return Some(MappedState::new("minecraft:undyed_shulker_box").lossy());
+    }
     if short == "sign" {
         return Some(MappedState::new("minecraft:standing_sign").lossy());
     }
