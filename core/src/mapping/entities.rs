@@ -8,9 +8,7 @@ pub const ENTITY_ALIASES: &[(&str, &str)] = &[
     ("minecraft:breeze_wind_charge", "minecraft:breeze_wind_charge_projectile"),
     ("minecraft:commandblock_minecart", "minecraft:command_block_minecart"),
     ("minecraft:end_crystal", "minecraft:ender_crystal"),
-    ("minecraft:evocation_fangs", "minecraft:evocation_fang"),
     ("minecraft:evoker", "minecraft:evocation_illager"),
-    ("minecraft:evoker_fangs", "minecraft:evocation_fang"),
     ("minecraft:experience_bottle", "minecraft:xp_bottle"),
     ("minecraft:experience_orb", "minecraft:xp_orb"),
     ("minecraft:eye_of_ender", "minecraft:eye_of_ender_signal"),
@@ -29,6 +27,24 @@ pub const ENTITY_ALIASES: &[(&str, &str)] = &[
     ("minecraft:zombie_villager", "minecraft:zombie_villager_v2"),
     ("minecraft:zombified_piglin", "minecraft:zombie_pigman"),
 ];
+
+/// Java entities that Bedrock has no entity for.
+///
+/// Fangs are a damage source in Bedrock, not an entity, so writing an identifier
+/// for them produced an id nothing defines and the entity vanished anyway - with
+/// no trace in the report. They are dropped and counted instead.
+pub const NO_BEDROCK_ENTITY: &[&str] = &[
+    "minecraft:evocation_fangs",
+    "minecraft:evoker_fangs",
+];
+
+/// Whether a Java entity exists in Bedrock at all.
+#[must_use]
+pub fn has_bedrock_entity(java: &str) -> bool {
+    let short = java.strip_prefix("minecraft:").unwrap_or(java);
+    let full = format!("minecraft:{short}");
+    !NO_BEDROCK_ENTITY.contains(&full.as_str())
+}
 
 /// Bedrock identifier for a Java entity id (identity when unchanged).
 #[must_use]

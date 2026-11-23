@@ -130,6 +130,15 @@ pub fn java_to_bedrock(je: &NbtTag, uid: i64, report: &mut ReportBuilder) -> Opt
         );
         return None;
     }
+    if !crate::mapping::entities::has_bedrock_entity(je_id) {
+        // No Bedrock entity exists for this type, so there is nothing to write.
+        report.warn(
+            crate::report::WarningCode::UnsupportedFeature,
+            je_id.to_string(),
+            format!("{je_id} has no Bedrock entity and was dropped"),
+        );
+        return None;
+    }
     let be_id = entity_to_bedrock(je_id);
     let mut out = IndexMap::new();
     out.insert("identifier".to_string(), tag_string(be_id.clone()));
