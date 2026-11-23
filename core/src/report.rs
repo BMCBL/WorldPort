@@ -78,6 +78,10 @@ pub struct Warning {
 pub struct UnmappedIds {
     /// Block state descriptions (`name[prop=value]`).
     pub blocks: BTreeMap<String, u64>,
+    /// Unmapped blocks that the target edition simply does not have, counted per
+    /// reason. Kept apart from `blocks` so the two never mix: one is a gap to fix,
+    /// the other is a fact about the editions.
+    pub by_reason: BTreeMap<String, u64>,
     /// Entity identifiers.
     pub entities: BTreeMap<String, u64>,
     /// Item identifiers.
@@ -293,8 +297,24 @@ impl ReportBuilder {
     }
 
     /// Records an unmapped block state.
+    ///
+    /// A block that Java simply does not have is counted under its reason rather
+    /// than warned about: 118 elements and a hundred education-edition ids would
+    /// otherwise bury the warnings that need attention, and the user only needs to
+    /// know one thing - that their world uses blocks the target edition lacks.
     pub fn unmapped_block(&mut self, state: impl Into<String>, message: impl Into<String>) {
         let state = state.into();
+        if let Some(reason) = crate::mapping::unmapped::no_java_block(&state) {
+            let label = reason.label();
+            *self
+                .report
+                .unmapped
+                .by_reason
+                .entry(label.to_string())
+                .or_insert(0) += 1;
+            *self.report.unmapped.blocks.entry(label.to_string()).or_insert(0) += 1;
+            return;
+        }
         *self.report.unmapped.blocks.entry(state.clone()).or_insert(0) += 1;
         self.warn(WarningCode::UnmappedBlock, state, message);
     }

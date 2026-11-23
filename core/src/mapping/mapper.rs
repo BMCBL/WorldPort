@@ -410,6 +410,13 @@ fn be_alias(short: &str) -> Option<MappedState> {
         "cave_vines_body_with_berries" => {
             return Some(MappedState::new("minecraft:cave_vines_plant").lossy());
         }
+        // Bedrock keeps lit ores and lamps as their own blocks; Java uses a `lit`
+        // property on one block.
+        "lit_redstone_lamp" => return Some(MappedState::new("minecraft:redstone_lamp").lossy()),
+        "lit_redstone_ore" => return Some(MappedState::new("minecraft:redstone_ore").lossy()),
+        "lit_deepslate_redstone_ore" => {
+            return Some(MappedState::new("minecraft:deepslate_redstone_ore").lossy());
+        }
         "stonecutter_block" => {
             // Java called it `stonecutter` from 1.14; the reverse rule cannot hold
             // for a release whose catalog predates the block.

@@ -15,6 +15,7 @@ pub mod game_rules;
 pub mod map_colors;
 pub mod potions;
 pub mod mapper;
+pub mod unmapped;
 pub mod schema;
 
 pub use mapper::{BlockMapper, MappedState, short_name};
