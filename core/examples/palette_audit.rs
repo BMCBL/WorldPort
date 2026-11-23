@@ -28,12 +28,24 @@ fn main() {
         rows.push(Row {
             version: version.to_string(),
             direction: "JE->BE",
-            coverage: audit(&mapper, &java, true),
+            coverage: audit(&mapper, &java, &bedrock, true),
         });
         rows.push(Row {
             version: version.to_string(),
             direction: "BE->JE",
-            coverage: audit(&mapper, &bedrock, false),
+            coverage: audit(&mapper, &bedrock, &java, false),
+        });
+    }
+
+    for version in worldport_core::mapping::schema::bedrock_catalog_versions() {
+        let catalog = worldport_core::mapping::schema::bedrock_catalog_for(version)
+            .expect("bundled bedrock catalog");
+        let java = JavaCatalog::bundled("26.2").expect("newest bundled Java catalog").to_catalog();
+        let mapper = BlockMapper::new(java.clone(), catalog.clone());
+        rows.push(Row {
+            version: format!("be {version}"),
+            direction: "BE->JE",
+            coverage: audit(&mapper, &catalog, &java, false),
         });
     }
 
@@ -58,13 +70,13 @@ fn main() {
     }
 
     println!(
-        "{:<8} {:<7} {:>7} {:>6} {:>9} {:>9} {:>9} {:>8}",
-        "version", "dir", "states", "exact", "declared", "silent", "unstable", "unmapped"
+        "{:<15} {:<7} {:>7} {:>6} {:>9} {:>9} {:>9} {:>8} {:>10}",
+        "version", "dir", "states", "exact", "declared", "silent", "unstable", "unmapped", "invalid"
     );
     for row in &rows {
         let coverage = &row.coverage;
         println!(
-            "{:<8} {:<7} {:>7} {:>6} {:>9} {:>9} {:>9} {:>8}",
+            "{:<15} {:<7} {:>7} {:>6} {:>9} {:>9} {:>9} {:>8} {:>10}",
             row.version,
             row.direction,
             coverage.states,
@@ -73,6 +85,7 @@ fn main() {
             coverage.count(&Outcome::SilentLoss),
             coverage.count(&Outcome::Unstable),
             coverage.count(&Outcome::Unmapped),
+            coverage.count(&Outcome::InvalidTarget),
         );
     }
 

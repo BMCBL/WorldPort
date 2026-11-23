@@ -14,7 +14,9 @@
 use std::collections::BTreeMap;
 
 use worldport_core::mapping::audit::{Coverage, Outcome, audit};
-use worldport_core::mapping::schema::bedrock_catalog;
+use worldport_core::mapping::schema::{
+    bedrock_catalog, bedrock_catalog_for, bedrock_catalog_versions,
+};
 use worldport_core::mapping::{BlockMapper, JavaCatalog};
 
 /// Recorded coverage, keyed `"<version> <direction>"`.
@@ -31,6 +33,13 @@ struct Recorded {
     silent_loss: u64,
     unstable: u64,
     unmapped: u64,
+    /// States whose produced block or property the target catalog does not
+    /// declare. Recorded but not gated: the current population is dominated by
+    /// `waterlogged` (a liquid layer in Bedrock, a property in Java) and double
+    /// slabs (separate blocks in Bedrock), which are modelling differences that
+    /// need triage per family before they can be asserted on.
+    #[serde(default)]
+    invalid_target: u64,
 }
 
 fn record(coverage: &Coverage) -> Recorded {
@@ -41,6 +50,7 @@ fn record(coverage: &Coverage) -> Recorded {
         silent_loss: coverage.count(&Outcome::SilentLoss),
         unstable: coverage.count(&Outcome::Unstable),
         unmapped: coverage.count(&Outcome::Unmapped),
+        invalid_target: coverage.count(&Outcome::InvalidTarget),
     }
 }
 
@@ -52,11 +62,28 @@ fn coverage() -> BTreeMap<String, Recorded> {
         let mapper = BlockMapper::new(java.clone(), bedrock.clone());
         rows.insert(
             format!("{version} JE->BE"),
-            record(&audit(&mapper, &java, true)),
+            record(&audit(&mapper, &java, &bedrock, true)),
         );
+        // The embedded snapshot, measured in the direction a Java target reads it.
         rows.insert(
             format!("{version} BE->JE"),
-            record(&audit(&mapper, &bedrock, false)),
+            record(&audit(&mapper, &bedrock, &java, false)),
+        );
+    }
+    // Bedrock is measured once per bundled release: a world saved by an older
+    // build has ids the newest snapshot never listed, and that is exactly the
+    // path a version-agnostic mapper gets wrong.
+    // These measure *reading* a world of that release, which is the path a user
+    // with an old save takes. The reverse direction there would target a catalog
+    // we never write to, so instability is not meaningful for these rows; what
+    // matters is that every produced Java state exists in the target version.
+    for version in bedrock_catalog_versions() {
+        let catalog = bedrock_catalog_for(version).expect("bundled bedrock catalog");
+        let java = JavaCatalog::bundled("26.2").expect("newest bundled Java catalog").to_catalog();
+        let mapper = BlockMapper::new(java.clone(), catalog.clone());
+        rows.insert(
+            format!("be {version} BE->JE"),
+            record(&audit(&mapper, &catalog, &java, false)),
         );
     }
     rows
@@ -81,6 +108,13 @@ fn no_bedrock_state_is_unstable() {
     // is not acceptable is a state that maps to something which cannot map back.
     for (key, row) in coverage() {
         if !key.ends_with("BE->JE") {
+            // Covers "<je version> BE->JE" and the cross-version "be <v> BE->JE".
+            continue;
+        }
+        // A cross-version row reads a world of that release; its reverse direction
+        // would target a catalog we never write to, so only same-catalog rows are
+        // held to round-trip stability.
+        if key.starts_with("be ") {
             continue;
         }
         assert_eq!(row.unstable, 0, "{key}: {row:?}");
@@ -144,7 +178,12 @@ fn every_state_lands_in_exactly_one_bucket() {
     // A classification that silently drops a state would make the whole report
     // lie about its own totals.
     for (key, row) in coverage() {
-        let summed = row.exact + row.declared_loss + row.silent_loss + row.unstable + row.unmapped;
+        let summed = row.exact
+            + row.declared_loss
+            + row.silent_loss
+            + row.unstable
+            + row.unmapped
+            + row.invalid_target;
         assert_eq!(summed, row.states, "{key}: {row:?}");
     }
 }

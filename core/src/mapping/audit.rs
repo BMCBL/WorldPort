@@ -33,13 +33,18 @@ pub enum Outcome {
     SilentLoss,
     /// No target block at all.
     Unmapped,
+    /// A target state was produced, but the target catalog does not declare it.
+    ///
+    /// Reading an old world can otherwise emit a block or property the target
+    /// version never had, which a game would reject rather than approximate.
+    InvalidTarget,
 }
 
 impl Outcome {
     /// Whether this outcome means data was lost without being declared.
     #[must_use]
     pub const fn is_defect(&self) -> bool {
-        matches!(self, Self::Unstable | Self::SilentLoss)
+        matches!(self, Self::Unstable | Self::SilentLoss | Self::InvalidTarget)
     }
 
     /// The report column this outcome belongs to.
@@ -52,6 +57,7 @@ impl Outcome {
             Self::Unstable => "unstable",
             Self::SilentLoss => "silent-loss",
             Self::Unmapped => "unmapped",
+            Self::InvalidTarget => "invalid-target",
         }
     }
 }
@@ -112,6 +118,7 @@ const MAX_DEFECT_ROWS: usize = 20;
 pub fn audit(
     mapper: &BlockMapper,
     source: &BlockCatalog,
+    target: &BlockCatalog,
     forward: bool,
 ) -> Coverage {
     let mut coverage = Coverage::default();
@@ -131,7 +138,7 @@ pub fn audit(
                 .zip(&counters)
                 .map(|((key, options), index)| ((*key).to_string(), options[*index].to_string()))
                 .collect();
-            let outcome = classify(mapper, name, &properties, forward);
+            let outcome = classify(mapper, name, &properties, target, forward);
             *coverage
                 .outcomes
                 .entry(outcome.label().to_string())
@@ -168,6 +175,7 @@ fn classify(
     mapper: &BlockMapper,
     name: &str,
     properties: &BTreeMap<String, String>,
+    target: &BlockCatalog,
     forward: bool,
 ) -> Outcome {
     let (mapped, back): (Option<MappedState>, Option<MappedState>) = if forward {
@@ -186,6 +194,9 @@ fn classify(
     let Some(mapped) = mapped else {
         return Outcome::Unmapped;
     };
+    if !declares(target, &mapped.name, &mapped.properties) {
+        return Outcome::InvalidTarget;
+    }
     let Some(back) = back else {
         // A mapped state whose result cannot be mapped at all loses everything
         // the target did express.
@@ -209,6 +220,27 @@ fn classify(
         (false, true) => Outcome::DeclaredChanged,
         (false, false) => Outcome::SilentLoss,
     }
+}
+
+/// Whether `catalog` declares this block and every property value used.
+fn declares(catalog: &BlockCatalog, name: &str, properties: &BTreeMap<String, String>) -> bool {
+    let Some(schema) = catalog.block(name) else {
+        return false;
+    };
+    properties.iter().all(|(key, value)| {
+        let Some(property) = schema.property(key) else {
+            return false;
+        };
+        if property.accepts(value) {
+            return true;
+        }
+        // A boolean is written as `true`/`false` here and turned into a Bedrock
+        // byte by the writer, so the catalog's `0`/`1` domain still accepts it.
+        match value.as_str() {
+            "true" | "false" => property.accepts(if value == "true" { "1" } else { "0" }),
+            _ => false,
+        }
+    })
 }
 
 /// Property names differ between the editions for the same concept; a quiet

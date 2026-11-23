@@ -143,11 +143,30 @@ pub fn convert(
     );
     let target = JavaTarget::resolve(plan)?;
     super::prepare_target(&plan.target, plan.overwrite)?;
-    let mapper = BlockMapper::new(target.catalog.to_catalog(), bedrock_catalog());
+    // The embedded snapshot describes the release this converter targets, which is
+    // not necessarily the release that saved this world. An older build has ids the
+    // snapshot never listed, so the lookup uses the catalog for the world's own
+    // version and only falls back to the snapshot when the version is unknown.
+    let source_version = crate::be::inspect::version_label(&level_dat.root);
+    let bedrock = crate::mapping::schema::bedrock_catalog_at_or_below(&source_version);
+    let mapper = BlockMapper::new(
+        target.catalog.to_catalog(),
+        bedrock.clone().unwrap_or_else(bedrock_catalog),
+    );
     report.set_versions(
-        format!("bedrock {}", crate::be::inspect::version_label(&level_dat.root)),
+        format!("bedrock {source_version}"),
         format!("java {} ({})", target.catalog.version(), target.data_version),
     );
+    if bedrock.is_none() {
+        report.warn(
+            WarningCode::Lossy,
+            "bedrock-catalog",
+            format!(
+                "no bundled block catalog covers Bedrock {source_version};                  mapping with the {} snapshot, so ids that build never had may appear",
+                crate::mapping::schema::bedrock_format_version()
+            ),
+        );
+    }
 
     report.begin_stage("maps");
     options.report(Progress::new("maps", 0, None));
