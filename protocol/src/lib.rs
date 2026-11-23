@@ -182,6 +182,12 @@ pub struct WorldInfo {
     pub players: u64,
     /// Map items found in the world.
     pub maps: u64,
+    /// Preview of the world's first map, as an image `src`.
+    ///
+    /// Empty when the world has no map to draw, which is the common case for a
+    /// fresh world; the page then shows its placeholder instead of an empty box.
+    #[serde(default)]
+    pub map_preview: String,
 }
 
 impl WorldInfo {
@@ -255,6 +261,15 @@ pub enum Event {
         total: u64,
         /// Optional detail.
         message: String,
+        /// Milliseconds since the conversion started.
+        ///
+        /// The plugin sandbox has no clock, so a progress panel that wants to
+        /// show how long it has been running has to be told.
+        #[serde(default)]
+        elapsed_ms: u64,
+        /// Estimated milliseconds left in this stage, `0` when unknown.
+        #[serde(default)]
+        eta_ms: u64,
     },
     /// Warnings discovered so far (may repeat as more are found).
     Warnings {

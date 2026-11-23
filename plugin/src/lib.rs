@@ -80,6 +80,12 @@ struct State {
     stage: String,
     done: u64,
     total: u64,
+    /// Stages that already reported and then moved on.
+    finished_stages: Vec<String>,
+    /// Milliseconds since the conversion started, as reported by the kernel.
+    elapsed_ms: u64,
+    /// Estimated milliseconds left in the current stage; `0` when unknown.
+    eta_ms: u64,
     warnings: Vec<WarningRow>,
     unmapped_total: u64,
     report: Option<ReportSummary>,
@@ -116,6 +122,9 @@ impl Default for State {
             stage: String::new(),
             done: 0,
             total: 0,
+            finished_stages: Vec::new(),
+            elapsed_ms: 0,
+            eta_ms: 0,
             warnings: Vec::new(),
             unmapped_total: 0,
             report: None,
@@ -370,11 +379,22 @@ impl State {
                 done,
                 total,
                 message,
+                elapsed_ms,
+                eta_ms,
             } => {
                 self.running = true;
-                self.stage = stage;
+                if self.stage != stage {
+                    // Keep the finished stages so the panel can show what has
+                    // already been done instead of only the current step.
+                    if !self.stage.is_empty() {
+                        self.finished_stages.push(std::mem::take(&mut self.stage));
+                    }
+                    self.stage = stage;
+                }
                 self.done = done;
                 self.total = total;
+                self.elapsed_ms = elapsed_ms;
+                self.eta_ms = eta_ms;
                 if !message.is_empty() {
                     self.note(message);
                 }
@@ -611,6 +631,8 @@ mod tests {
             done: 47,
             total: 100,
             message: String::new(),
+            elapsed_ms: 1_500,
+            eta_ms: 3_000,
         });
         assert!(!page::render(&state, "another-page")
             .nodes

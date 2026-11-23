@@ -115,6 +115,10 @@ struct SessionState {
     stage: String,
     done: u64,
     total: u64,
+    /// Milliseconds since the conversion started.
+    elapsed_ms: u64,
+    /// Estimated milliseconds left, `0` when unknown.
+    eta_ms: u64,
     warnings: Vec<WarningRow>,
     last_report: Option<ReportSummary>,
 }
@@ -340,39 +344,87 @@ fn start_conversion(
     }
 }
 
+/// Progress throttling state, kept per conversion.
+struct Throttle {
+    emitted_at: Instant,
+    done: u64,
+    stage: String,
+    /// When the current stage first reported, so its rate is its own.
+    stage_started: Instant,
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Estimated time left in a stage, or `0` when it cannot be estimated.
+///
+/// Only reports an estimate once enough of the stage has run for the rate to
+/// mean something: a number that swings wildly is worse than no number.
+fn eta_ms(done: u64, total: u64, stage_ms: u64) -> u64 {
+    if total == 0 || done == 0 || done >= total || stage_ms < 500 {
+        return 0;
+    }
+    let per_item = stage_ms as f64 / done as f64;
+    let remaining = (total - done) as f64 * per_item;
+    if remaining.is_finite() {
+        remaining.round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
 fn progress_sink(
     events: &Arc<Events>,
     state: &Arc<Mutex<SessionState>>,
 ) -> Arc<dyn Fn(convert::Progress) + Send + Sync> {
     let events = Arc::clone(events);
     let state = Arc::clone(state);
-    let last = Mutex::new((Instant::now(), u64::MAX, String::new()));
+    let started = Instant::now();
+    let last = Mutex::new(Throttle {
+        emitted_at: started,
+        done: u64::MAX,
+        stage: String::new(),
+        stage_started: started,
+    });
     Arc::new(move |progress: convert::Progress| {
         let Ok(mut throttle) = last.lock() else {
             return;
         };
         let now = Instant::now();
-        let same_stage = throttle.2 == progress.stage;
+        let same_stage = throttle.stage == progress.stage;
         if same_stage
-            && now.duration_since(throttle.0) < PROGRESS_INTERVAL
-            && progress.done != throttle.1
+            && now.duration_since(throttle.emitted_at) < PROGRESS_INTERVAL
+            && progress.done != throttle.done
         {
             return;
         }
-        throttle.0 = now;
-        throttle.1 = progress.done;
-        throttle.2 = progress.stage.clone();
+        if !same_stage {
+            // A new stage resets the rate window: the previous stage's pace says
+            // nothing about this one.
+            throttle.stage_started = now;
+        }
+        throttle.emitted_at = now;
+        throttle.done = progress.done;
+        throttle.stage.clone_from(&progress.stage);
+        let elapsed_ms = millis(now.duration_since(started));
+        let stage_ms = millis(now.duration_since(throttle.stage_started));
         drop(throttle);
+        let total = progress.total.unwrap_or(0);
         if let Ok(mut current) = state.lock() {
             current.stage = progress.stage.clone();
             current.done = progress.done;
-            current.total = progress.total.unwrap_or(0);
+            current.total = total;
+            current.elapsed_ms = elapsed_ms;
+            current.eta_ms = eta_ms(progress.done, total, stage_ms);
         }
         events.publish(Event::Stage {
             stage: progress.stage,
             done: progress.done,
-            total: progress.total.unwrap_or(0),
+            total,
             message: progress.message.unwrap_or_default(),
+            elapsed_ms,
+            eta_ms: eta_ms(progress.done, total, stage_ms),
         });
     })
 }

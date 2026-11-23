@@ -2,6 +2,12 @@
 
 use bmcbl_plugin_api::prelude::*;
 use bmcbl_plugin_api::{ButtonNode, Container, InputNode, TextNode, TextSizeToken};
+
+/// Drawn placeholder for a world with no map.
+///
+/// Inline SVG rather than a packaged PNG: the page must look deliberate whether
+/// or not the world has a map, and a missing image would read as a bug.
+const PLACEHOLDER_MAP: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjgiIGhlaWdodD0iMTI4IiB2aWV3Qm94PSIwIDAgMTI4IDEyOCI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIGZpbGw9IiMyYjJmMzMiLz48cGF0aCBkPSJNMzIgOTZsMjQtMzIgMjQgMjR6IiBmaWxsPSIjNDU0YjUxIi8+PGNpcmNsZSBjeD0iODYiIGN5PSI0MiIgcj0iOCIgZmlsbD0iIzQ1NGI1MSIvPjwvc3ZnPg==";
 use worldport_protocol::{ReportSummary, WorldInfo};
 
 use super::{Native, State, PAGE_ID};
@@ -151,6 +157,25 @@ fn version_options(java_target: bool) -> Vec<SelectOption> {
     }
 }
 
+/// The world's map, or a drawn placeholder when it has none.
+fn map_preview(info: &WorldInfo) -> View {
+    let (src, caption) = if info.map_preview.is_empty() {
+        (PLACEHOLDER_MAP.to_string(), "该世界没有地图".to_string())
+    } else {
+        (info.map_preview.clone(), "世界地图".to_string())
+    };
+    View::node(image_options(
+        src,
+        caption.clone(),
+        ImageOptions::new()
+            .caption(caption)
+            .fit(ImageFit::Cover)
+            // A square keeps a 128x128 map from stretching the card.
+            .aspect_ratio(1, 1)
+            .corner_radius(6),
+    ))
+}
+
 fn info_card(info: &WorldInfo) -> View {
     let edition = if info.edition == "java" {
         "Java"
@@ -175,6 +200,10 @@ fn info_card(info: &WorldInfo) -> View {
                 ))
                 .child(title(info.level_name.clone())),
         )
+        // The map preview is the one part of a world a person recognises at a
+        // glance, so it leads the card. A world without a map shows the
+        // placeholder instead of an empty frame.
+        .child(map_preview(info))
         .child(detail(format!(
             "区块 {}{} · 玩家 {} · 地图 {}",
             info.total_chunks(),
@@ -293,30 +322,91 @@ fn actions(state: &State) -> View {
 }
 
 fn progress_panel(state: &State) -> View {
-    let stage = match state.stage.as_str() {
+    let stage = stage_label(&state.stage);
+    let total = (state.total > 0).then_some(state.total);
+    let percent = if state.total > 0 {
+        // Integer maths avoids a float round trip for a percentage that is only
+        // ever shown, never compared.
+        Some((state.done.saturating_mul(100) / state.total).min(100))
+    } else {
+        None
+    };
+    let mut body = panel().child(heading("activity", "转换进度"));
+    body = body.child(View::node(progress(
+        format!("{stage} · {} / {}", state.done, state.total),
+        state.done,
+        total,
+    )));
+    // A second line with the numbers a user actually asks about: how far along,
+    // how long it has taken, and how much longer.
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(percent) = percent {
+        facts.push(format!("{percent}%"));
+    }
+    if state.elapsed_ms > 0 {
+        facts.push(format!("已用 {}", duration_text(state.elapsed_ms)));
+    }
+    if state.eta_ms > 0 {
+        facts.push(format!("预计剩余 {}", duration_text(state.eta_ms)));
+    }
+    if let Some(total) = total
+        && state.elapsed_ms > 0
+        && state.done > 0
+    {
+        // Items per second over the whole run, which is the number that makes a
+        // conversion's speed comparable between worlds.
+        let rate = state.done as f64 / (state.elapsed_ms as f64 / 1000.0);
+        if rate.is_finite() && rate >= 0.1 {
+            facts.push(format!("{rate:.0} 项/秒"));
+        }
+        let _ = total;
+    }
+    if !facts.is_empty() {
+        body = body.child(detail(facts.join(" · ")));
+    }
+    if !state.finished_stages.is_empty() {
+        let done: Vec<String> = state
+            .finished_stages
+            .iter()
+            .map(|stage| format!("✓ {}", stage_label(stage)))
+            .collect();
+        body = body.child(detail(format!("已完成：{}", done.join("、"))));
+    }
+    body.child(detail(if state.running {
+        "转换期间可以离开本页，任务会继续；回来时进度会自动恢复。"
+    } else {
+        "等待开始"
+    }))
+    .finish_view()
+}
+
+/// Renders milliseconds the way a person reads them.
+fn duration_text(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else if seconds < 3600 {
+        format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+    } else {
+        format!("{} 小时 {} 分", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+/// User-facing name for a stage id.
+fn stage_label(stage: &str) -> &str {
+    match stage {
         "terrain" => "转换区块",
         "chunk-index" => "读取区块索引",
+        "structures" => "转换结构",
+        "poi" => "转换村庄兴趣点",
         "maps" => "转换地图",
         "players" => "转换玩家",
         "level.dat" => "写入世界设置",
         "finalize" => "收尾",
         "start" => "启动",
-        other if other.is_empty() => "准备中",
+        "" => "准备中",
         other => other,
-    };
-    let total = (state.total > 0).then_some(state.total);
-    panel()
-        .child(View::node(progress(
-            format!("{stage} · {} / {}", state.done, state.total),
-            state.done,
-            total,
-        )))
-        .child(detail(if state.running {
-            "转换期间可以离开本页，任务会继续；回来时进度会自动恢复。"
-        } else {
-            "等待开始"
-        }))
-        .finish_view()
+    }
 }
 
 fn report_panel(state: &State, report: &ReportSummary) -> View {

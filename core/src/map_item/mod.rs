@@ -3,6 +3,7 @@
 //! Java stores one byte per pixel (`base * 4 + shade`) in `map_<id>.dat`;
 //! Bedrock stores raw RGBA (`colors`, 4 bytes per pixel) in the `map_<id>`
 //! LevelDB record. Both use a 128x128 grid by default.
+pub mod preview;
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,12 @@ pub struct MapData {
     pub tracking: bool,
     /// Java palette indices, `width * height` entries.
     pub colors: Vec<u8>,
+}
+
+/// The Java map colour table as RGBA, for renderers outside this module.
+#[must_use]
+pub fn palette() -> Vec<[u8; 4]> {
+    shaded_palette()
 }
 
 /// Java map colour byte → RGBA.
