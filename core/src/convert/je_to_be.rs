@@ -94,6 +94,8 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
     let mut converted_chunks = 0_u64;
     let mut interests = crate::poi::InterestInventory::default();
+    // Structure areas collected during the terrain pass; no second world read.
+    let mut structure_areas: Vec<(i32, i32, crate::structure::StructureArea)> = Vec::new();
     let uid_counter = AtomicI64::new(1);
     let current_tick = world.total_ticks();
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
@@ -131,7 +133,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                     output.put_raw(key, value);
                 }
                 for (pos, uid, payload) in outcome.actors {
-                    output.put_actor(pos, uid, payload);
+                    output.put_actor(pos, uid, payload)?;
                 }
                 report.merge(outcome.report);
                 interests.total += outcome.interests.total;
@@ -141,6 +143,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                 for (kind, count) in outcome.interests.by_kind {
                     *interests.by_kind.entry(kind).or_default() += count;
                 }
+                structure_areas.extend(outcome.structures);
                 if outcome.converted {
                     converted_chunks += 1;
                     report.counters().chunks += 1;
@@ -160,7 +163,7 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
     report.begin_stage("structures");
     options.report(Progress::new("structures", 0, None));
     if plan.features.chunk_metadata {
-        write_structures(&mut output, &world, &mut report)?;
+        write_structures(&mut output, &structure_areas, &mut report)?;
     }
     report.end_stage();
 
@@ -206,60 +209,43 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
 /// `HardcodedSpawners` record covering its piece bounds. Structures Bedrock has
 /// no hardcoded area for (villages, ancient cities, ...) keep their blocks and
 /// are reported instead of being given a fabricated area.
+/// Writes Bedrock hardcoded spawn areas for the Java structures found during
+/// the terrain pass.
+///
+/// The areas come from chunks the converter already decoded: a separate pass
+/// would re-open every region, re-read and re-inflate every chunk and rebuild
+/// its NBT tree only to read `structures.starts`.
 fn write_structures(
     output: &mut BedrockOutput,
-    world: &JavaWorld,
+    areas: &[(i32, i32, crate::structure::StructureArea)],
     report: &mut ReportBuilder,
 ) -> Result<()> {
     let mut convertible: std::collections::BTreeMap<&'static str, u64> = Default::default();
-    let mut unsupported: std::collections::BTreeMap<String, u64> = Default::default();
-    for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
-        let be_dimension = dimension_of(dimension);
-        for pos in world.chunk_positions(dimension)? {
-            let Ok(Some(chunk)) = world.read_chunk(dimension, pos) else {
-                continue;
-            };
-            let Some(starts) = chunk.get("structures").and_then(|value| value.get("starts"))
-            else {
-                continue;
-            };
-            let Some(starts) = starts.as_compound() else {
-                continue;
-            };
-            let mut areas = Vec::new();
-            for (id, start) in starts {
-                let Some(kind) = crate::structure::StructureKind::from_java_id(id) else {
-                    *unsupported.entry(id.clone()).or_default() += 1;
-                    continue;
-                };
-                let Some((min, max)) = crate::structure::java_start_bounds(start) else {
-                    // No piece bounds: nothing to place.
-                    *unsupported.entry(format!("{id} (no pieces)")).or_default() += 1;
-                    continue;
-                };
-                areas.push(crate::structure::StructureArea { kind, min, max });
-                *convertible.entry(kind.java_id()).or_default() += 1;
-            }
-            if areas.is_empty() {
-                continue;
-            }
-            let value = crate::structure::write_bedrock_chunk(&areas)?;
-            output.put_raw(
-                ChunkKey::new(
-                    ChunkPos {
-                        x: pos.x,
-                        z: pos.z,
-                        dimension: be_dimension,
-                    },
-                    ChunkRecordTag::HardcodedSpawners,
-                )
-                .encode(),
-                Bytes::from(value),
-            );
-            report.counters().structures += areas.len() as u64;
-        }
+    let mut by_chunk: BTreeMap<(i32, i32), Vec<crate::structure::StructureArea>> = BTreeMap::new();
+    for (chunk_x, chunk_z, area) in areas {
+        *convertible.entry(area.kind.java_id()).or_default() += 1;
+        by_chunk
+            .entry((*chunk_x, *chunk_z))
+            .or_default()
+            .push(area.clone());
     }
-    crate::structure::report_java_structures(&convertible, &unsupported, report);
+    for ((chunk_x, chunk_z), chunk_areas) in by_chunk {
+        let value = crate::structure::write_bedrock_chunk(&chunk_areas)?;
+        output.put_raw(
+            ChunkKey::new(
+                ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                    dimension: Dimension::Overworld,
+                },
+                ChunkRecordTag::HardcodedSpawners,
+            )
+            .encode(),
+            Bytes::from(value),
+        );
+        report.counters().structures += chunk_areas.len() as u64;
+    }
+    crate::structure::report_java_structures(&convertible, &BTreeMap::new(), report);
     Ok(())
 }
 
@@ -405,6 +391,13 @@ struct ChunkOutcome {
     converted: bool,
     /// Village-interest blocks found in this chunk.
     interests: crate::poi::InterestInventory,
+    /// Structure areas this chunk declared, with the chunk position they came
+    /// from.
+    ///
+    /// Extracted here, while the chunk NBT is already parsed: a separate pass
+    /// would re-open every region, re-read and re-inflate every chunk, and
+    /// rebuild the whole NBT tree just to read `structures.starts`.
+    structures: Vec<(i32, i32, crate::structure::StructureArea)>,
 }
 
 /// Per-chunk write buffer; the driver replays it into [`BedrockOutput`].
@@ -419,8 +412,9 @@ impl ChunkSink {
         self.raw.push((key, value));
     }
 
-    fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) {
+    fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) -> Result<()> {
         self.actors.push((pos, uid, payload));
+        Ok(())
     }
 }
 
@@ -450,6 +444,7 @@ fn convert_position(
             report,
             converted: false,
             interests: Default::default(),
+            structures: Vec::new(),
         });
     };
     let summary = summarize(&chunk);
@@ -465,10 +460,13 @@ fn convert_position(
             report,
             converted: false,
             interests: Default::default(),
+            structures: Vec::new(),
         });
     }
     let mut sink = ChunkSink::default();
     let mut interests = crate::poi::InterestInventory::default();
+    let mut structures = Vec::new();
+    let mut unsupported_structures = BTreeMap::new();
     convert_chunk(
         &mut sink,
         &mut report,
@@ -481,13 +479,29 @@ fn convert_position(
         current_tick,
         policy,
         &mut interests,
+        &mut structures,
+        &mut unsupported_structures,
     )?;
+    let structures: Vec<(i32, i32, crate::structure::StructureArea)> = structures
+        .into_iter()
+        .map(|area| (pos.x, pos.z, area))
+        .collect();
+    if !unsupported_structures.is_empty() {
+        for (id, count) in &unsupported_structures {
+            report.warn(
+                WarningCode::UnsupportedFeature,
+                format!("structure:{id}"),
+                format!("{count} Java structure(s) of type {id} have no Bedrock spawn area"),
+            );
+        }
+    }
     Ok(ChunkOutcome {
         raw: sink.raw,
         actors: sink.actors,
         report,
         converted: true,
         interests,
+        structures,
     })
 }
 
@@ -503,6 +517,8 @@ fn convert_chunk(
     current_tick: i64,
     policy: crate::convert::UnknownDataPolicy,
     interests: &mut crate::poi::InterestInventory,
+    structures: &mut Vec<crate::structure::StructureArea>,
+    unsupported_structures: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
     let be_pos = ChunkPos {
         x: pos.x,
@@ -659,7 +675,7 @@ fn convert_chunk(
                 },
                 ActorUid::from_unique_id(uid),
                 payload,
-            );
+            )?;
         }
     }
 
@@ -698,6 +714,29 @@ fn convert_chunk(
                 ChunkKey::new(be_pos, ChunkRecordTag::PendingTicks).encode(),
                 bytes::Bytes::from(bytes),
             );
+        }
+    }
+
+    // Structure metadata from the Java starts already in hand. Only the four
+    // structures Bedrock also tracks as hardcoded spawn areas become areas;
+    // the rest keep their blocks and are counted by the caller.
+    if let Some(starts) = chunk
+        .get("structures")
+        .and_then(|value| value.get("starts"))
+        .and_then(|value| value.as_compound())
+    {
+        for (id, start) in starts {
+            let Some(kind) = crate::structure::StructureKind::from_java_id(id) else {
+                *unsupported_structures.entry(id.clone()).or_default() += 1;
+                continue;
+            };
+            let Some((min, max)) = crate::structure::java_start_bounds(start) else {
+                *unsupported_structures
+                    .entry(format!("{id} (no pieces)"))
+                    .or_default() += 1;
+                continue;
+            };
+            structures.push(crate::structure::StructureArea { kind, min, max });
         }
     }
 

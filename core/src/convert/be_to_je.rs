@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use bedrock_nbt::NbtTag;
 use bedrock_world::world::{OpenOptions, World};
 use bedrock_world::{
-    ChunkKey, ChunkPos, ChunkRecordTag, Dimension, SubChunkDecodeMode, SubChunkFormat,
+    ChunkKey, ChunkPos, ChunkRecordTag, ChunkVersion, Dimension, SubChunkDecodeMode, SubChunkFormat,
 };
 use flate2::Compression;
 use indexmap::IndexMap;
@@ -408,7 +408,20 @@ fn read_chunk(
     // Everything below is CPU work on already-read records.
     profiler.mark_mapping_start();
     let biomes = biome_data.map(|data| data.storages);
+    // Actor records live under their own keys (digp + actorprefix), outside the
+    // chunk record batch, so they are read once here: the keep/drop decision
+    // below needs to know whether the chunk holds entities, and the entity
+    // conversion later reuses this list.
+    let actors = if features.entities {
+        world.actors(pos)?
+    } else {
+        Vec::new()
+    };
+    // Minimum build height of the target dimension: Java heightmaps are
+    // relative to it and `yPos` is its section index.
+    let min_y = pos.y_range(ChunkVersion::New).0;
     let mut sections: Vec<NbtTag> = Vec::new();
+    // Heightmaps start at "no block yet", which is the minimum height itself.
     let mut height_map_blocking = [0_i16; 256];
     let mut height_map_surface = [0_i16; 256];
     let mut any_blocks = false;
@@ -578,7 +591,20 @@ fn read_chunk(
         sections.push(NbtTag::Compound(section));
     }
 
-    if !any_blocks {
+    // "No convertible blocks" is not the same as "nothing to save": a chunk can
+    // hold only entities, pending ticks or biome data. The chunk is dropped only
+    // when it has no blocks *and* none of the optional records the conversion was
+    // asked to keep, and the reason is recorded so a skipped chunk is never
+    // silent.
+    let has_optional = !actors.is_empty()
+        || chunk.records.iter().any(|record| match record.key.tag {
+            ChunkRecordTag::BlockEntity => features.block_entities,
+            ChunkRecordTag::Entity => features.entities,
+            ChunkRecordTag::PendingTicks => features.ticks,
+            ChunkRecordTag::HardcodedSpawners => features.chunk_metadata,
+            _ => false,
+        });
+    if !any_blocks && !has_optional {
         return Ok(None);
     }
 
@@ -589,7 +615,9 @@ fn read_chunk(
     );
     root.insert("xPos".to_string(), NbtTag::Int(pos.x));
     root.insert("zPos".to_string(), NbtTag::Int(pos.z));
-    root.insert("yPos".to_string(), NbtTag::Int(-4));
+    // `yPos` is the lowest section index, which differs per dimension: the
+    // overworld starts at -64 (section -4), the nether and end at 0.
+    root.insert("yPos".to_string(), NbtTag::Int(min_y.div_euclid(16)));
     root.insert(
         "Status".to_string(),
         NbtTag::String(target.status().to_string()),
@@ -598,8 +626,8 @@ fn read_chunk(
     root.insert(
         "Heightmaps".to_string(),
         compound([
-            ("MOTION_BLOCKING", packed_heightmap(&height_map_blocking)),
-            ("WORLD_SURFACE", packed_heightmap(&height_map_surface)),
+            ("MOTION_BLOCKING", packed_heightmap(&height_map_blocking, min_y)),
+            ("WORLD_SURFACE", packed_heightmap(&height_map_surface, min_y)),
         ]),
     );
     root.insert("isLightOn".to_string(), NbtTag::Byte(0));
@@ -614,20 +642,35 @@ fn read_chunk(
         .records
         .iter()
         .find(|record| record.key.tag == ChunkRecordTag::PendingTicks)
-        && let Ok(root_tag) = bedrock_nbt::parse_root(&record.value)
     {
-        let (ticks, stats) = crate::tick::read_bedrock_pending(&root_tag);
-        report.counters().ticks += stats.written as u64;
-        if stats.pruned > 0 {
-            report.warn(
-                WarningCode::Pruned,
-                "ticks",
-                format!("{} scheduled ticks referenced non-vanilla blocks", stats.pruned),
-            );
+        let root_tag = match bedrock_nbt::parse_root(&record.value) {
+            Ok(root) => Some(root),
+            Err(error) => {
+                // A corrupt tick record must be reported, not silently dropped.
+                // Report and skip the ticks only: dropping the whole chunk would
+                // discard its blocks over one unreadable record.
+                report.warn(
+                    WarningCode::Skipped,
+                    "pending-ticks",
+                    format!("scheduled ticks could not be decoded: {error}"),
+                );
+                None
+            }
+        };
+        if let Some(root_tag) = root_tag {
+            let (ticks, stats) = crate::tick::read_bedrock_pending(&root_tag);
+            report.counters().ticks += stats.written as u64;
+            if stats.pruned > 0 {
+                report.warn(
+                    WarningCode::Pruned,
+                    "ticks",
+                    format!("{} scheduled ticks referenced non-vanilla blocks", stats.pruned),
+                );
+            }
+            let (blocks, fluids) = crate::tick::write_java_chunk(&ticks);
+            block_ticks = blocks;
+            fluid_ticks = fluids;
         }
-        let (blocks, fluids) = crate::tick::write_java_chunk(&ticks);
-        block_ticks = blocks;
-        fluid_ticks = fluids;
     }
     root.insert("block_ticks".to_string(), block_ticks);
     root.insert("fluid_ticks".to_string(), fluid_ticks);
@@ -641,14 +684,22 @@ fn read_chunk(
         .records
         .iter()
         .find(|record| record.key.tag == ChunkRecordTag::BlockEntity)
-        && let Ok(entities) = bedrock_nbt::parse_consecutive_roots(&record.value)
     {
-        for entity in &entities {
-            if let Some(converted) =
-                crate::block_entity::bedrock_to_java(entity, report, target.data_version)
-            {
-                block_entities.push(converted);
+        match bedrock_nbt::parse_consecutive_roots(&record.value) {
+            Ok(entities) => {
+                for entity in &entities {
+                    if let Some(converted) =
+                        crate::block_entity::bedrock_to_java(entity, report, target.data_version)
+                    {
+                        block_entities.push(converted);
+                    }
+                }
             }
+            Err(error) => report.warn(
+                WarningCode::Skipped,
+                "block-entities",
+                format!("block entities could not be decoded: {error}"),
+            ),
         }
     }
     root.insert("block_entities".to_string(), tag_list(block_entities));
@@ -656,15 +707,11 @@ fn read_chunk(
     // Entities from modern actor storage (digp + actorprefix). They are written
     // to the separate `entities/` region file by the caller, matching 1.17+.
     let mut java_entities: Vec<NbtTag> = Vec::new();
-    // Actor records live under their own keys, outside the chunk record batch,
-    // so skipping entities has to be checked here too.
-    if features.entities {
-        for record in world.actors(pos)? {
-            if let Some(entity) =
-                crate::entity::bedrock_to_java(&record.entity.nbt, report, target.data_version)
-            {
-                java_entities.push(entity);
-            }
+    for record in &actors {
+        if let Some(entity) =
+            crate::entity::bedrock_to_java(&record.entity.nbt, report, target.data_version)
+        {
+            java_entities.push(entity);
         }
     }
 
@@ -821,7 +868,14 @@ fn pack_indices(indices: &[u16], bits: u32) -> NbtTag {
     NbtTag::LongArray(words)
 }
 
-fn packed_heightmap(values: &[i16; 256]) -> NbtTag {
+/// Packs a Java heightmap from **absolute** block heights.
+///
+/// Java stores heights relative to the dimension's minimum build height, and a
+/// value means "one above the topmost matching block". Verified against a real
+/// 26.2 chunk: the top block at y=60 is encoded as 125, which is
+/// `60 + 1 - (-64)`. Writing absolute heights (61) made the game read the
+/// terrain as ~64 blocks lower than it is.
+fn packed_heightmap(values: &[i16; 256], min_y: i32) -> NbtTag {
     // 9 bits per entry, seven values per long, `z * 16 + x` order.
     const BITS: u32 = 9;
     const PER_LONG: usize = 7;
@@ -833,7 +887,10 @@ fn packed_heightmap(values: &[i16; 256]) -> NbtTag {
             let Some(value) = values.get(base + lane) else {
                 break;
             };
-            packed |= (u64::from(*value as u16) & ((1 << BITS) - 1)) << (lane as u32 * BITS);
+            // Absolute block Y -> Java's relative "one above the top" value.
+            let relative = i32::from(*value) - min_y;
+            let relative = u64::try_from(relative.max(0)).unwrap_or(0);
+            packed |= (relative & ((1 << BITS) - 1)) << (lane as u32 * BITS);
         }
         *word = packed as i64;
     }
@@ -1485,12 +1542,42 @@ mod tests {
         let mut heights = [0_i16; 256];
         heights[0] = 70;
         heights[6] = 100;
-        let NbtTag::LongArray(words) = packed_heightmap(&heights) else {
+        // min_y = 0 keeps the encoded values equal to the inputs.
+        let NbtTag::LongArray(words) = packed_heightmap(&heights, 0) else {
             panic!("long array");
         };
         assert_eq!(words.len(), 37);
         assert_eq!(words[0] & 0x1FF, 70);
         assert_eq!((words[0] as u64 >> 54) & 0x1FF, 100);
+    }
+
+    #[test]
+    fn heightmap_is_relative_to_the_dimension_minimum() {
+        // Verified against a real 26.2 chunk: a top block at y=60 in the
+        // overworld (min -64) is stored as 125, i.e. `60 + 1 - (-64)`.
+        let mut heights = [0_i16; 256];
+        heights[0] = 61; // one above a top block at y=60
+        let NbtTag::LongArray(words) = packed_heightmap(&heights, -64) else {
+            panic!("long array");
+        };
+        assert_eq!(words[0] & 0x1FF, 125);
+    }
+
+    #[test]
+    fn heightmap_clamps_below_the_minimum_to_zero() {
+        // An empty column starts at the minimum height and must not underflow.
+        let heights = [0_i16; 256];
+        let NbtTag::LongArray(words) = packed_heightmap(&heights, -64) else {
+            panic!("long array");
+        };
+        assert_eq!(words[0] & 0x1FF, 64);
+    }
+
+    #[test]
+    fn ypos_follows_the_dimension_minimum_section() {
+        // The overworld starts at y=-64 (section -4); the nether and end at 0.
+        assert_eq!((-64_i32).div_euclid(16), -4);
+        assert_eq!(0_i32.div_euclid(16), 0);
     }
 
     #[test]

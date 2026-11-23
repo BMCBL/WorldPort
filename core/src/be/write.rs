@@ -93,10 +93,13 @@ impl BedrockOutput {
     }
 
     /// Queues one actor record (`actorprefix<uid>` + digest entry).
-    pub fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) {
-        if let Ok(bytes) = bedrock_nbt::serialize_root(&payload) {
-            self.pending_actors.push((pos, uid, Bytes::from(bytes)));
-        }
+    pub fn put_actor(&mut self, pos: ChunkPos, uid: ActorUid, payload: NbtTag) -> Result<()> {
+        // Serialising can fail on an oversized or malformed tag; swallowing that
+        // silently lost the entity with no trace in the report.
+        let bytes = bedrock_nbt::serialize_root(&payload)
+            .map_err(|error| WorldPortError::nbt(format!("entity at {pos:?}: {error}")))?;
+        self.pending_actors.push((pos, uid, Bytes::from(bytes)));
+        Ok(())
     }
 
     /// Counts one converted column; commits when the batch is full.
