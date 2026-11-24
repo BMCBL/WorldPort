@@ -25,7 +25,6 @@ use crate::be::write::{
 };
 use crate::convert::{ConversionOptions, ConversionPlan, Edition, Progress};
 use crate::error::{Result, WorldPortError};
-use crate::je::chunk::summarize;
 use crate::je::nbt as je_nbt;
 use crate::je::world::JavaWorld;
 use crate::je::{JeChunkPos, JeDimension};
@@ -127,24 +126,27 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
         .num_threads(plan.jobs)
         .build()
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
-    let mut converted_chunks = 0_u64;
     let mut interests = crate::poi::InterestInventory::default();
     // Structure areas collected during the terrain pass; no second world read.
     let mut structure_areas: Vec<(i32, i32, crate::structure::StructureArea)> = Vec::new();
     let profile_totals = crate::convert::profile::Totals::default();
     let uid_counter = AtomicI64::new(1);
     let current_tick = world.total_ticks();
+    let mut dimensions = Vec::with_capacity(3);
+    let mut remaining = plan.chunk_limit.unwrap_or(usize::MAX);
     for dimension in [JeDimension::Overworld, JeDimension::Nether, JeDimension::End] {
-        let positions = world.chunk_positions(dimension)?;
-        if positions.is_empty() {
-            continue;
-        }
-        options.report(crate::convert::Progress::new(
-            "terrain",
-            converted_chunks,
-            None,
-        ));
-        for window in positions.chunks(256) {
+        let mut positions = world.chunk_positions(dimension)?;
+        positions.truncate(remaining);
+        remaining = remaining.saturating_sub(positions.len());
+        dimensions.push((dimension, positions));
+    }
+    let total = dimensions.iter().map(|(_, positions)| positions.len() as u64).sum::<u64>();
+    let mut processed = 0_u64;
+    options.report(Progress::new("terrain", 0, Some(total)));
+    // Bound intermediate results relative to worker count.
+    let window_size = pool.current_num_threads().saturating_mul(8).clamp(16, 256);
+    for (dimension, positions) in dimensions {
+        for window in positions.chunks(window_size) {
             options.check_cancelled()?;
             let outcomes: Vec<Result<ChunkOutcome>> = pool.install(|| {
                 window.par_iter().map(|pos| {
@@ -174,16 +176,12 @@ pub fn convert(plan: &ConversionPlan, options: &ConversionOptions) -> Result<cra
                 structure_areas.extend(outcome.structures);
                 profile_totals.add(&outcome.timings);
                 if outcome.converted {
-                    converted_chunks += 1;
                     report.counters().chunks += 1;
                     output.finish_chunk()?;
                 }
             }
-            options.report(crate::convert::Progress::new(
-                "terrain",
-                converted_chunks,
-                None,
-            ));
+            processed += window.len() as u64;
+            options.report(Progress::new("terrain", processed, Some(total)));
         }
     }
     output.flush()?;
@@ -593,14 +591,16 @@ fn convert_position(
         });
     };
     profiler.stop(crate::convert::profile::read);
-    // `summarize` walks the parsed tree, so it is analysis, not I/O; count it
-    // with the mapping phase it feeds.
+    // Only generation status is needed; don't walk every section to summarize it.
     profiler.start();
-    let summary = summarize(&chunk);
-    if !summary.status.ends_with("full") {
+    let data = chunk.get("Level").unwrap_or(&chunk);
+    let status = data.get_str("Status").unwrap_or_else(|| {
+        if data.get_bool("TerrainPopulated") == Some(true) { "full" } else { "" }
+    });
+    if !status.ends_with("full") {
         report.warn(
             WarningCode::Skipped,
-            summary.status.clone(),
+            status.to_string(),
             format!("chunk {} is not fully generated and was skipped", pos.label()),
         );
         return Ok(ChunkOutcome {

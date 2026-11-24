@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::convert::{ConversionOptions, ConversionPlan, Progress};
 use crate::error::{Result, WorldPortError, io_result};
-use crate::je::anvil::{ZlibEncode, write_region_compressed};
+use crate::je::anvil::write_region_zlib;
 use crate::je::nbt as je_nbt;
 use crate::je::{JeBlockPos, JeChunkPos, JeDimension};
 use crate::mapping::biomes::java_biome_name;
@@ -218,7 +218,9 @@ pub fn convert(
         .num_threads(plan.jobs)
         .build()
         .map_err(|error| WorldPortError::other(format!("cannot start worker pool: {error}")))?;
-    let mut converted = 0_u64;
+    let mut processed = 0_u64;
+    let total = plan.chunk_limit.map_or(all_positions.len(), |limit| limit.min(all_positions.len())) as u64;
+    options.report(Progress::new("terrain", 0, Some(total)));
     let profile_totals = crate::convert::profile::Totals::default();
     for (dimension, je_dimension) in [
         (Dimension::Overworld, JeDimension::Overworld),
@@ -232,12 +234,12 @@ pub fn convert(
             .collect();
         positions.sort_by_key(|pos| (pos.x, pos.z));
         if let Some(limit) = plan.chunk_limit {
-            positions.truncate(limit.saturating_sub(usize::try_from(converted).unwrap_or(0)));
+            positions.truncate(limit.saturating_sub(usize::try_from(processed).unwrap_or(0)));
         }
         if positions.is_empty() {
             continue;
         }
-        options.report(Progress::new("terrain", converted, Some(0)));
+
         // Group the dimension by region file and write each region as soon as
         // its chunks are converted. Holding every region's encoded payloads
         // until the dimension finished kept ~700 MB resident on a large world;
@@ -252,63 +254,71 @@ pub fn convert(
         let dimension_dir = target.dimension_dir(&plan.target, je_dimension);
         let region_dir = dimension_dir.join("region");
         let entity_dir = dimension_dir.join("entities");
-        for ((region_x, region_z), region_positions) in by_region {
-            options.check_cancelled()?;
-            let outcomes: Vec<_> = pool.install(|| {
-                region_positions.par_iter().map(|pos| {
-                    options.check_cancelled()?;
-                    convert_position(
-                        &world, *pos, &mapper, &target, &plan.features,
-                        plan.pruning.blocks, plan.compression_level,
-                    )
-                }).collect()
-            });
-            let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(region_positions.len());
-            let mut entities: Vec<(u8, u8, Vec<u8>)> = Vec::new();
-            for (pos, outcome) in region_positions.iter().zip(outcomes) {
-                let (chunk, worker, timings) = outcome?;
-                profile_totals.add(&timings);
-                report.merge(worker);
-                let je_pos = JeChunkPos::new(pos.x, pos.z);
-                let Some(chunk) = chunk else {
-                    report.warn(
-                        WarningCode::Skipped,
-                        je_pos.label(),
-                        "chunk has no convertible section",
-                    );
-                    continue;
-                };
-                let (lx, lz) = je_pos.local();
-                // 1.17+ stores entities in their own region files.
-                if let Some(entity_payload) = chunk.entities {
-                    entities.push((lx, lz, entity_payload));
-                }
-                chunks.push((lx, lz, chunk.payload));
-                converted += 1;
-                report.counters().chunks += 1;
-            }
-            // Compression inside the writer runs on this pool as well.
-            pool.install(|| -> Result<()> {
-                if !chunks.is_empty() {
-                    let path = region_dir.join(format!("r.{region_x}.{region_z}.mca"));
-                    write_region_compressed(
-                        &path,
-                        chunks.into_iter().map(|(lx, lz, bytes)| (lx, lz, ZlibEncode::Zlib(bytes))),
-                        compression_level(plan),
-                    )?;
-                }
-                if !entities.is_empty() {
-                    let path = entity_dir.join(format!("r.{region_x}.{region_z}.mca"));
-                    write_region_compressed(
-                        &path,
-                        entities.into_iter().map(|(lx, lz, bytes)| (lx, lz, ZlibEncode::Zlib(bytes))),
-                        compression_level(plan),
-                    )?;
+        // One queued region bounds retained compressed data. The writer
+        // overlaps disk I/O with the next conversion on the Rayon pool.
+        std::thread::scope(|scope| -> Result<()> {
+            type Entries = Vec<(u8, u8, Vec<u8>)>;
+            type Region = ((i32, i32), Entries, Entries);
+            let (send, receive) = std::sync::mpsc::sync_channel::<Region>(1);
+            let writer = scope.spawn(move || -> Result<()> {
+                for ((rx, rz), chunks, entities) in receive {
+                    if !chunks.is_empty() {
+                        write_region_zlib(&region_dir.join(format!("r.{rx}.{rz}.mca")), chunks)?;
+                    }
+                    if !entities.is_empty() {
+                        write_region_zlib(&entity_dir.join(format!("r.{rx}.{rz}.mca")), entities)?;
+                    }
                 }
                 Ok(())
-            })?;
-            options.report(Progress::new("terrain", converted, None));
-        }
+            });
+            let produced = (|| -> Result<()> {
+                for ((region_x, region_z), region_positions) in by_region {
+                    options.check_cancelled()?;
+                    let outcomes: Vec<_> = pool.install(|| {
+                        region_positions.par_iter().map(|pos| {
+                            options.check_cancelled()?;
+                            convert_position(
+                                &world, *pos, &mapper, &target, &plan.features,
+                                plan.pruning.blocks, plan.compression_level,
+                            )
+                        }).collect()
+                    });
+                    let mut chunks: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(region_positions.len());
+                    let mut entities: Vec<(u8, u8, Vec<u8>)> = Vec::new();
+                    for (pos, outcome) in region_positions.iter().zip(outcomes) {
+                        let (chunk, worker, timings) = outcome?;
+                        profile_totals.add(&timings);
+                        report.merge(worker);
+                        let je_pos = JeChunkPos::new(pos.x, pos.z);
+                        let Some(chunk) = chunk else {
+                            report.warn(
+                                WarningCode::Skipped,
+                                je_pos.label(),
+                                "chunk has no convertible section",
+                            );
+                            continue;
+                        };
+                        let (lx, lz) = je_pos.local();
+                        // 1.17+ stores entities in their own region files.
+                        if let Some(entity_payload) = chunk.entities {
+                            entities.push((lx, lz, entity_payload));
+                        }
+                        chunks.push((lx, lz, chunk.payload));
+                        report.counters().chunks += 1;
+                    }
+                    send.send(((region_x, region_z), chunks, entities))
+                        .map_err(|_| WorldPortError::other("region writer stopped"))?;
+                    processed += region_positions.len() as u64;
+                    options.report(Progress::new("terrain", processed, Some(total)));
+                }
+                Ok(())
+            })();
+            drop(send);
+            let written = writer.join()
+                .map_err(|_| WorldPortError::other("region writer panicked"))?;
+            written?;
+            produced
+        })?;
     }
     report.end_stage();
     crate::convert::profile::report(&profile_totals.snapshot());
@@ -416,10 +426,6 @@ fn convert_position(
         report,
         profiler.timings(),
     ))
-}
-
-fn compression_level(plan: &ConversionPlan) -> Compression {
-    Compression::new(plan.compression_level.min(9))
 }
 
 /// Reads one Bedrock chunk and builds the Java chunk NBT.

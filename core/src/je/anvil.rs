@@ -428,18 +428,6 @@ pub fn write_region_compressed<I>(path: &Path, entries: I, level: Compression) -
 where
     I: IntoIterator<Item = (u8, u8, ZlibEncode)>,
 {
-    if let Some(parent) = path.parent() {
-        io_result(parent, std::fs::create_dir_all(parent))?;
-    }
-    let file = io_result(
-        path,
-        File::options()
-            .write(true)
-            .read(true)
-            .create(true)
-            .truncate(true)
-            .open(path),
-    )?;
     // Compress every chunk of the region in parallel; the sector layout below
     // has to be sequential because offsets depend on the previous sizes.
     let compressed: Vec<(u8, u8, Vec<u8>)> = entries
@@ -453,6 +441,27 @@ where
                 .map(|compressed| (local_x, local_z, compressed)),
         })
         .collect::<Result<Vec<_>>>()?;
+    write_region_zlib(path, compressed)
+}
+
+/// Writes already compressed zlib chunks directly, without another Rayon pass
+/// or intermediate collection.
+pub fn write_region_zlib<I>(path: &Path, entries: I) -> Result<()>
+where
+    I: IntoIterator<Item = (u8, u8, Vec<u8>)>,
+{
+    if let Some(parent) = path.parent() {
+        io_result(parent, std::fs::create_dir_all(parent))?;
+    }
+    let file = io_result(
+        path,
+        File::options()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(path),
+    )?;
     const ZERO_SECTOR: [u8; SECTOR_BYTES as usize] = [0; SECTOR_BYTES as usize];
     let mut writer = BufWriter::with_capacity(1 << 20, file);
     writer
@@ -461,7 +470,7 @@ where
     let mut locations = [Location::default(); SLOTS];
     let timestamp = unix_now_seconds();
     let mut next_sector = 2_u32;
-    for (local_x, local_z, compressed) in compressed {
+    for (local_x, local_z, compressed) in entries {
         if local_x >= 32 || local_z >= 32 {
             return Err(WorldPortError::invalid(format!(
                 "local chunk position out of range: {local_x},{local_z}"
