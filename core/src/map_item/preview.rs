@@ -111,7 +111,8 @@ impl Crc32 {
 }
 
 /// Standard base64 with padding, which is what a `data:` URL needs.
-fn base64(bytes: &[u8]) -> String {
+/// Encodes bytes using standard padded Base64 for inline images.
+pub fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

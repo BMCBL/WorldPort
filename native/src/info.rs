@@ -1,102 +1,77 @@
-//! Lightweight world summaries for the plugin's detection card.
+//! Lightweight world metadata and original save icons for the plugin.
 
+use std::io::Read;
 use std::path::Path;
 
 use worldport_core::convert::{Edition, detect_edition};
-use worldport_core::je::world::JavaWorld;
-use worldport_core::je::JeDimension;
-use worldport_core::map_item::preview;
-use worldport_core::mapping::schema::JavaCatalog;
+use worldport_core::error::{Result, WorldPortError};
+use worldport_core::nbt::NbtExt;
 use worldport_protocol::WorldInfo;
 
-/// Detects the edition of `path` and summarizes it without decoding chunks.
-pub fn world_info(path: &Path) -> worldport_core::error::Result<WorldInfo> {
-    match detect_edition(path)? {
-        Edition::Java => java_info(path),
-        Edition::Bedrock => bedrock_info(path),
-    }
-}
-
-fn java_info(path: &Path) -> worldport_core::error::Result<WorldInfo> {
-    let world = JavaWorld::open(path)?;
-    let mut dimensions = Vec::new();
-    for (dimension, label) in [
-        (JeDimension::Overworld, "overworld"),
-        (JeDimension::Nether, "the_nether"),
-        (JeDimension::End, "the_end"),
-    ] {
-        let count = world.chunk_positions(dimension)?.len();
-        dimensions.push((label.to_string(), u64::try_from(count).unwrap_or(u64::MAX)));
-    }
-    let data_version = world.data_version();
-    let version = JavaCatalog::for_data_version(data_version)
-        .map(|catalog| catalog.version().to_string())
-        .unwrap_or_else(|_| format!("DataVersion {data_version}"));
-    Ok(WorldInfo {
-        edition: "java".to_string(),
-        level_name: world.level_name(),
-        seed: world.seed(),
-        version,
-        dimensions,
-        players: u64::try_from(world.player_files()?.len()).unwrap_or(u64::MAX),
-        maps: u64::try_from(world.map_files()?.len()).unwrap_or(u64::MAX),
-        map_preview: java_map_preview(&world),
-    })
-}
-
-/// Renders the world's first map as a preview, or an empty string when it has
-/// none.
-///
-/// Detection has to stay cheap: this reads one map file, and a world with no
-/// maps or an unreadable one simply yields no preview so the page keeps its
-/// placeholder.
-fn java_map_preview(world: &JavaWorld) -> String {
-    let Ok(files) = world.map_files() else {
-        return String::new();
+/// Inspect only the world header and icon. Never open LevelDB or enumerate chunks.
+pub fn world_info(path: &Path) -> Result<WorldInfo> {
+    let edition = detect_edition(path)?;
+    let mut info = match edition {
+        Edition::Java => {
+            let document = worldport_core::je::nbt::read_gzip(&path.join("level.dat"))?;
+            let data = document.tag.get("Data")
+                .ok_or_else(|| WorldPortError::invalid("Java level.dat missing Data"))?;
+            let data_version = data.get_int("DataVersion").unwrap_or(0);
+            // Report the actual save version, not the closest conversion catalog.
+            let version = data.get("Version").and_then(|version| version.get_str("Name"))
+                .filter(|name| !name.is_empty()).map(str::to_owned)
+                .unwrap_or_else(|| format!("DataVersion {data_version}"));
+            WorldInfo {
+                edition: "java".into(),
+                level_name: data.get_str("LevelName").unwrap_or_default().to_owned(),
+                version,
+                ..WorldInfo::default()
+            }
+        }
+        Edition::Bedrock => {
+            let summary = worldport_core::be::inspect::read_metadata(path)?;
+            WorldInfo {
+                edition: "bedrock".into(),
+                level_name: summary.level_name,
+                version: summary.version_label,
+                ..WorldInfo::default()
+            }
+        }
     };
-    let Some((_, path)) = files.first() else {
-        return String::new();
-    };
-    // The map id is in the file name Java uses (`map_<id>.dat`); 0 is a safe
-    // stand-in when a world renamed it, because the preview only needs pixels.
-    let id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix("map_"))
-        .and_then(|id| id.parse::<i64>().ok())
-        .unwrap_or(0);
-    match worldport_core::map_item::read_java_map(path, id) {
-        Ok(map) => preview::preview_data_url(&map, &worldport_core::map_item::palette()),
-        Err(_) => String::new(),
+    if info.level_name.is_empty() {
+        info.level_name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     }
+    // Keep the existing wire field for compatibility; its payload is now the
+    // original world icon, not the pixels of an in-game map item.
+    info.map_preview = world_icon(path, edition);
+    Ok(info)
 }
 
-fn bedrock_info(path: &Path) -> worldport_core::error::Result<WorldInfo> {
-    let summary = worldport_core::be::inspect::summarize(path)?;
-    Ok(WorldInfo {
-        edition: "bedrock".to_string(),
-        level_name: summary.level_name,
-        seed: summary.seed,
-        version: summary.version_label,
-        dimensions: vec![
-            (
-                "overworld".to_string(),
-                u64::try_from(summary.overworld_chunks).unwrap_or(u64::MAX),
-            ),
-            (
-                "the_nether".to_string(),
-                u64::try_from(summary.nether_chunks).unwrap_or(u64::MAX),
-            ),
-            (
-                "the_end".to_string(),
-                u64::try_from(summary.end_chunks).unwrap_or(u64::MAX),
-            ),
-        ],
-        players: u64::try_from(summary.players).unwrap_or(u64::MAX),
-        maps: 0,
-        // Bedrock maps are palette images too, but reading one needs Bedrock's
-        // own map record path; until that exists this stays empty and the page
-        // shows its placeholder rather than a wrong picture.
-        map_preview: String::new(),
-    })
+// The host validates PNG/JPEG dimensions before decoding. Bound the encoded
+// payload below its per-image view budget (128 KiB) without scanning the save.
+const MAX_ICON_BYTES: usize = 90 * 1024;
+
+fn world_icon(path: &Path, edition: Edition) -> String {
+    let filenames: &[&str] = match edition {
+        Edition::Java => &["icon.png"],
+        Edition::Bedrock => &["world_icon.jpeg", "world_icon.jpg", "world_icon.png"],
+    };
+    for name in filenames {
+        let Ok(file) = std::fs::File::open(path.join(name)) else { continue };
+        let mut bytes = Vec::new();
+        if file.take((MAX_ICON_BYTES + 1) as u64).read_to_end(&mut bytes).is_err()
+            || bytes.len() > MAX_ICON_BYTES
+        {
+            continue;
+        }
+        let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "image/jpeg"
+        } else {
+            continue;
+        };
+        return format!("data:{mime};base64,{}", worldport_core::map_item::preview::base64(&bytes));
+    }
+    String::new()
 }

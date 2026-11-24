@@ -52,17 +52,7 @@ pub fn summarize(path: &Path) -> Result<BedrockWorldSummary> {
         WorldPortError::invalid(format!("cannot open Bedrock world {}: {error}", path.display()))
     })?;
     let level_dat = world.read_level_dat()?;
-    let root = &level_dat.root;
-
-    let mut summary = BedrockWorldSummary {
-        level_name: root.get_str("LevelName").unwrap_or_default().to_string(),
-        seed: level_dat.random_seed()?.unwrap_or(0),
-        version_label: version_label(root),
-        storage_version: root.get_int("StorageVersion").unwrap_or(0),
-        game_type: root.get_int("GameType").unwrap_or(0),
-        difficulty: root.get_int("Difficulty").unwrap_or(0),
-        ..BedrockWorldSummary::default()
-    };
+    let mut summary = metadata(&level_dat)?;
     let positions = world.chunk_positions(Default::default())?;
     for pos in positions {
         match pos.dimension {
@@ -81,6 +71,26 @@ pub fn summarize(path: &Path) -> Result<BedrockWorldSummary> {
     summary.record_counts = counts;
     summary.players = world.players()?.len();
     Ok(summary)
+}
+
+/// Reads only level.dat metadata, without opening or scanning LevelDB.
+pub fn read_metadata(path: &Path) -> Result<BedrockWorldSummary> {
+    let document = bedrock_world::level::read(&path.join("level.dat"))?;
+    metadata(&document)
+}
+
+fn metadata(level_dat: &bedrock_world::LevelDatDocument) -> Result<BedrockWorldSummary> {
+    let root = &level_dat.root;
+
+    Ok(BedrockWorldSummary {
+        level_name: root.get_str("LevelName").unwrap_or_default().to_string(),
+        seed: level_dat.random_seed()?.unwrap_or(0),
+        version_label: version_label(root),
+        storage_version: root.get_int("StorageVersion").unwrap_or(0),
+        game_type: root.get_int("GameType").unwrap_or(0),
+        difficulty: root.get_int("Difficulty").unwrap_or(0),
+        ..BedrockWorldSummary::default()
+    })
 }
 
 pub(crate) fn version_label(root: &bedrock_nbt::NbtTag) -> String {
