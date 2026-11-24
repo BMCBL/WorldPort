@@ -245,6 +245,21 @@ fn run(
                 path: String::new(),
             }),
         },
+        Command::BrowseArchive { mcworld } => {
+            let extension = if mcworld { "mcworld" } else { "zip" };
+            let path = rfd::FileDialog::new()
+                .set_title("选择输出文件")
+                .add_filter(if mcworld { "Minecraft 基岩版地图包" } else { "ZIP 压缩包" }, &[extension])
+                .set_file_name(format!("world.{extension}"))
+                .save_file()
+                .map(|mut path| {
+                    if !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case(extension)) {
+                        path.set_extension(extension);
+                    }
+                    path.display().to_string()
+                }).unwrap_or_default();
+            events.publish(Event::Picked { path });
+        }
         Command::Detect { path } => {
             let path = PathBuf::from(&path);
             match world_info(&path) {
@@ -273,7 +288,14 @@ fn run(
                 last_report: snapshot.last_report.clone(),
             });
         }
-        Command::OpenOutput { path } => open_folder(Path::new(&path)),
+        Command::OpenOutput { path } => {
+            let path = Path::new(&path);
+            if path.is_file() {
+                open_folder(path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")));
+            } else {
+                open_folder(path);
+            }
+        }
     }
 }
 

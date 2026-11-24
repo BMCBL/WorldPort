@@ -20,6 +20,8 @@ jobs:
         run: cargo test --locked -p worldport-core --lib player::tests
       - name: Verify real world icon encoders
         run: cargo test --locked -p worldport-core --lib world_icon::tests
+      - name: Verify transactional archive export
+        run: cargo test --locked -p worldport-core --lib convert::archive::tests
       - name: Verify heightmap and coordinate encoding
         run: cargo test --locked -p worldport-core --lib convert::be_to_je::tests
       - name: Verify every bundled Java Palette and NBT version

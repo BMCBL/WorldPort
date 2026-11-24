@@ -106,7 +106,7 @@ impl Default for PruningPolicy {
 pub struct ConversionRequest {
     /// Source world directory.
     pub source: String,
-    /// Output world directory.
+    /// Output world directory, ZIP archive or Bedrock MCWORLD archive.
     pub target: String,
     /// Target edition; `None` means "the other edition".
     pub target_edition: Option<Edition>,
@@ -147,8 +147,13 @@ pub enum Command {
     Snapshot,
     /// Open the output folder in the system file manager.
     OpenOutput {
-        /// Folder to open.
+        /// Output directory or archive path.
         path: String,
+    },
+    /// Save an archive through a native file dialog.
+    BrowseArchive {
+        /// Use the Bedrock world package extension instead of ZIP.
+        mcworld: bool,
     },
 }
 

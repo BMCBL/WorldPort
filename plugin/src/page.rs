@@ -136,7 +136,7 @@ fn target_panel(state: &State) -> View {
             .full_width()
             .child(View::node(ViewNode::Input(InputNode {
                 value: state.target.clone(),
-                placeholder: "选择或输入输出目录".into(),
+                placeholder: "目录、.zip 或 .mcworld 文件路径".into(),
                 action_id: "target-input".into(),
                 action_value: None,
                 style: ViewStyle {
@@ -145,8 +145,14 @@ fn target_panel(state: &State) -> View {
                     ..default_style()
                 },
             })))
-            .child(compact_action("浏览…", "browse-target", ThemeToken::Accent)),
+            .child(compact_action("目录…", "browse-target", ThemeToken::Accent)),
     );
+    let mut formats = row().full_width()
+        .child(compact_action("保存 ZIP…", "browse-zip", ThemeToken::SecondaryText));
+    if !java_target {
+        formats = formats.child(compact_action("保存 MCWORLD…", "browse-mcworld", ThemeToken::SecondaryText));
+    }
+    body = body.child(formats);
     body = body.child(
         row()
             .full_width()
@@ -167,7 +173,7 @@ fn target_panel(state: &State) -> View {
                 Some(state.version.clone()),
             ))),
     );
-    body = body.child(detail("输出目录必须为空或尚未创建。"));
+    body = body.child(detail(if java_target { "目录须为空；ZIP 文件须尚未存在。" } else { "目录须为空；ZIP 或 MCWORLD 文件须尚未存在。" }));
     if !java_target {
         body = body.child(detail("基岩版目标目前固定写 1.26.60 方块状态。"));
     }
@@ -318,14 +324,14 @@ fn actions(state: &State) -> View {
         body = body.child(compact_action("取消转换", "cancel", ThemeToken::Danger));
     } else {
         if state.info.is_none() || state.detecting || state.target.trim().is_empty() {
-            body = body.child(detail("选择源存档和输出目录后即可开始转换。"));
+            body = body.child(detail("选择源存档和输出路径后即可开始转换。"));
         } else {
             body = body.child(View::node(button("开始转换", "start")));
         }
     }
     if state.report.is_some() {
         body = body.child(compact_action(
-            "打开输出目录",
+            "打开输出位置",
             "open-output",
             ThemeToken::SecondaryText,
         ));
@@ -406,6 +412,7 @@ fn stage_label(stage: &str) -> &str {
         "players" => "转换玩家",
         "level.dat" => "写入世界设置",
         "finalize" => "收尾",
+        "archive" => "打包输出存档",
         "start" => "启动",
         "create-world" => "创建目标存档",
         "village-interests" => "转换村庄兴趣点",

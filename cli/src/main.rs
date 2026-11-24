@@ -186,7 +186,7 @@ struct ConvertArgs {
     /// Deflate level for Java region chunks.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=9))]
     compression: u32,
-    /// Replace an existing target directory.
+    /// Replace an existing target directory (archive outputs never overwrite).
     #[arg(long)]
     overwrite: bool,
     /// Validate and report without writing.

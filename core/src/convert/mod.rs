@@ -1,5 +1,6 @@
 //! Conversion entry points, options and progress reporting.
 
+mod archive;
 pub mod be_to_je;
 pub mod je_to_be;
 pub mod neighbors;
@@ -160,7 +161,7 @@ impl Default for PruningPolicy {
 pub struct ConversionPlan {
     /// Source world directory.
     pub source: PathBuf,
-    /// Output world directory. Must not exist yet unless `overwrite` is set.
+    /// Output directory, ZIP archive, or Bedrock MCWORLD archive.
     pub target: PathBuf,
     /// Leave `None` to convert to the other edition.
     pub target_edition: Option<Edition>,
@@ -335,6 +336,13 @@ pub fn run(plan: &ConversionPlan, options: &ConversionOptions) -> Result<Convers
         )));
     }
     options.check_cancelled()?;
+    if archive::Output::from_path(&plan.target) != archive::Output::Directory {
+        return archive::convert(plan, options, source, target);
+    }
+    run_directory(plan, options, source, target)
+}
+
+fn run_directory(plan: &ConversionPlan, options: &ConversionOptions, source: Edition, target: Edition) -> Result<ConversionReport> {
     match (source, target) {
         (Edition::Java, Edition::Bedrock) => je_to_be::convert(plan, options),
         (Edition::Bedrock, Edition::Java) => be_to_je::convert(plan, options),

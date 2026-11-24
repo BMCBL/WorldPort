@@ -362,7 +362,13 @@ impl State {
         let source = source_directory(&self.source);
         let target = unquote_path(&self.target);
         if self.info.is_none() || self.detecting || source.is_empty() || target.is_empty() {
-            return Err(plugin_error("missing-path", "请先选择有效的源世界和输出目录。"));
+            return Err(plugin_error("missing-path", "请先选择有效的源世界和输出路径。"));
+        }
+        if target.rsplit(['\\', '/']).next().is_some_and(|name| name.to_ascii_lowercase().ends_with(".mcworld"))
+            && self.direction != "bedrock"
+            && (self.direction == "java" || self.info.as_ref().is_some_and(|info| info.edition == "bedrock"))
+        {
+            return Err(plugin_error("invalid-output", "MCWORLD 地图包仅支持基岩版目标。"));
         }
         if source == target {
             return Err(plugin_error("same-path", "源存档与输出目录不能相同。"));
@@ -636,6 +642,10 @@ fn handle_action(
         "browse-target" => {
             state.browse = Some(Browse::Target);
             state.dispatch(Command::BrowseTarget)?;
+        }
+        "browse-zip" | "browse-mcworld" => {
+            state.browse = Some(Browse::Target);
+            state.dispatch(Command::BrowseArchive { mcworld: action.action_id == "browse-mcworld" })?;
         }
         "detect" => {
             if state.source.trim().is_empty() {
