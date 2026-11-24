@@ -77,6 +77,7 @@ fn header(state: &State) -> View {
         Native::Installing { .. } => ("正在安装原生组件", ThemeToken::SecondaryText),
         Native::Loading(_) => ("正在加载原生组件", ThemeToken::SecondaryText),
         Native::Creating(..) => ("正在创建会话", ThemeToken::SecondaryText),
+        Native::Missing if state.install_required => ("等待安装或授权", ThemeToken::SecondaryText),
         Native::Missing if state.digest.is_some() || state.platform.is_none() => {
             ("原生组件待加载", ThemeToken::SecondaryText)
         }
@@ -490,15 +491,22 @@ fn native_setup(state: &State) -> View {
         .background(ThemeToken::Surface)
         .child(heading("alert", "安装原生转换组件"))
         .child(detail(
-            "转换需要与当前系统匹配的原生库。点击下面的按钮即可自动下载并校验安装，\
-             之后在「设置 → 插件 → 权限」批准它。",
+            "转换需要与当前系统匹配的原生库。下载并校验后，BMCBL 会弹出授权安装窗口。请确认信任该组件后授权；拒绝授权不会加载原生代码。",
         ));
     // The one action that matters while nothing is installed.
-    body = body.child(compact_action(
-        if busy { "正在安装…" } else { "自动安装" },
-        "install-native",
-        ThemeToken::Accent,
-    ));
+    if busy {
+        body = body.child(detail(match &state.native {
+            Native::Installing { .. } => "正在校验组件或等待 BMCBL 授权确认…",
+            Native::Loading(_) => "正在加载已授权的原生组件…",
+            _ => "正在准备原生组件…",
+        }));
+    } else {
+        body = body.child(compact_action(
+            if state.install_required { "重新校验并授权安装" } else { "安装并授权" },
+            "install-native",
+            ThemeToken::Accent,
+        ));
+    }
     if state.show_advanced {
         // Only reachable from the advanced panel, which is hidden until the
         // component is ready; kept for a build whose library has no registry entry.

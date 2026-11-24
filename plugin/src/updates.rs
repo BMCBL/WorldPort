@@ -20,8 +20,11 @@ use serde::Deserialize;
 pub(super) const REGISTRY_DETAIL: &str =
     "https://bmcbl-plugin.chlna6666.com/v1/plugins/worldport.json";
 /// Release index published beside every GitHub release.
-const RELEASE_INDEX: &str =
-    "https://github.com/BMCBL/WorldPort/releases/latest/download/worldport-native.json";
+const RELEASE_INDEX: &str = concat!(
+    "https://github.com/BMCBL/WorldPort/releases/download/v",
+    env!("CARGO_PKG_VERSION"),
+    "/worldport-native.json"
+);
 const RELEASE_DOWNLOAD: &str = "https://github.com/BMCBL/WorldPort/releases/download";
 const REGISTRY_ORIGIN: &str = "https://bmcbl-plugin.chlna6666.com";
 const PLUGIN_ID: &str = "worldport";
@@ -126,6 +129,9 @@ pub(super) fn registry_component(
         .ok()
         .filter(|version| version.pre.is_empty() && version.build.is_empty())
         .ok_or_else(invalid)?;
+    if version != Version::parse(env!("CARGO_PKG_VERSION")).expect("package version") {
+        return Err(plugin_error("native-version", "插件目录版本与当前插件不一致，将使用对应 GitHub 发布。"));
+    }
     let filename = component_filename(platform)?;
     let asset = release
         .native_assets
@@ -187,6 +193,9 @@ pub(super) fn release_component(text: &str, platform: &Platform) -> PluginResult
                 "发布标签必须使用稳定的 vMAJOR.MINOR.PATCH 格式。",
             )
         })?;
+    if version != Version::parse(env!("CARGO_PKG_VERSION")).expect("package version") {
+        return Err(plugin_error("native-version", "原生组件发布版本与当前插件不一致。"));
+    }
     let filename = component_filename(platform)?;
     let wanted = filename.clone();
     let missing = || {

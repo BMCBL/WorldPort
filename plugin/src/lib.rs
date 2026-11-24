@@ -32,7 +32,7 @@ struct WorldPort;
 
 #[derive(Default)]
 enum Native {
-    /// No digest configured (or the user must approve the library first).
+    /// No native instance yet; a known digest does not imply installation.
     #[default]
     Missing,
     Resolving(Job<Platform>),
@@ -92,6 +92,9 @@ struct State {
     message: Option<String>,
     problem: Option<String>,
     digest: Option<String>,
+    /// A load failed or installation was declined. Retry the verified install,
+    /// not the same unapproved native.load call.
+    install_required: bool,
     digest_input: String,
     pending: Option<Command>,
     submit: Option<(Job<RequestId>, bool)>,
@@ -131,6 +134,7 @@ impl Default for State {
             message: None,
             problem: None,
             digest: None,
+            install_required: false,
             digest_input: String::new(),
             pending: None,
             submit: None,
@@ -208,24 +212,29 @@ impl State {
             self.native = Native::Resolving(native::platform()?);
             return Ok(());
         }
-        let Some(digest) = self.digest.clone() else {
-            // No packaged or remembered component: fetch the one for this
-            // platform instead of asking the user to hunt down a file.
-            self.note("正在查找当前平台的原生转换组件");
-            self.native = Native::FetchingRegistry(updates::fetch_registry()?);
-            return Ok(());
+        let Some(digest) = self.digest.clone().filter(|_| !self.install_required) else {
+            return self.fetch_component();
         };
         self.note("正在加载原生转换组件");
         self.native = Native::Loading(native::load(&digest)?);
         Ok(())
     }
 
-    /// Starts downloading a component, or loads it when it is already installed.
+    fn fetch_component(&mut self) -> PluginResult<()> {
+        self.install_required = true;
+        self.note("正在查找当前平台的原生转换组件");
+        self.native = Native::FetchingRegistry(updates::fetch_registry()?);
+        Ok(())
+    }
+
+    /// A matching digest proves identity, not installation or authorization.
+    /// Always use the verified download/host approval route after a load failure.
     fn begin_component_download(&mut self, component: Component) -> PluginResult<()> {
-        if self.digest.as_deref() == Some(component.sha256()) {
-            // Already present; asking the host to load it triggers approval.
-            self.native = Native::Loading(native::load(component.sha256())?);
-            return Ok(());
+        self.install_required = true;
+        if let Some(expected) = self.platform.as_ref().and_then(packaged_digest)
+            && expected != component.sha256()
+        {
+            return Err(plugin_error("native-digest", "原生组件与当前插件的内置 SHA-256 不一致，请更新插件后重试。"));
         }
         let Some(request) = component.request() else {
             return Err(plugin_error(
@@ -564,6 +573,8 @@ fn handle_action(
         // release index) supplies it and the host verifies it.
         "install-native" => {
             if matches!(state.native, Native::Missing) {
+                state.problem = None;
+                state.message = None;
                 state.ensure_native()?;
             }
         }
@@ -745,7 +756,7 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                     state.digest = packaged_digest(&platform).or(state.digest.take());
                     state.digest_input = state.digest.clone().unwrap_or_default();
                     state.platform = Some(platform);
-                    if state.pending.is_some() && let Err(error) = state.ensure_native() {
+                    if let Err(error) = state.ensure_native() {
                         state.native_error(error.message);
                     }
                 }
@@ -761,7 +772,12 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                         plugin_error("native-platform", "宿主机平台尚未确定")
                     })?;
                     match updates::registry_component(&text, &platform) {
-                        Ok(component) => state.begin_component_download(component)?,
+                        Ok(component) => {
+                            if let Err(error) = state.begin_component_download(component) {
+                                state.note(error.message);
+                                state.native = Native::FetchingRelease(updates::fetch_release_index()?);
+                            }
+                        }
                         Err(error) => {
                             // The registry is a preferred mirror, not a
                             // requirement; a GitHub release works too.
@@ -786,7 +802,11 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                         plugin_error("native-platform", "宿主机平台尚未确定")
                     })?;
                     match updates::release_component(&text, &platform) {
-                        Ok(component) => state.begin_component_download(component)?,
+                        Ok(component) => {
+                            if let Err(error) = state.begin_component_download(component) {
+                                state.native_error(error.message);
+                            }
+                        }
                         Err(error) => {
                             state.native_error(format!(
                                 "没有找到当前平台的原生转换组件：{}",
@@ -809,7 +829,7 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
             match job.try_take() {
                 Ok(Some(task)) => {
                     state.note(format!(
-                        "正在下载原生组件 {}，校验通过后将请求授权",
+                        "正在校验原生组件 {}，请在 BMCBL 授权窗口确认安装",
                         component.version
                     ));
                     let job = native::download(&task, component.sha256())?;
@@ -830,8 +850,8 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                     state.digest_input = digest.clone();
                     let _ = storage_set(STORAGE_DIGEST, &digest);
                     state.note(format!("原生组件 {} 已安装", component.version));
-                    // Loading now asks the host to approve the new library, which
-                    // is why this is a separate step from the download.
+                    // install-download has already requested explicit host approval.
+                    // Do not retry installation automatically if this load fails.
                     state.native = Native::Loading(native::load(&digest)?);
                 }
                 Ok(None) => state.native = Native::Installing { component, job },
@@ -849,10 +869,20 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 }
                 Ok(None) => state.native = Native::Loading(job),
                 Err(error) => {
-                    state.native_error(format!(
-                        "加载原生组件失败（请在设置里批准当前平台的库）：{}",
-                        error.message
-                    ));
+                    if !state.install_required
+                        && error.message.contains("native component must be approved by the user")
+                    {
+                        // Packaged/remembered hashes can exist on a fresh install.
+                        // The host has not authorized this binary. Recover once
+                        // via install-download, which prompts the user.
+                        state.note("原生组件尚未授权，开始校验安装");
+                        if let Err(error) = state.fetch_component() {
+                            state.native_error(error.message);
+                        }
+                    } else {
+                        state.install_required = true;
+                        state.native_error(format!("加载原生组件失败：{}。请重试校验安装。", error.message));
+                    }
                 }
             }
             Ok(true)
@@ -861,6 +891,8 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
             match job.try_take() {
                 Ok(Some(instance)) => {
                     state.note("原生转换组件已就绪");
+                    state.install_required = false;
+                    state.problem = None;
                     state.native = Native::Ready(instance);
                 }
                 Ok(None) => state.native = Native::Creating(module, job),
