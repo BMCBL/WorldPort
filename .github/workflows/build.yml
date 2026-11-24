@@ -153,7 +153,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))
     needs: [native, plugin]
     runs-on: ubuntu-22.04
     permissions:
@@ -177,13 +177,20 @@ jobs:
           # The tag is what users install by, so it has to be the version the
           # package itself declares; a mismatch would publish an uninstallable
           # component because the plugin refuses anything older than itself.
-          [[ "$GITHUB_REF_NAME" == "$tag" ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$GITHUB_REF_NAME" == "$tag" ]]
+            release_ref=(--verify-tag)
+          else
+            [[ "$GITHUB_REF_NAME" == "main" ]]
+            [[ "$(jq -r '.head_commit.message | split("\n")[0]' "$GITHUB_EVENT_PATH")" == "release: $tag" ]]
+            release_ref=(--target "$GITHUB_SHA")
+          fi
           (cd artifacts && sha256sum --check --strict worldport-native-*.sha256)
           [[ "$(jq -er '.tag_name' artifacts/worldport-native.json)" == "$tag" ]]
           gh release create "$tag" \
             artifacts/worldport-*.bmcblx \
             artifacts/worldport-native-abi1-* \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest
+            --repo "$GITHUB_REPOSITORY" "${release_ref[@]}" --generate-notes --latest
           # The plugin falls back to this index when the registry is unreachable,
           # so it is uploaded on its own line and then checked: an asset that is
           # silently dropped turns that fallback into a 404 for every user.
