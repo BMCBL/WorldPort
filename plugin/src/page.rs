@@ -98,10 +98,11 @@ fn source_panel(state: &State) -> View {
             .full_width()
             .child(View::node(ViewNode::Input(InputNode {
                 value: state.source.clone(),
-                placeholder: "选择 Java 或基岩版世界文件夹".into(),
+                placeholder: "选择或输入世界文件夹路径".into(),
                 action_id: "source-input".into(),
                 action_value: None,
                 style: ViewStyle {
+                    text_size: TextSizeToken::Small,
                     full_width: true,
                     ..default_style()
                 },
@@ -129,10 +130,11 @@ fn target_panel(state: &State) -> View {
             .full_width()
             .child(View::node(ViewNode::Input(InputNode {
                 value: state.target.clone(),
-                placeholder: "输出世界目录（必须是空目录或不存在）".into(),
+                placeholder: "选择或输入输出目录".into(),
                 action_id: "target-input".into(),
                 action_value: None,
                 style: ViewStyle {
+                    text_size: TextSizeToken::Small,
                     full_width: true,
                     ..default_style()
                 },
@@ -159,6 +161,7 @@ fn target_panel(state: &State) -> View {
                 Some(state.version.clone()),
             ))),
     );
+    body = body.child(detail("输出目录必须为空或尚未创建。"));
     if !java_target {
         body = body.child(detail("基岩版目标目前固定写 1.26.60 方块状态。"));
     }
@@ -489,10 +492,12 @@ fn native_setup(state: &State) -> View {
     );
     let mut body = panel()
         .background(ThemeToken::Surface)
-        .child(heading("alert", "安装原生转换组件"))
-        .child(detail(
-            "转换需要与当前系统匹配的原生库。下载并校验后，BMCBL 会弹出授权安装窗口。请确认信任该组件后授权；拒绝授权不会加载原生代码。",
+        .child(heading("alert", if busy { "准备原生转换组件" } else { "安装原生转换组件" }));
+    if !busy {
+        body = body.child(detail(
+            "首次使用或组件版本变化时，需要校验并授权安装。已授权的相同组件会在下次启动时自动恢复。",
         ));
+    }
     // The one action that matters while nothing is installed.
     if busy {
         body = body.child(detail(match &state.native {

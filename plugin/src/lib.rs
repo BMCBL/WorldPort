@@ -95,6 +95,8 @@ struct State {
     /// A load failed or installation was declined. Retry the verified install,
     /// not the same unapproved native.load call.
     install_required: bool,
+    /// Set only by an explicit install action; startup may load but never download.
+    install_requested: bool,
     digest_input: String,
     pending: Option<Command>,
     submit: Option<(Job<RequestId>, bool)>,
@@ -135,6 +137,7 @@ impl Default for State {
             problem: None,
             digest: None,
             install_required: false,
+            install_requested: false,
             digest_input: String::new(),
             pending: None,
             submit: None,
@@ -213,7 +216,11 @@ impl State {
             return Ok(());
         }
         let Some(digest) = self.digest.clone().filter(|_| !self.install_required) else {
-            return self.fetch_component();
+            if self.install_requested {
+                return self.fetch_component();
+            }
+            self.install_required = true;
+            return Ok(());
         };
         self.note("正在加载原生转换组件");
         self.native = Native::Loading(native::load(&digest)?);
@@ -253,6 +260,7 @@ impl State {
         self.detecting = false;
         self.stage.clear();
         self.pending = None;
+        self.install_requested = false;
         self.problem = Some(message);
     }
 
@@ -469,7 +477,15 @@ impl State {
 #[bmcbl_plugin]
 impl Plugin for WorldPort {
     fn init(_context: PluginContext) -> PluginResult<Vec<Registration>> {
-        PAGE.with_borrow_mut(|state| state.load_persisted());
+        PAGE.with_borrow_mut(|state| {
+            state.load_persisted();
+            // A new Wasm generation needs a new native instance, not a new
+            // download or approval. Resolve the platform and try native.load.
+            // The host validates the persistent approval and actual file hash.
+            if let Err(error) = state.ensure_native() {
+                state.native_error(error.message);
+            }
+        });
         Ok(registrations! {
             page PAGE_ID, title = "基岩版与 Java 版世界互转", tool = Tool::new("世界转换").icon("network").order(10);
         })
@@ -575,7 +591,10 @@ fn handle_action(
             if matches!(state.native, Native::Missing) {
                 state.problem = None;
                 state.message = None;
-                state.ensure_native()?;
+                state.install_requested = true;
+                if let Err(error) = state.ensure_native() {
+                    state.native_error(error.message);
+                }
             }
         }
         "digest-input" => state.digest_input = value,
@@ -869,19 +888,23 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 }
                 Ok(None) => state.native = Native::Loading(job),
                 Err(error) => {
-                    if !state.install_required
-                        && error.message.contains("native component must be approved by the user")
-                    {
-                        // Packaged/remembered hashes can exist on a fresh install.
-                        // The host has not authorized this binary. Recover once
-                        // via install-download, which prompts the user.
+                    let needs_approval = error.message.contains("native component must be approved by the user");
+                    // At startup a missing approval is a normal first-install
+                    // state. Never start a download or prompt without a click.
+                    if !state.install_required && needs_approval && state.install_requested {
                         state.note("原生组件尚未授权，开始校验安装");
                         if let Err(error) = state.fetch_component() {
                             state.native_error(error.message);
                         }
                     } else {
                         state.install_required = true;
-                        state.native_error(format!("加载原生组件失败：{}。请重试校验安装。", error.message));
+                        state.install_requested = false;
+                        if needs_approval {
+                            state.note("当前组件尚未获得授权");
+                            state.problem = None;
+                        } else {
+                            state.native_error(format!("加载原生组件失败：{}。请重试校验安装。", error.message));
+                        }
                     }
                 }
             }
@@ -892,6 +915,10 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
                 Ok(Some(instance)) => {
                     state.note("原生转换组件已就绪");
                     state.install_required = false;
+                    state.install_requested = false;
+                    if let Some(digest) = &state.digest {
+                        let _ = storage_set(STORAGE_DIGEST, digest);
+                    }
                     state.problem = None;
                     state.native = Native::Ready(instance);
                 }
