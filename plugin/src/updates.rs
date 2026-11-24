@@ -149,23 +149,26 @@ pub(super) fn registry_component(
     // Only accept the exact locations the registry is allowed to publish, so a
     // compromised document cannot point the download elsewhere.
     let github = format!("{RELEASE_DOWNLOAD}/v{version}/{filename}");
-    let mirror = format!(
-        "/downloads/official/{PLUGIN_ID}/{}.{}",
-        asset.sha256, asset.filename
-    );
-    let mut urls = Vec::new();
+    let mirror = mirror_path(&asset.sha256, &filename);
+    let mut has_mirror = false;
+    let mut has_github = false;
     for source in asset.sources {
         match source {
-            RegistrySource::Edgeone { path } if path == mirror => {
-                urls.push(format!("{REGISTRY_ORIGIN}{path}"));
-            }
-            RegistrySource::Github { url } if url == github => urls.push(url),
+            RegistrySource::Edgeone { path } if path == mirror => has_mirror = true,
+            RegistrySource::Github { url } if url == github => has_github = true,
             _ => {}
         }
     }
-    if !urls.contains(&github) {
+    if !has_github {
         return Err(invalid());
     }
+    // Prefer the verified CDN regardless of the source ordering in the index.
+    // Duplicate records must not trigger duplicate network requests.
+    let mut urls = Vec::with_capacity(2);
+    if has_mirror {
+        urls.push(format!("{REGISTRY_ORIGIN}{mirror}"));
+    }
+    urls.push(github);
     Ok(Component {
         version,
         sha256: asset.sha256.clone(),
@@ -221,7 +224,14 @@ pub(super) fn release_component(text: &str, platform: &Platform) -> PluginResult
         .size
         .filter(|size| (1..=MAX_COMPONENT_BYTES).contains(size))
         .map(|size| VerifiedDownload {
-            urls: vec![url],
+            // The digest is checked by the plugin against its packaged
+            // component table, and by the host against the downloaded bytes.
+            // Try the canonical immutable CDN path even when discovery fell
+            // back to GitHub; an absent mirror simply falls back to GitHub.
+            urls: vec![
+                format!("{REGISTRY_ORIGIN}{}", mirror_path(&sha256, &wanted)),
+                url,
+            ],
             filename: wanted.clone(),
             sha256: sha256.clone(),
             size,
@@ -264,6 +274,12 @@ fn component_filename(platform: &Platform) -> PluginResult<String> {
     ))
 }
 
+/// Matches Plugin-Registry's official_mirror_path: <sha256>.<extension>.
+fn mirror_path(sha: &str, filename: &str) -> String {
+    let extension = filename.rsplit('.').next().expect("native filename extension");
+    format!("/downloads/official/{PLUGIN_ID}/{sha}.{extension}")
+}
+
 fn valid_digest(sha: &str) -> bool {
     sha.len() == 64
         && sha
@@ -303,6 +319,45 @@ mod tests {
         let mut wrong = metadata;
         wrong["tag_name"] = serde_json::json!("v99.0.0");
         assert!(release_component(&wrong.to_string(), &host).is_err());
+    }
+
+    #[test]
+    fn official_registry_native_mirrors_are_preferred_for_all_release_platforms() {
+        let version = env!("CARGO_PKG_VERSION");
+        let sha = "a".repeat(64);
+        for (os, arch, env, extension) in [
+            ("windows", "x86_64", "msvc", "dll"),
+            ("windows", "aarch64", "msvc", "dll"),
+            ("linux", "x86_64", "gnu", "so"),
+            ("linux", "aarch64", "gnu", "so"),
+        ] {
+            let host = platform(os, arch, env);
+            let filename = component_filename(&host).unwrap();
+            let github = format!("{RELEASE_DOWNLOAD}/v{version}/{filename}");
+            let mirror = format!("/downloads/official/worldport/{sha}.{extension}");
+            let metadata = serde_json::json!({
+                "schema_version": 1, "id": "worldport", "repository": REPOSITORY,
+                "status": "official", "version": version,
+                "native_assets": [{
+                    "abi_major": 1, "os": os, "arch": arch, "environment": env,
+                    "filename": filename, "size": 1024, "sha256": sha,
+                    "sources": [
+                        {"type": "github", "url": github},
+                        {"type": "edgeone", "path": mirror},
+                        {"type": "edgeone", "path": mirror}
+                    ]
+                }]
+            });
+            let component = registry_component(&metadata.to_string(), &host).expect("official mirror");
+            assert_eq!(component.request().unwrap().urls, vec![format!("{REGISTRY_ORIGIN}{mirror}"), github.clone()]);
+            let mut wrong = metadata;
+            wrong["native_assets"][0]["sources"] = serde_json::json!([
+                {"type": "edgeone", "path": format!("/downloads/official/worldport/{sha}.{filename}")},
+                {"type": "github", "url": github}
+            ]);
+            let component = registry_component(&wrong.to_string(), &host).unwrap();
+            assert_eq!(component.request().unwrap().urls, vec![github]);
+        }
     }
 
     #[test]

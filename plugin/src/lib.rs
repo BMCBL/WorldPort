@@ -242,7 +242,7 @@ impl State {
                 "原生组件缺少可校验的下载信息。",
             ));
         };
-        self.note(format!("正在下载原生组件 {}", component.version));
+        self.note(format!("正在下载原生组件 {}（{} 个候选来源）", component.version, request.urls.len()));
         let job = download_verified(request)?;
         self.native = Native::Downloading { component, job };
         Ok(())
