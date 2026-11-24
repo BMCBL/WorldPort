@@ -31,6 +31,18 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
         }
         return page.finish();
     }
+    // Conversion settings cannot change while a native job is active.
+    // Keep the active task and cancellation visible instead of dead controls.
+    if state.running {
+        page = page.child(progress_panel(state)).child(actions(state));
+        if let Some(feedback) = feedback(state) {
+            page = page.child(feedback);
+        }
+        if !state.log.is_empty() {
+            page = page.child(log_panel(state));
+        }
+        return page.finish();
+    }
     page = page
         .child(source_panel(state))
         .child(target_panel(state))
@@ -79,7 +91,7 @@ fn header(state: &State) -> View {
 }
 
 fn source_panel(state: &State) -> View {
-    let mut body = panel().child(heading("folder", "源存档"));
+    let mut body = panel().child(heading("folder", "1. 选择源存档"));
     body = body.child(
         row()
             .full_width()
@@ -110,7 +122,7 @@ fn target_panel(state: &State) -> View {
         "java" => true,
         _ => state.info.as_ref().is_none_or(|info| info.edition == "bedrock"),
     };
-    let mut body = panel().child(heading("settings", "目标存档"));
+    let mut body = panel().child(heading("settings", "2. 设置目标存档"));
     body = body.child(
         row()
             .full_width()
@@ -230,7 +242,7 @@ fn info_card(info: &WorldInfo) -> View {
 
 fn content_panel(state: &State) -> View {
     let features = &state.features;
-    let mut body = panel().child(heading("star", "转换内容"));
+    let mut body = panel().child(heading("star", "3. 转换内容"));
     body = body.child(
         row()
             .full_width()
@@ -319,7 +331,11 @@ fn actions(state: &State) -> View {
     if state.running {
         body = body.child(compact_action("取消转换", "cancel", ThemeToken::Danger));
     } else {
-        body = body.child(View::node(button("开始转换", "start")));
+        if state.source.trim().is_empty() || state.target.trim().is_empty() {
+            body = body.child(detail("选择源存档和输出目录后即可开始转换。"));
+        } else {
+            body = body.child(View::node(button("开始转换", "start")));
+        }
     }
     if state.report.is_some() {
         body = body.child(compact_action(
@@ -343,7 +359,11 @@ fn progress_panel(state: &State) -> View {
     };
     let mut body = panel().child(heading("activity", "转换进度"));
     body = body.child(View::node(progress(
-        format!("{stage} · {} / {}", state.done, state.total),
+        if let Some(total) = total {
+            format!("{stage} · {} / {total}", state.done)
+        } else {
+            stage.to_string()
+        },
         state.done,
         total,
     )));
@@ -358,18 +378,6 @@ fn progress_panel(state: &State) -> View {
     }
     if state.eta_ms > 0 {
         facts.push(format!("预计剩余 {}", duration_text(state.eta_ms)));
-    }
-    if let Some(total) = total
-        && state.elapsed_ms > 0
-        && state.done > 0
-    {
-        // Items per second over the whole run, which is the number that makes a
-        // conversion's speed comparable between worlds.
-        let rate = state.done as f64 / (state.elapsed_ms as f64 / 1000.0);
-        if rate.is_finite() && rate >= 0.1 {
-            facts.push(format!("{rate:.0} 项/秒"));
-        }
-        let _ = total;
     }
     if !facts.is_empty() {
         body = body.child(detail(facts.join(" · ")));
@@ -414,14 +422,15 @@ fn stage_label(stage: &str) -> &str {
         "level.dat" => "写入世界设置",
         "finalize" => "收尾",
         "start" => "启动",
+        "create-world" => "创建目标存档",
+        "village-interests" => "转换村庄兴趣点",
         "" => "准备中",
         other => other,
     }
 }
 
 fn report_panel(state: &State, report: &ReportSummary) -> View {
-    let _ = state;
-    let mut body = panel().child(heading("plug", "结果"));
+    let mut body = panel().child(heading("plug", "转换结果"));
     body = body.child(detail(format!(
         "{} → {} · 用时 {:.1} 秒 · 区块 {} · 方块 {}",
         report.source_version,
@@ -445,6 +454,9 @@ fn report_panel(state: &State, report: &ReportSummary) -> View {
             )));
         }
         body = rows;
+        if state.warnings.len() > 5 {
+            body = body.child(detail(format!("另有 {} 条警告未在此处展开", state.warnings.len() - 5)));
+        }
     }
     body.finish_view()
 }

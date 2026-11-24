@@ -393,9 +393,10 @@ fn progress_sink(
         };
         let now = Instant::now();
         let same_stage = throttle.stage == progress.stage;
+        let complete = progress.total.is_some_and(|total| total > 0 && progress.done >= total);
         if same_stage
+            && !complete
             && now.duration_since(throttle.emitted_at) < PROGRESS_INTERVAL
-            && progress.done != throttle.done
         {
             return;
         }

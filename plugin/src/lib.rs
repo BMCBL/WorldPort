@@ -282,6 +282,9 @@ impl State {
         if self.source.trim().is_empty() || self.target.trim().is_empty() {
             return Err(plugin_error("missing-path", "请先选择源世界和输出目录。"));
         }
+        if self.source.trim() == self.target.trim() {
+            return Err(plugin_error("same-path", "源存档与输出目录不能相同。"));
+        }
         let request = ConversionRequest {
             source: self.source.trim().to_string(),
             target: self.target.trim().to_string(),
@@ -300,6 +303,9 @@ impl State {
         self.problem = None;
         self.message = Some("正在启动转换…".to_string());
         self.warnings.clear();
+        self.finished_stages.clear();
+        self.elapsed_ms = 0;
+        self.eta_ms = 0;
         self.unmapped_total = 0;
         self.report = None;
         self.persist_paths();
