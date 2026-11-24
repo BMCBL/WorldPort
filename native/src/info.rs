@@ -1,6 +1,5 @@
 //! Lightweight world metadata and original save icons for the plugin.
 
-use std::io::Read;
 use std::path::Path;
 
 use worldport_core::convert::{Edition, detect_edition};
@@ -47,33 +46,13 @@ pub fn world_info(path: &Path) -> Result<WorldInfo> {
     Ok(info)
 }
 
-// The host validates PNG/JPEG dimensions before decoding. Bound the encoded
-// payload below its per-image view budget (128 KiB) without scanning the save.
-const MAX_ICON_BYTES: usize = 90 * 1024;
-
+// Normalize the original icon once per detection, never during page rendering.
+// The 64x64 raster stays well below the host's inline-image budget even when
+// the original Bedrock screenshot is a large JPEG.
 fn world_icon(path: &Path, edition: Edition) -> String {
-    let filenames: &[&str] = match edition {
-        Edition::Java => &["icon.png"],
-        Edition::Bedrock => &["world_icon.jpeg", "world_icon.jpg", "world_icon.png"],
-    };
-    for name in filenames {
-        let Ok(file) = std::fs::File::open(path.join(name)) else { continue };
-        let mut bytes = Vec::new();
-        if file.take((MAX_ICON_BYTES + 1) as u64).read_to_end(&mut bytes).is_err()
-            || bytes.len() > MAX_ICON_BYTES
-        {
-            continue;
-        }
-        let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            "image/png"
-        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            "image/jpeg"
-        } else {
-            continue;
-        };
-        return format!("data:{mime};base64,{}", worldport_core::map_item::preview::base64(&bytes));
-    }
-    String::new()
+    worldport_core::world_icon::preview(path, edition)
+        .map(|png| format!("data:image/png;base64,{}", worldport_core::map_item::preview::base64(&png)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -121,20 +100,27 @@ mod tests {
         level.extend_from_slice(&nbt);
         std::fs::write(root.0.join("level.dat"), level).unwrap();
 
-        // The native reader forwards encoded bytes without decoding them.
-        // Host raster tests separately validate decoding and image limits.
-        let jpeg_header = [0xff, 0xd8, 0xff, 0xd9];
-        std::fs::write(root.0.join("world_icon.jpeg"), jpeg_header).unwrap();
+        // A valid 1x1 RGB PNG. Detection decodes actual image data, not only
+        // its signature, and normalizes it into the bounded preview format.
+        let png = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222,
+            0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 96, 96, 96, 0,
+            0, 0, 4, 0, 1, 246, 23, 56, 85, 0, 0, 0, 0, 73, 69, 78, 68,
+            174, 66, 96, 130,
+        ];
+        std::fs::write(root.0.join("world_icon.png"), png).unwrap();
         let info = world_info(&root.0).expect("metadata without LevelDB");
         assert_eq!(info.level_name, "Bedrock fixture");
         assert_eq!(info.version, "1.26.60.5");
         assert_eq!(info.edition, "bedrock");
-        assert_eq!(info.map_preview, "data:image/jpeg;base64,/9j/2Q==");
+        assert!(info.map_preview.starts_with("data:image/png;base64,"));
+        assert!(info.map_preview.len() < 128 * 1024);
         assert!(info.dimensions.is_empty());
         assert_eq!(info.total_chunks(), 0);
 
-        // Oversized files are not forwarded into the plugin view or ABI.
-        std::fs::write(root.0.join("world_icon.jpeg"), vec![0xff; MAX_ICON_BYTES + 1]).unwrap();
+        // Malformed images produce the normal empty preview.
+        std::fs::write(root.0.join("world_icon.png"), b"not a PNG").unwrap();
         assert!(world_info(&root.0).unwrap().map_preview.is_empty());
     }
 

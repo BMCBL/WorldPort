@@ -17,6 +17,8 @@ use worldport_core::mapping::{BlockMapper, JavaCatalog, bedrock_catalog};
 use worldport_core::nbt::{NbtExt, compound, empty_compound, tag_list, tag_string};
 
 const MODERN_LAYOUT: i32 = 4786;
+const CHUNK_X: i32 = -33;
+const CHUNK_Z: i32 = 34;
 
 fn manifest() -> BTreeMap<String, i32> {
     serde_json::from_str(include_str!("../../mappings/je_versions.json"))
@@ -117,8 +119,8 @@ fn palette_chunk(data_version: i32) -> NbtTag {
     ]);
     compound([
         ("DataVersion", NbtTag::Int(data_version)),
-        ("xPos", NbtTag::Int(0)),
-        ("zPos", NbtTag::Int(0)),
+        ("xPos", NbtTag::Int(CHUNK_X)),
+        ("zPos", NbtTag::Int(CHUNK_Z)),
         ("yPos", NbtTag::Int(-4)),
         ("Status", tag_string(if data_version >= 3578 { "minecraft:full" } else { "full" })),
         ("sections", tag_list(vec![section])),
@@ -153,12 +155,12 @@ fn make_world(root: &Path, data_version: i32) {
     ]))]);
     nbt::write_gzip(&root.join("level.dat"), "", &level).expect("Java level.dat");
     let region = if data_version >= MODERN_LAYOUT {
-        root.join("dimensions/minecraft/overworld/region/r.0.0.mca")
+        root.join("dimensions/minecraft/overworld/region/r.-2.1.mca")
     } else {
-        root.join("region/r.0.0.mca")
+        root.join("region/r.-2.1.mca")
     };
     let payload = nbt::encode("", &palette_chunk(data_version)).expect("Java NBT encode");
-    write_region_file(&region, vec![(0, 0, payload)], Compression::fast())
+    write_region_file(&region, vec![(31, 2, payload)], Compression::fast())
         .expect("Java Anvil write");
 }
 
@@ -234,9 +236,9 @@ fn every_version_converts_java_to_bedrock_and_back_without_palette_differences()
             .unwrap_or_else(|error| panic!("{version}: BE -> JE: {error}"));
 
         let actual_region = if data_version >= MODERN_LAYOUT {
-            restored.join("dimensions/minecraft/overworld/region/r.0.0.mca")
+            restored.join("dimensions/minecraft/overworld/region/r.-2.1.mca")
         } else {
-            restored.join("region/r.0.0.mca")
+            restored.join("region/r.-2.1.mca")
         };
         assert!(actual_region.is_file(), "{version}: incorrect target region directory");
         let a = JavaWorld::open(&source).expect("source Java world");
@@ -255,10 +257,21 @@ fn every_version_converts_java_to_bedrock_and_back_without_palette_differences()
             "{version}: block mismatch: {:?} / {:?}", diff.block_totals, diff.worst_chunks);
         assert_eq!(diff.biome_mismatches, 0, "{version}: biome mismatch: {:?}", diff.worst_chunks);
         assert!(diff.compared_non_air_positions > 0, "{version}: fixture became empty");
-        let chunk = b.read_chunk(JeDimension::Overworld, JeChunkPos::new(0, 0))
+        let chunk = b.read_chunk(JeDimension::Overworld, JeChunkPos::new(CHUNK_X, CHUNK_Z))
             .unwrap().expect("reconstructed chunk");
         assert_eq!(chunk.get("DataVersion"), Some(&NbtTag::Int(data_version)), "{version}");
+        assert_eq!(chunk.get("xPos"), Some(&NbtTag::Int(CHUNK_X)), "{version}");
+        assert_eq!(chunk.get("zPos"), Some(&NbtTag::Int(CHUNK_Z)), "{version}");
         assert_eq!(chunk.get("yPos"), Some(&NbtTag::Int(-4)), "{version}");
+        // Exact independent heightmap check: the floor is at Y=-64,
+        // while the two-block log reaches Y=-62 at local (3,4).
+        let heights = chunk.get("Heightmaps").and_then(|tag| tag.get("WORLD_SURFACE"))
+            .expect("world surface heightmap");
+        let NbtTag::LongArray(words) = heights else { panic!("heightmap must be a long array") };
+        assert_eq!(words[0] & 511, 1, "{version}: negative-Y floor");
+        let column = 4 * 16 + 3;
+        assert_eq!((words[column / 7] >> ((column % 7) * 9)) & 511, 3,
+            "{version}: asymmetric column and Y position");
         let section = &chunk.get_list("sections").unwrap()[0];
         assert_eq!(section.get("Y"), Some(&NbtTag::Byte(-4)), "{version}");
         assert!(matches!(section.get("block_states").and_then(|state| state.get("data")),

@@ -63,7 +63,11 @@ fn convert(source: &Path, target: &Path, edition: Edition) -> Result<()> {
         Edition::Java => {
             // Bedrock uses a JPEG thumbnail. Preserve the square source icon
             // without introducing an artificial aspect ratio.
-            let icon = image.thumbnail(256, 256).to_rgb8();
+            let icon = if image.width() > 256 || image.height() > 256 {
+                image.thumbnail(256, 256).to_rgb8()
+            } else {
+                image.into_rgb8()
+            };
             let path = target.join("world_icon.jpeg");
             let file = io_result(&path, std::fs::File::create(&path))?;
             image::codecs::jpeg::JpegEncoder::new_with_quality(file, 90)

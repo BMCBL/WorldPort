@@ -16,11 +16,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Diagnose dependency lock changes
-        run: |
-          cargo metadata --format-version 1 > /dev/null
-          git diff -- Cargo.lock
-          git diff --exit-code -- Cargo.lock
+      - name: Verify player position and respawn schemas
+        run: cargo test --locked -p worldport-core --lib player::tests
+      - name: Verify real world icon encoders
+        run: cargo test --locked -p worldport-core --lib world_icon::tests
+      - name: Verify heightmap and coordinate encoding
+        run: cargo test --locked -p worldport-core --lib convert::be_to_je::tests
       - name: Verify every bundled Java Palette and NBT version
         run: cargo test --locked -p worldport-core --test version_matrix -- --nocapture
 
