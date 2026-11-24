@@ -88,6 +88,9 @@ jobs:
           pattern: native-*
           path: native-assets
           merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Test and package plugin
         run: |
           rustup target add wasm32-wasip2
@@ -144,6 +147,58 @@ jobs:
           cd plugin
           cargo test --locked --lib
           cargo build --locked --release --target wasm32-wasip2
+      - name: Verify packaged network permissions
+        run: |
+          python3 - <<'PY'
+          import json
+          import tomllib
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          packages = list(Path("artifacts").glob("worldport-*.bmcblx"))
+          assert len(packages) == 1, packages
+          with zipfile.ZipFile(packages[0]) as archive:
+              manifest = tomllib.loads(archive.read("plugin.toml").decode("utf-8"))
+          required = {
+              "https://bmcbl-plugin.chlna6666.com/v1/plugins/worldport.json",
+              "https://bmcbl-plugin.chlna6666.com/downloads/official/worldport/",
+              "https://github.com/BMCBL/WorldPort/releases/download/",
+              "https://release-assets.githubusercontent.com/",
+              "https://objects.githubusercontent.com/",
+          }
+          allow = set(manifest["permissions"]["network"]["allow"])
+          assert allow == required, f"unexpected packaged network allowlist: {allow}"
+          assert {"network.http", "download.start"} <= set(manifest["capabilities"])
+
+          # Mirror the host's HTTPS origin and path-segment matching semantics.
+          def allowed(url):
+              target = urlsplit(url)
+              if target.scheme != "https" or target.username or target.password or target.fragment:
+                  return False
+              for entry in allow:
+                  rule = urlsplit(entry)
+                  if (target.scheme, target.netloc) != (rule.scheme, rule.netloc):
+                      continue
+                  if target.path == rule.path or target.path.startswith(rule.path.rstrip("/") + "/"):
+                      return True
+              return False
+
+          index = json.loads(Path("artifacts/worldport-native.json").read_text())
+          tag = index["tag_name"]
+          assert allowed("https://bmcbl-plugin.chlna6666.com/v1/plugins/worldport.json")
+          assert allowed(f"https://github.com/BMCBL/WorldPort/releases/download/{tag}/worldport-native.json")
+          for asset in index["assets"]:
+              assert allowed(f"https://github.com/BMCBL/WorldPort/releases/download/{tag}/{asset['name']}")
+              digest = asset["digest"].removeprefix("sha256:")
+              assert allowed(f"https://bmcbl-plugin.chlna6666.com/downloads/official/worldport/{digest}.{asset['name']}")
+          assert allowed("https://release-assets.githubusercontent.com/example?signature=test")
+          assert allowed("https://objects.githubusercontent.com/example")
+          assert not allowed("https://github.com/BMCBL/PaperConnect/releases/download/v1/test.dll")
+          assert not allowed("https://bmcbl-plugin.chlna6666.com/v1/plugins/paperconnect.json")
+          assert not allowed("https://example.com/test.dll")
+          assert not allowed("http://github.com/BMCBL/WorldPort/releases/download/v1/test.dll")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: worldport-plugin

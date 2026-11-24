@@ -32,6 +32,17 @@ capabilities = ["ui.page", "storage.kv", "toast", "network.http", "download.star
 readme = "README.md"
 icon = "assets/icon.png"
 
+# Both fetch-text and verified downloads are checked against this list.
+# GitHub's signed asset redirects are checked separately by the host.
+[package.metadata.bmcbl-plugin.permissions.network]
+allow = [
+    "https://bmcbl-plugin.chlna6666.com/v1/plugins/worldport.json",
+    "https://bmcbl-plugin.chlna6666.com/downloads/official/worldport/",
+    "https://github.com/BMCBL/WorldPort/releases/download/",
+    "https://release-assets.githubusercontent.com/",
+    "https://objects.githubusercontent.com/",
+]
+
 [profile.release]
 opt-level = "s"
 lto = "fat"
