@@ -23,6 +23,8 @@ pub mod poi;
 pub mod report;
 pub mod structure;
 pub mod tick;
+/// World-selection thumbnail conversion.
+pub mod world_icon;
 
 pub use convert::{ConversionOptions, ConversionPlan, Edition, Features};
 pub use error::{Result, WorldPortError};

@@ -723,7 +723,7 @@ fn digest_for_platform<'a>(components: &'a str, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, PAGE_ID, ReportSummary, State, ViewNode, digest_for_platform, page};
+    use super::{Event, PAGE_ID, ReportSummary, State, ViewNode, WorldInfo, digest_for_platform, page, source_directory};
 
     #[test]
     fn source_paths_accept_quotes_and_level_dat() {

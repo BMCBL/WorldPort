@@ -174,6 +174,7 @@ pub fn convert(
         );
     }
 
+    crate::world_icon::transfer(&plan.source, &plan.target, super::Edition::Bedrock, &mut report);
     report.begin_stage("maps");
     options.report(Progress::new("maps", 0, None));
     if plan.features.maps {
