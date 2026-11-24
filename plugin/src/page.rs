@@ -113,7 +113,7 @@ fn source_panel(state: &State) -> View {
     if state.detecting {
         body = body.child(detail("正在读取世界信息…"));
     } else if let Some(info) = &state.info {
-        body = body.child(info_card(info));
+        body = body.child(world_summary(info));
     } else if state.detect_error.is_some() {
         body = body.child(row().full_width()
             .child(detail("未识别到有效存档"))
@@ -190,7 +190,7 @@ fn version_options(java_target: bool) -> Vec<SelectOption> {
 }
 
 /// Compact list item: original world icon, display name and actual edition/version.
-fn info_card(info: &WorldInfo) -> View {
+fn world_summary(info: &WorldInfo) -> View {
     let edition = if info.edition == "java" { "Java 版" } else { "基岩版" };
     // An empty source uses the same fixed thumbnail slot as a real icon.
     let icon = View::node(image_options(
@@ -203,16 +203,26 @@ fn info_card(info: &WorldInfo) -> View {
         },
         "世界图标",
         ImageOptions::new()
-            .height(56).min_height(56).max_height(56)
-            .aspect_ratio(1, 1).corner_radius(8)
+            .height(40).min_height(40).max_height(40)
+            .aspect_ratio(1, 1).corner_radius(6)
             .fallback("世界").fit(ImageFit::Cover),
     ));
-    row().full_width().gap(12).padding(8).corner_radius(8)
-        .background(ThemeToken::Surface)
+    // This is inline metadata inside the source panel, not another card.
+    // Container::new defaults to 24 px padding; explicitly clear it on the
+    // text column so it cannot inflate the row by another 48 px.
+    row().full_width().gap(10).padding(0)
         .child(icon)
-        .child(View::column().full_width().gap(4)
+        .child(View::column().full_width().padding(0).gap(2).align(Align::Start)
             .child(text(info.level_name.clone(), ThemeToken::PrimaryText, true, true))
-            .child(detail(format!("{edition} · {}", info.version))))
+            .child(View::node(ViewNode::Text(TextNode {
+                text: bounded_text(format!("{edition} · {}", info.version)),
+                style: ViewStyle {
+                    color: Some(ThemeToken::SecondaryText),
+                    text_size: TextSizeToken::Small,
+                    full_width: true,
+                    ..default_style()
+                },
+            }))))
         .finish_view()
 }
 
@@ -584,3 +594,37 @@ fn compact_action(label: &str, action: &str, color: ThemeToken) -> View {
     }))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_summary_is_a_flat_compact_row() {
+        let info = WorldInfo {
+            level_name: "Bedrock level".into(),
+            edition: "bedrock".into(),
+            version: "1.26.60.5".into(),
+            ..WorldInfo::default()
+        };
+        let tree = world_summary(&info).finish();
+        let ViewNode::Container(row) = &tree.nodes[tree.root as usize] else {
+            panic!("expected summary row");
+        };
+        assert_eq!(row.style.padding, 0);
+        assert_eq!(row.style.background, None);
+        assert_eq!(row.children.len(), 2);
+        let ViewNode::Image(icon) = &tree.nodes[row.children[0] as usize] else {
+            panic!("expected thumbnail");
+        };
+        assert_eq!(icon.height, Some(40));
+        assert_eq!(icon.min_height, Some(40));
+        assert_eq!(icon.max_height, Some(40));
+        let ViewNode::Container(metadata) = &tree.nodes[row.children[1] as usize] else {
+            panic!("expected metadata column");
+        };
+        assert_eq!(metadata.style.padding, 0);
+        assert_eq!(metadata.style.gap, 2);
+        assert_eq!(metadata.children.len(), 2);
+    }
+}
