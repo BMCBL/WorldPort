@@ -22,8 +22,9 @@ mod updates;
 const PAGE_ID: &str = "convert";
 const EVENT_WAIT_MS: u32 = 10_000;
 const LOG_LINES: usize = 24;
-const STORAGE_SOURCE: &str = "last_source";
-const STORAGE_TARGET: &str = "last_target";
+// Migration only: paths are no longer persisted across plugin instances.
+const LEGACY_STORAGE_SOURCE: &str = "last_source";
+const LEGACY_STORAGE_TARGET: &str = "last_target";
 const STORAGE_JOBS: &str = "jobs";
 const STORAGE_COMPRESSION: &str = "compression";
 const STORAGE_DIGEST: &str = "native_sha256";
@@ -65,6 +66,7 @@ struct State {
     platform: Option<Platform>,
     source: String,
     target: String,
+    legacy_paths_cleanup_attempted: bool,
     info: Option<WorldInfo>,
     detecting: bool,
     last_probe: Option<String>,
@@ -118,6 +120,7 @@ impl Default for State {
             platform: None,
             source: String::new(),
             target: String::new(),
+            legacy_paths_cleanup_attempted: false,
             info: None,
             detecting: false,
             last_probe: None,
@@ -163,9 +166,9 @@ thread_local! {
 }
 
 impl State {
-    fn load_persisted(&mut self) {
-        self.source = storage_get(STORAGE_SOURCE).ok().flatten().unwrap_or_default();
-        self.target = storage_get(STORAGE_TARGET).ok().flatten().unwrap_or_default();
+    fn load_preferences(&mut self) {
+        // Source/target and detected metadata belong to this runtime instance.
+        // Only conversion preferences and native-component identity survive restart.
         self.jobs = storage_get(STORAGE_JOBS)
             .ok()
             .flatten()
@@ -185,11 +188,24 @@ impl State {
         self.digest_input = self.digest.clone().unwrap_or_default();
     }
 
-    fn persist_paths(&self) {
-        let _ = storage_set(STORAGE_SOURCE, &self.source);
-        let _ = storage_set(STORAGE_TARGET, &self.target);
+    fn persist_preferences(&self) {
         let _ = storage_set(STORAGE_JOBS, self.jobs.to_string());
         let _ = storage_set(STORAGE_COMPRESSION, self.compression.to_string());
+    }
+
+    // Older releases wrote absolute paths to persistent storage. Remove only
+    // those obsolete keys on the first normal event: the host may discard
+    // storage effects during init, and rendering must remain side-effect free.
+    fn remove_legacy_paths(&mut self) {
+        if self.legacy_paths_cleanup_attempted {
+            return;
+        }
+        self.legacy_paths_cleanup_attempted = true;
+        for key in [LEGACY_STORAGE_SOURCE, LEGACY_STORAGE_TARGET] {
+            if let Err(error) = storage_delete(key) {
+                log_warn(format!("Unable to remove obsolete WorldPort storage key {key}: {}", error.code));
+            }
+        }
     }
 
     fn native_ready(&self) -> bool {
@@ -376,7 +392,7 @@ impl State {
         self.show_log = false;
         self.unmapped_total = 0;
         self.report = None;
-        self.persist_paths();
+        self.persist_preferences();
         self.dispatch(Command::Start { request })?;
         self.request = None;
         self.running = true;
@@ -547,7 +563,7 @@ impl State {
 impl Plugin for WorldPort {
     fn init(_context: PluginContext) -> PluginResult<Vec<Registration>> {
         PAGE.with_borrow_mut(|state| {
-            state.load_persisted();
+            state.load_preferences();
             // A new Wasm generation needs a new native instance, not a new
             // download or approval. Resolve the platform and try native.load.
             // The host validates the persistent approval and actual file hash.
@@ -562,6 +578,7 @@ impl Plugin for WorldPort {
 
     fn handle_event(event: PluginEvent) -> PluginResult<()> {
         let changed = PAGE.with_borrow_mut(|state| -> PluginResult<bool> {
+            state.remove_legacy_paths();
             let mut changed = false;
             if let PluginEventKind::Action(action) = &event.kind
                 && event.page_id.as_deref().is_none_or(|page| page == PAGE_ID)
@@ -733,6 +750,32 @@ mod tests {
         assert_eq!(source_directory("/home/test/world/level.dat"), "/home/test/world/");
         assert_eq!(source_directory(r"C:\Saves\World"), r"C:\Saves\World");
         assert_eq!(source_directory("/home/test/world"), "/home/test/world");
+    }
+
+    #[test]
+    fn conversion_paths_belong_to_the_current_runtime_instance() {
+        let mut state = State::default();
+        state.set_source("/world/current".into());
+        state.target = "/world/output".into();
+        state.info = Some(WorldInfo {
+            level_name: "current".into(), ..WorldInfo::default()
+        });
+
+        // Rendering and navigating to another page do not reset in-flight
+        // conversion input or metadata.
+        let _ = page::render(&state, PAGE_ID);
+        let _ = page::render(&state, "another-page");
+        assert_eq!(state.source, "/world/current");
+        assert_eq!(state.target, "/world/output");
+        assert!(state.info.is_some());
+
+        // A new plugin instance starts with no world selected.
+        let restarted = State::default();
+        assert!(restarted.source.is_empty());
+        assert!(restarted.target.is_empty());
+        assert!(restarted.info.is_none());
+        assert!(!restarted.detecting);
+        assert!(restarted.last_probe.is_none());
     }
 
     #[test]
