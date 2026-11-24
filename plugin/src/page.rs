@@ -192,18 +192,15 @@ fn version_options(java_target: bool) -> Vec<SelectOption> {
 /// Compact list item: original world icon, display name and actual edition/version.
 fn info_card(info: &WorldInfo) -> View {
     let edition = if info.edition == "java" { "Java 版" } else { "基岩版" };
-    let icon = if info.map_preview.is_empty() {
-        View::node(bmcbl_plugin_api::icon("folder"))
-    } else {
-        View::node(image_options(
-            info.map_preview.clone(),
-            "世界图标",
-            ImageOptions::new()
-                .height(56).min_height(56).max_height(56)
-                .aspect_ratio(1, 1).corner_radius(8)
-                .fallback("世界").fit(ImageFit::Cover),
-        ))
-    };
+    // An empty source uses the same fixed thumbnail slot as a real icon.
+    let icon = View::node(image_options(
+        info.map_preview.clone(),
+        "世界图标",
+        ImageOptions::new()
+            .height(56).min_height(56).max_height(56)
+            .aspect_ratio(1, 1).corner_radius(8)
+            .fallback("世界").fit(ImageFit::Cover),
+    ));
     row().full_width().gap(12).padding(8).corner_radius(8)
         .background(ThemeToken::Surface)
         .child(icon)
