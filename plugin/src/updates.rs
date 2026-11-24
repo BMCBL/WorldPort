@@ -284,6 +284,28 @@ mod tests {
     }
 
     #[test]
+    fn release_index_matches_running_plugin_and_rejects_other_versions() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(RELEASE_INDEX.contains(&format!("/v{version}/")));
+        let sha = "a".repeat(64);
+        let metadata = serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "assets": [{
+                "name": "worldport-native-abi1-windows-x86_64-msvc.dll",
+                "digest": format!("sha256:{sha}"),
+                "size": 1024
+            }]
+        });
+        let host = platform("windows", "x86_64", "msvc");
+        let component = release_component(&metadata.to_string(), &host).expect("matching release");
+        assert_eq!(component.sha256(), sha);
+        assert!(component.request().is_some());
+        let mut wrong = metadata;
+        wrong["tag_name"] = serde_json::json!("v99.0.0");
+        assert!(release_component(&wrong.to_string(), &host).is_err());
+    }
+
+    #[test]
     fn component_name_follows_the_registry_contract() {
         // The registry only recognises this exact shape, so a rename here would
         // silently make every release asset undiscoverable.
@@ -315,8 +337,9 @@ mod tests {
             "version": "0.1.0",
             "native_assets": []
         }"#;
+        let text = text.replace("0.1.0", env!("CARGO_PKG_VERSION"));
         // Parses, but there is no asset for this platform.
-        assert!(registry_component(text, &platform("windows", "x86_64", "msvc")).is_err());
+        assert!(registry_component(&text, &platform("windows", "x86_64", "msvc")).is_err());
 
         // A different plugin id in the same document must not be accepted.
         let impostor = text.replace(r#""id": "worldport""#, r#""id": "paperconnect""#);
@@ -332,7 +355,7 @@ mod tests {
                 "id": "worldport",
                 "repository": "BMCBL/WorldPort",
                 "status": "official",
-                "version": "0.1.0",
+                "version": "{version}",
                 "native_assets": [{{
                     "abi_major": 1,
                     "os": "windows",
@@ -343,7 +366,8 @@ mod tests {
                     "sha256": "{sha}",
                     "sources": [{{"type": "github", "url": "https://evil.example/x.dll"}}]
                 }}]
-            }}"#
+            }}"#,
+            version = env!("CARGO_PKG_VERSION")
         );
         // The GitHub URL is not the release URL, and the required release URL is
         // absent, so the document is rejected rather than trusted.
