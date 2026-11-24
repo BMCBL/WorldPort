@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "worldport-plugin"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bmcbl_plugin_api",
  "semver",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "worldport-protocol"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "postcard",
  "serde",
