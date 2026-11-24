@@ -16,7 +16,7 @@ use worldport_core::je::{JeChunkPos, JeDimension};
 use worldport_core::mapping::{BlockMapper, JavaCatalog, bedrock_catalog};
 use worldport_core::nbt::{NbtExt, compound, empty_compound, tag_list, tag_string};
 
-const MODERN_LAYOUT: i32 = 3953;
+const MODERN_LAYOUT: i32 = 4786;
 
 fn manifest() -> BTreeMap<String, i32> {
     serde_json::from_str(include_str!("../../mappings/je_versions.json"))
@@ -120,7 +120,7 @@ fn palette_chunk(data_version: i32) -> NbtTag {
         ("xPos", NbtTag::Int(0)),
         ("zPos", NbtTag::Int(0)),
         ("yPos", NbtTag::Int(-4)),
-        ("Status", tag_string(if data_version >= MODERN_LAYOUT { "minecraft:full" } else { "full" })),
+        ("Status", tag_string(if data_version >= 3578 { "minecraft:full" } else { "full" })),
         ("sections", tag_list(vec![section])),
         ("Heightmaps", compound([
             ("WORLD_SURFACE", NbtTag::LongArray(vec![0; 37])),
@@ -148,6 +148,7 @@ fn make_world(root: &Path, data_version: i32) {
         ("GameType", NbtTag::Int(0)),
         ("Difficulty", NbtTag::Byte(2)),
         ("Time", NbtTag::Long(1234)),
+        ("LastPlayed", NbtTag::Long(1_700_000_000_000)),
     ]))]);
     nbt::write_gzip(&root.join("level.dat"), "", &level).expect("Java level.dat");
     let region = if data_version >= MODERN_LAYOUT {
@@ -231,8 +232,15 @@ fn every_version_converts_java_to_bedrock_and_back_without_palette_differences()
         convert::run(&reverse, &ConversionOptions::default())
             .unwrap_or_else(|error| panic!("{version}: BE -> JE: {error}"));
 
+        let actual_region = if data_version >= MODERN_LAYOUT {
+            restored.join("dimensions/minecraft/overworld/region/r.0.0.mca")
+        } else {
+            restored.join("region/r.0.0.mca")
+        };
+        assert!(actual_region.is_file(), "{version}: incorrect target region directory");
         let a = JavaWorld::open(&source).expect("source Java world");
         let b = JavaWorld::open(&restored).expect("converted Java world");
+        assert_eq!(b.data().get_int("LastPlayed"), Some(1_700_000_000_000), "{version}");
         let diff = compare_java(&a, &b, JeDimension::Overworld)
             .unwrap_or_else(|error| panic!("{version}: compare: {error}"));
         assert_eq!(diff.first_chunks, 1, "{version}");

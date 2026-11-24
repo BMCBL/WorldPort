@@ -62,8 +62,15 @@ pub fn bedrock_to_java(be: &NbtTag, uuid: [i32; 4], data_version: i32) -> NbtTag
     // while `uuid` is only a hash of the Bedrock storage key.
     let uuid = java_uuid_of(be).unwrap_or(uuid);
     out.insert("UUID".to_string(), NbtTag::IntArray(uuid.to_vec()));
-    if let Some(pos) = be.get_list("Pos") {
-        out.insert("Pos".to_string(), double_list(pos));
+    if let Some(pos) = position(be) {
+        out.insert("Pos".to_string(), tag_list(vec![
+            NbtTag::Double(pos[0]),
+            NbtTag::Double(pos[1] - f64::from(BEDROCK_PLAYER_OFFSET)),
+            NbtTag::Double(pos[2]),
+        ]));
+    }
+    if let Some(motion) = be.get_list("Motion") {
+        out.insert("Motion".to_string(), double_list(motion));
     }
     if let Some(rotation) = be.get_list("Rotation") {
         out.insert("Rotation".to_string(), NbtTag::List(rotation.to_vec()));
@@ -160,6 +167,7 @@ const OWNED_JAVA_FIELDS: &[&str] = &[
     "UUID",
     "Pos",
     "Rotation",
+    "Motion",
     "Health",
     "XpLevel",
     "XpP",
@@ -199,8 +207,15 @@ pub fn java_to_bedrock(je: &NbtTag) -> NbtTag {
             );
         }
     }
-    if let Some(pos) = je.get_list("Pos") {
-        out.insert("Pos".to_string(), float_list(pos));
+    if let Some(pos) = position(je) {
+        out.insert("Pos".to_string(), tag_list(vec![
+            NbtTag::Float(pos[0] as f32),
+            NbtTag::Float(pos[1] as f32 + BEDROCK_PLAYER_OFFSET),
+            NbtTag::Float(pos[2] as f32),
+        ]));
+    }
+    if let Some(motion) = je.get_list("Motion") {
+        out.insert("Motion".to_string(), float_list(motion));
     }
     if let Some(rotation) = je.get_list("Rotation") {
         out.insert("Rotation".to_string(), NbtTag::List(rotation.to_vec()));
@@ -379,6 +394,21 @@ fn bedrock_effects(list: &[NbtTag]) -> NbtTag {
     tag_list(entries)
 }
 
+// Bedrock stores a player's eye position; Java stores feet. The small
+// epsilon matches the native saved position used by Chunker.
+const BEDROCK_PLAYER_OFFSET: f32 = 1.62001;
+
+fn position(tag: &NbtTag) -> Option<[f64; 3]> {
+    let [x, y, z] = tag.get_list("Pos")? else { return None };
+    let values = [x.as_f64_value()?, y.as_f64_value()?, z.as_f64_value()?];
+    values.iter().all(|v| v.is_finite()).then_some(values)
+}
+
+/// Checks that a local player has a usable finite XYZ position.
+pub(crate) fn valid_position(tag: &NbtTag) -> bool {
+    position(tag).is_some()
+}
+
 fn float_list(values: &[NbtTag]) -> NbtTag {
     NbtTag::List(
         values
@@ -461,8 +491,14 @@ mod tests {
         let be = java_to_bedrock(&je);
         assert_eq!(be.get_int("PlayerGameType"), Some(1));
         assert_eq!(be.get_int("DimensionId"), Some(1));
+        let pos = position(&be).unwrap();
+        assert_eq!(pos[0], 1.5);
+        assert_eq!(pos[2], -2.5);
+        assert!((pos[1] - 71.62001).abs() < 0.00002);
         let back = bedrock_to_java(&be, [1, 2, 3, 4], 4903);
         assert_eq!(back.get_str("Dimension"), Some("minecraft:the_nether"));
+        let pos = position(&back).unwrap();
+        assert!((pos[1] - 70.0).abs() < 0.00002);
         assert_eq!(back.get_int("XpLevel"), Some(7));
         let inventory = back.get_list("Inventory").expect("inventory");
         assert_eq!(inventory[0].get_int("Slot"), Some(5));

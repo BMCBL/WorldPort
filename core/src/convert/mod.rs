@@ -363,3 +363,9 @@ fn prepare_target(target: &Path, overwrite: bool) -> Result<()> {
     std::fs::create_dir_all(target).map_err(|error| WorldPortError::io(target, error))?;
     Ok(())
 }
+
+/// Current Unix milliseconds for missing or invalid source timestamps.
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .ok().and_then(|duration| i64::try_from(duration.as_millis()).ok()).unwrap_or(0)
+}

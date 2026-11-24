@@ -319,14 +319,16 @@ fn write_player(
     // accounts has several files and the choice would follow sort order. A
     // selector wins when given; otherwise the most recently played player is
     // used, and the decision is always reported so it is never silent.
-    let chosen = choose_player(world, selector, report)?;
+    // Before 26.1 the embedded local player is authoritative.
+    let embedded = selector.is_none().then(|| world.data().get("Player")).flatten();
+    let chosen = if embedded.is_none() { choose_player(world, selector, report)? } else { None };
     let player = if let Some((stem, path)) = chosen {
         report.warn(
             WarningCode::Notice,
             "player",
             format!("converted player {stem} as the Bedrock local player"),
         );
-        je_nbt::read_gzip(&path).ok()
+        Some(je_nbt::read_gzip(&path)?)
     } else {
         world
             .data()
@@ -439,7 +441,8 @@ fn choose_player(
 
 /// The single-player owner Java records in `level.dat`, as a dashed UUID.
 fn singleplayer_uuid(world: &JavaWorld) -> Option<String> {
-    let raw = world.data().get_i32_array("SingleplayerUUID")?;
+    let raw = world.data().get_i32_array("singleplayer_uuid")
+        .or_else(|| world.data().get_i32_array("SingleplayerUUID"))?;
     let value = <[i32; 4]>::try_from(raw).ok()?;
     // Java stores the UUID as four big-endian ints.
     Some(format!(
@@ -1367,6 +1370,9 @@ fn level_dat_root(world: &JavaWorld, report: &mut ReportBuilder) -> Result<NbtTa
         NbtTag::String(world.level_name()),
     );
     root.insert("RandomSeed".to_string(), NbtTag::Long(world.seed()));
+    let last_played = data.get_int("LastPlayed").filter(|ms| *ms > 0)
+        .unwrap_or_else(super::unix_millis);
+    root.insert("LastPlayed".to_string(), NbtTag::Long(last_played / 1000));
     root.insert("SpawnX".to_string(), NbtTag::Int(spawn.x));
     root.insert("SpawnY".to_string(), NbtTag::Int(spawn.y));
     root.insert("SpawnZ".to_string(), NbtTag::Int(spawn.z));

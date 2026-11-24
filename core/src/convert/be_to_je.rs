@@ -30,8 +30,10 @@ use crate::report::{ReportBuilder, WarningCode};
 
 /// Oldest Java target whose chunk layout this writer emits (1.18 sections).
 pub const MIN_TARGET_DATA_VERSION: i32 = 2860;
-/// 1.21 moved vanilla dimensions into `dimensions/<namespace>/<path>/`.
-const DIMENSIONS_LAYOUT_DATA_VERSION: i32 = 3953;
+/// 26.1 moved vanilla dimensions into `dimensions/<namespace>/<path>/`.
+const DIMENSIONS_LAYOUT_DATA_VERSION: i32 = 4786;
+/// Java 1.20.2+ stores generation status as a namespaced identifier.
+const NAMESPACED_STATUS_DATA_VERSION: i32 = 3578;
 /// 26.1 split `level.dat` into `data/minecraft/*.dat`, `players/data` and `data/minecraft/maps`.
 const SPLIT_DATA_VERSION: i32 = 4786;
 /// 1.16 moved map `dimension` from a byte to a string id.
@@ -82,7 +84,7 @@ impl JavaTarget {
     }
 
     fn status(&self) -> &'static str {
-        if self.data_version >= DIMENSIONS_LAYOUT_DATA_VERSION {
+        if self.data_version >= NAMESPACED_STATUS_DATA_VERSION {
             "minecraft:full"
         } else {
             "full"
@@ -181,7 +183,7 @@ pub fn convert(
 
     report.begin_stage("players");
     options.report(Progress::new("players", 0, None));
-    let player_uuid = if plan.features.players {
+    let local_player = if plan.features.players {
         write_players(&plan.target, &world, &target, &mut report)?
     } else {
         None
@@ -201,7 +203,7 @@ pub fn convert(
         &plan.target,
         &world,
         &level_name,
-        player_uuid,
+        local_player,
         plan,
         &target,
         &mut report,
@@ -462,7 +464,7 @@ fn read_chunk(
     let min_y = pos.y_range(ChunkVersion::New).0;
     let mut sections: Vec<NbtTag> = Vec::new();
     // Heightmaps start at "no block yet", which is the minimum height itself.
-    let mut height_map = [0_i16; 256];
+    let mut height_map = [min_y as i16; 256];
     let mut any_blocks = false;
     // Cells whose state depended on a neighbour and had to be recomputed.
     let mut neighbour_states = 0_usize;
@@ -563,7 +565,7 @@ fn read_chunk(
             let section_bottom = i16::from(section_y) * 16;
             for x in 0..16_usize {
                 for z in 0..16_usize {
-                    let mut column_height = 0;
+                    let mut column_height = min_y as i16;
                     for local_y in 0..16_usize {
                         let offset = x * 256 + z * 16 + local_y;
                         let Some(state_index) = packed.get(offset).copied() else {
@@ -1115,9 +1117,9 @@ fn write_players(
     world: &World,
     target: &JavaTarget,
     report: &mut ReportBuilder,
-) -> Result<Option<[i32; 4]>> {
+) -> Result<Option<([i32; 4], NbtTag)>> {
     let ids = world.players()?;
-    let mut chosen: Option<[i32; 4]> = None;
+    let mut chosen: Option<([i32; 4], NbtTag)> = None;
     // Only the local player is converted.
     //
     // A Bedrock world also stores `player_<xuid>` records, but those are
@@ -1136,7 +1138,9 @@ fn write_players(
             continue;
         };
         // Server identity stubs have no position and no inventory.
-        if player.nbt.get_list("Pos").is_none() {
+        if !crate::player::valid_position(&player.nbt) {
+            report.warn(WarningCode::Skipped, "local-player-position",
+                "local player has no valid finite XYZ position; using the world's spawn");
             continue;
         }
         let key = id
@@ -1154,7 +1158,7 @@ fn write_players(
             .join(format!("{}.dat", uuid_string(uuid)));
         je_nbt::write_gzip(&path, "", &java)?;
         report.counters().players += 1;
-        chosen.get_or_insert(uuid);
+        chosen.get_or_insert((uuid, java));
     }
     if server_players > 0 {
         report.warn(
@@ -1379,7 +1383,7 @@ fn write_java_level(
     world_root: &Path,
     world: &World,
     level_name: &str,
-    player_uuid: Option<[i32; 4]>,
+    local_player: Option<([i32; 4], NbtTag)>,
     plan: &ConversionPlan,
     target: &JavaTarget,
     report: &mut ReportBuilder,
@@ -1437,9 +1441,19 @@ fn write_java_level(
     root.insert("initialized".to_string(), NbtTag::Byte(1));
     root.insert("WasModded".to_string(), NbtTag::Byte(0));
     root.insert("ServerBrands".to_string(), tag_list(vec![tag_string("vanilla")]));
-    root.insert("LastPlayed".to_string(), NbtTag::Long(0));
-    if target.split_data && let Some(uuid) = player_uuid {
-        root.insert("singleplayer_uuid".to_string(), NbtTag::IntArray(uuid.to_vec()));
+    let last_played = level.root.get_int("LastPlayed")
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.checked_mul(1000))
+        .unwrap_or_else(|| super::unix_millis());
+    root.insert("LastPlayed".to_string(), NbtTag::Long(last_played));
+    if let Some((uuid, player)) = local_player {
+        if target.split_data {
+            root.insert("singleplayer_uuid".to_string(), NbtTag::IntArray(uuid.to_vec()));
+        } else {
+            // Before 26.1 the integrated server uses Data.Player, not an
+            // arbitrary playerdata filename with a synthetic UUID.
+            root.insert("Player".to_string(), player);
+        }
     }
     root.insert("version".to_string(), NbtTag::Int(19133));
 
@@ -1693,11 +1707,13 @@ mod tests {
     #[test]
     fn heightmap_clamps_below_the_minimum_to_zero() {
         // An empty column starts at the minimum height and must not underflow.
-        let heights = [0_i16; 256];
+        let mut heights = [-64_i16; 256];
+        heights[1] = -31; // top block at y=-32
         let NbtTag::LongArray(words) = packed_heightmap(&heights, -64) else {
             panic!("long array");
         };
-        assert_eq!(words[0] & 0x1FF, 64);
+        assert_eq!(words[0] & 0x1FF, 0);
+        assert_eq!((words[0] >> 9) & 0x1FF, 33);
     }
 
     #[test]

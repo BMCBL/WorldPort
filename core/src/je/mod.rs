@@ -21,7 +21,7 @@ pub enum JeDimension {
 }
 
 impl JeDimension {
-    /// Resource-location path used by the 1.21+ layout.
+    /// Resource-location path used by the 26.1+ layout.
     #[must_use]
     pub const fn folder_name(self) -> &'static str {
         match self {
