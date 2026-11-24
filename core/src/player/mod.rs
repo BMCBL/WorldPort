@@ -120,21 +120,34 @@ pub fn bedrock_to_java(be: &NbtTag, uuid: [i32; 4], data_version: i32) -> NbtTag
     if let Some(effects) = be.get_list("ActiveEffects") {
         out.insert("active_effects".to_string(), java_effects(effects));
     }
-    for field in ["SpawnX", "SpawnY", "SpawnZ", "SpawnForced", "SpawnAngle"] {
-        if let Some(value) = be.get(field) {
-            out.insert(field.to_string(), value.clone());
-        }
+    // Remove legacy residual fields before encoding the target schema.
+    for field in ["SpawnX", "SpawnY", "SpawnZ", "SpawnForced", "SpawnAngle", "SpawnDimension", "respawn"] {
+        out.shift_remove(field);
     }
-    if let Some(dimension) = be.get_int("SpawnDimension") {
-        out.insert(
-            "SpawnDimension".to_string(),
-            tag_string(dimension_name(dimension)),
-        );
-    } else if be.get("SpawnX").is_some() {
-        out.insert(
-            "SpawnDimension".to_string(),
-            tag_string("minecraft:overworld"),
-        );
+    if let Some([x, y, z]) = spawn_position(be) {
+        let dimension = dimension_name(be.get_int("SpawnDimension").unwrap_or(0));
+        let angle = be.get_f64("SpawnAngle").unwrap_or(0.0) as f32;
+        let forced = be.get_bool("SpawnForced").unwrap_or(false);
+        if data_version >= 4315 {
+            let mut fields = IndexMap::new();
+            fields.insert("pos".into(), NbtTag::IntArray(vec![x, y, z]));
+            fields.insert("dimension".into(), tag_string(dimension));
+            fields.insert("forced".into(), NbtTag::Byte(i8::from(forced)));
+            if data_version >= 4548 {
+                fields.insert("yaw".into(), NbtTag::Float(angle));
+                fields.insert("pitch".into(), NbtTag::Float(0.0));
+            } else {
+                fields.insert("angle".into(), NbtTag::Float(angle));
+            }
+            out.insert("respawn".into(), NbtTag::Compound(fields));
+        } else {
+            out.insert("SpawnX".into(), NbtTag::Int(x));
+            out.insert("SpawnY".into(), NbtTag::Int(y));
+            out.insert("SpawnZ".into(), NbtTag::Int(z));
+            out.insert("SpawnAngle".into(), NbtTag::Float(angle));
+            out.insert("SpawnForced".into(), NbtTag::Byte(i8::from(forced)));
+            out.insert("SpawnDimension".into(), tag_string(dimension));
+        }
     }
     if let Some(abilities) = be.get("abilities") {
         out.insert("abilities".to_string(), abilities.clone());
@@ -183,6 +196,7 @@ const OWNED_JAVA_FIELDS: &[&str] = &[
     "SpawnDimension",
     "SpawnAngle",
     "SpawnForced",
+    "respawn",
     "Dimension",
 ];
 
@@ -265,16 +279,23 @@ pub fn java_to_bedrock(je: &NbtTag) -> NbtTag {
     if let Some(effects) = je.get_list("active_effects") {
         out.insert("ActiveEffects".to_string(), bedrock_effects(effects));
     }
-    for field in ["SpawnX", "SpawnY", "SpawnZ"] {
-        if let Some(value) = je.get(field) {
-            out.insert(field.to_string(), value.clone());
-        }
-    }
-    if let Some(dimension) = je.get_str("SpawnDimension") {
-        out.insert(
-            "SpawnDimension".to_string(),
-            NbtTag::Int(dimension_id(dimension)),
-        );
+    let modern = je.get("respawn");
+    let respawn_pos = modern.and_then(|spawn| spawn.get_i32_array("pos"))
+        .and_then(|pos| <[i32; 3]>::try_from(pos).ok())
+        .or_else(|| spawn_position(je));
+    if let Some([x, y, z]) = respawn_pos {
+        out.insert("SpawnX".into(), NbtTag::Int(x));
+        out.insert("SpawnY".into(), NbtTag::Int(y));
+        out.insert("SpawnZ".into(), NbtTag::Int(z));
+        let dimension = modern.and_then(|spawn| spawn.get_str("dimension"))
+            .or_else(|| je.get_str("SpawnDimension")).unwrap_or("minecraft:overworld");
+        out.insert("SpawnDimension".into(), NbtTag::Int(dimension_id(dimension)));
+        let angle = modern.and_then(|spawn| spawn.get_f64("yaw").or_else(|| spawn.get_f64("angle")))
+            .or_else(|| je.get_f64("SpawnAngle")).unwrap_or(0.0);
+        out.insert("SpawnAngle".into(), NbtTag::Float(angle as f32));
+        let forced = modern.and_then(|spawn| spawn.get_bool("forced"))
+            .or_else(|| je.get_bool("SpawnForced")).unwrap_or(false);
+        out.insert("SpawnForced".into(), NbtTag::Byte(i8::from(forced)));
     }
     if let Some(abilities) = je.get("abilities") {
         out.insert("abilities".to_string(), abilities.clone());
@@ -398,6 +419,14 @@ fn bedrock_effects(list: &[NbtTag]) -> NbtTag {
 // epsilon matches the native saved position used by Chunker.
 const BEDROCK_PLAYER_OFFSET: f32 = 1.62001;
 
+fn spawn_position(tag: &NbtTag) -> Option<[i32; 3]> {
+    Some([
+        i32::try_from(tag.get_int("SpawnX")?).ok()?,
+        i32::try_from(tag.get_int("SpawnY")?).ok()?,
+        i32::try_from(tag.get_int("SpawnZ")?).ok()?,
+    ])
+}
+
 fn position(tag: &NbtTag) -> Option<[f64; 3]> {
     let [x, y, z] = tag.get_list("Pos")? else { return None };
     let values = [x.as_f64_value()?, y.as_f64_value()?, z.as_f64_value()?];
@@ -503,6 +532,39 @@ mod tests {
         let inventory = back.get_list("Inventory").expect("inventory");
         assert_eq!(inventory[0].get_int("Slot"), Some(5));
         assert_eq!(inventory[0].get_str("id"), Some("minecraft:stone"));
+    }
+
+    #[test]
+    fn respawn_schema_matches_target_version_and_roundtrips() {
+        let bedrock = compound([
+            ("SpawnX", NbtTag::Int(-513)), ("SpawnY", NbtTag::Int(65)),
+            ("SpawnZ", NbtTag::Int(31)), ("SpawnDimension", NbtTag::Int(1)),
+            ("SpawnAngle", NbtTag::Float(90.0)), ("SpawnForced", NbtTag::Byte(1)),
+        ]);
+        for version in [3839, 4189, 4440, 4554, 4786, 4903, 5128] {
+            let java = bedrock_to_java(&bedrock, [1, 2, 3, 4], version);
+            if version < 4315 {
+                assert_eq!(java.get_int("SpawnX"), Some(-513));
+                assert_eq!(java.get_str("SpawnDimension"), Some("minecraft:the_nether"));
+                assert!(java.get("respawn").is_none());
+            } else {
+                assert!(java.get("SpawnX").is_none());
+                let spawn = java.get("respawn").expect("modern respawn");
+                assert_eq!(spawn.get_i32_array("pos"), Some(&[-513, 65, 31][..]));
+                assert_eq!(spawn.get_str("dimension"), Some("minecraft:the_nether"));
+                if version >= 4548 {
+                    assert_eq!(spawn.get_f64("yaw"), Some(90.0));
+                    assert_eq!(spawn.get_f64("pitch"), Some(0.0));
+                    assert!(spawn.get("angle").is_none());
+                } else {
+                    assert_eq!(spawn.get_f64("angle"), Some(90.0));
+                }
+            }
+            let restored = java_to_bedrock(&java);
+            assert_eq!(spawn_position(&restored), Some([-513, 65, 31]));
+            assert_eq!(restored.get_int("SpawnDimension"), Some(1));
+            assert_eq!(restored.get_f64("SpawnAngle"), Some(90.0));
+        }
     }
 
     #[test]

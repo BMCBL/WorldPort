@@ -1410,6 +1410,7 @@ fn write_java_level(
     let rain_time = level.root.get_int("RainTime").unwrap_or(0) as i32;
     let thunder_time = level.root.get_int("LightningTime").unwrap_or(0) as i32;
     let current_tick = level.root.get_int("currentTick").unwrap_or(0);
+    let day_tick = level.root.get_int("Time").unwrap_or(current_tick);
 
     let mut root = IndexMap::new();
     root.insert(
@@ -1432,7 +1433,7 @@ fn write_java_level(
     );
     root.insert(
         "Time".to_string(),
-        NbtTag::Long(level.root.get_int("Time").unwrap_or(0)),
+        NbtTag::Long(current_tick),
     );
     root.insert(
         "allowCommands".to_string(),
@@ -1548,7 +1549,7 @@ fn write_java_level(
         root.insert("rainTime".to_string(), NbtTag::Int(rain_time));
         root.insert("thunderTime".to_string(), NbtTag::Int(thunder_time));
         root.insert("clearWeatherTime".to_string(), NbtTag::Int(0));
-        root.insert("DayTime".to_string(), NbtTag::Long(current_tick));
+        root.insert("DayTime".to_string(), NbtTag::Long(day_tick));
     }
 
     let mut world_gen = java_worldgen(level.root.get_int("RandomSeed").unwrap_or(0));
@@ -1589,7 +1590,7 @@ fn write_java_level(
         clocks.insert(
             "minecraft:overworld".to_string(),
             compound([
-                ("total_ticks", NbtTag::Long(current_tick)),
+                ("total_ticks", NbtTag::Long(day_tick)),
                 ("partial_tick", NbtTag::Float(0.0)),
                 ("rate", NbtTag::Float(1.0)),
             ]),

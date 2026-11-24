@@ -148,6 +148,7 @@ fn make_world(root: &Path, data_version: i32) {
         ("GameType", NbtTag::Int(0)),
         ("Difficulty", NbtTag::Byte(2)),
         ("Time", NbtTag::Long(1234)),
+        ("DayTime", NbtTag::Long(5678)),
         ("LastPlayed", NbtTag::Long(1_700_000_000_000)),
     ]))]);
     nbt::write_gzip(&root.join("level.dat"), "", &level).expect("Java level.dat");
@@ -241,6 +242,8 @@ fn every_version_converts_java_to_bedrock_and_back_without_palette_differences()
         let a = JavaWorld::open(&source).expect("source Java world");
         let b = JavaWorld::open(&restored).expect("converted Java world");
         assert_eq!(b.data().get_int("LastPlayed"), Some(1_700_000_000_000), "{version}");
+        assert_eq!(b.total_ticks(), 1234, "{version}: simulation clock");
+        assert_eq!(b.day_ticks(), 5678, "{version}: daylight clock");
         let diff = compare_java(&a, &b, JeDimension::Overworld)
             .unwrap_or_else(|error| panic!("{version}: compare: {error}"));
         assert_eq!(diff.first_chunks, 1, "{version}");

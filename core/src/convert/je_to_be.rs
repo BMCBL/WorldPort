@@ -1391,7 +1391,7 @@ fn level_dat_root(world: &JavaWorld, report: &mut ReportBuilder) -> Result<NbtTa
     );
     root.insert(
         "Time".to_string(),
-        NbtTag::Long(data.get_int("Time").unwrap_or(0)),
+        NbtTag::Long(world.day_ticks()),
     );
     root.insert(
         "currentTick".to_string(),

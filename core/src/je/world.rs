@@ -135,7 +135,8 @@ impl JavaWorld {
                 "level.dat has no Data compound; this is not a Java Edition world",
             ));
         }
-        let layout = detect_layout(&root);
+        let data_version = level_dat.tag.get("Data").and_then(|data| data.get_int("DataVersion")).unwrap_or(0);
+        let layout = detect_layout(&root, data_version);
         let data_dir = root.join("data").join("minecraft");
         Ok(Self {
             world_gen_settings: read_split_data(&data_dir, "world_gen_settings"),
@@ -222,9 +223,15 @@ impl JavaWorld {
             .unwrap_or(0)
     }
 
-    /// Total game ticks for a dimension; 26.x keeps them in `world_clocks.dat`.
+    /// Total elapsed simulation ticks (not the mutable daylight clock).
     #[must_use]
     pub fn total_ticks(&self) -> i64 {
+        self.data().get_int("Time").unwrap_or_else(|| self.day_ticks())
+    }
+
+    /// Daylight ticks, including the 26.x split overworld clock.
+    #[must_use]
+    pub fn day_ticks(&self) -> i64 {
         if let Some(clocks) = &self.world_clocks {
             for dimension in ["minecraft:overworld", "overworld"] {
                 if let Some(clock) = clocks.get(dimension)
@@ -234,11 +241,9 @@ impl JavaWorld {
                 }
             }
         }
-        // `Time` is the world's game time; `DayTime` is only the time of day and
-        // must not be used as a scheduling clock.
         self.data()
-            .get_int("Time")
-            .or_else(|| self.data().get_int("DayTime"))
+            .get_int("DayTime")
+            .or_else(|| self.data().get_int("Time"))
             .unwrap_or(0)
     }
 
@@ -529,8 +534,14 @@ impl JavaWorld {
     }
 }
 
-fn detect_layout(root: &Path) -> WorldLayout {
-    if root.join("dimensions").is_dir() {
+fn detect_layout(root: &Path, data_version: i64) -> WorldLayout {
+    // A pre-26.1 world may have a dimensions directory for custom dimensions.
+    // Prefer its actual vanilla layout; retain compatibility with old WorldPort
+    // outputs which incorrectly used the 26.1 paths for earlier versions.
+    let legacy = ["region", "DIM-1", "DIM1"].iter().any(|name| root.join(name).is_dir());
+    let modern = ["overworld", "the_nether", "the_end"].iter().any(|name|
+        root.join("dimensions").join("minecraft").join(name).is_dir());
+    if data_version >= 4786 || (!legacy && modern) {
         WorldLayout::Modern
     } else {
         WorldLayout::Legacy
