@@ -44,10 +44,27 @@ fn read(path: &Path) -> Result<DynamicImage> {
 /// Returns no preview when the source world has no usable thumbnail.
 pub fn preview(root: &Path, edition: Edition) -> Option<Vec<u8>> {
     let image = read(&source_icon(root, edition)?).ok()?;
+    // 6 KiB minus the data URL prefix and Base64 expansion fits even
+    // hosts that enforce the older 8 KiB per-string view limit.
+    const MAX_PREVIEW_BYTES: usize = 6 * 1024 - 32;
+    let thumbnail = image.resize_to_fill(64, 64, FilterType::Triangle);
     let mut output = Cursor::new(Vec::new());
-    image.resize_to_fill(64, 64, FilterType::Triangle)
-        .write_to(&mut output, ImageFormat::Png).ok()?;
-    Some(output.into_inner())
+    thumbnail.write_to(&mut output, ImageFormat::Png).ok()?;
+    if output.get_ref().len() <= MAX_PREVIEW_BYTES {
+        return Some(output.into_inner());
+    }
+    // Preserve the 64x64 dimensions for noisy screenshots; JPEG is only
+    // used for the UI preview, never for converting the original icon.
+    let rgb = thumbnail.to_rgb8();
+    for quality in [90, 75, 50] {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(&rgb).ok()?;
+        if bytes.len() <= MAX_PREVIEW_BYTES {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 fn convert(source: &Path, target: &Path, edition: Edition) -> Result<()> {
@@ -112,6 +129,23 @@ mod tests {
         let preview = preview(source.path(), Edition::Bedrock).unwrap();
         assert!(preview.len() < 90 * 1024);
         assert!(preview.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn high_entropy_preview_fits_legacy_view_string_budget() {
+        let source = tempfile::tempdir().unwrap();
+        let mut seed = 1_u32;
+        let icon = image::RgbImage::from_fn(64, 64, |_, _| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            image::Rgb([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8])
+        });
+        icon.save(source.path().join("icon.png")).unwrap();
+        let bytes = preview(source.path(), Edition::Java).unwrap();
+        assert!(22 + bytes.len().div_ceil(3) * 4 <= 8192);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
     }
 
     #[test]

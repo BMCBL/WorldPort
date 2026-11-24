@@ -201,6 +201,8 @@ impl State {
         if self.log.len() >= LOG_LINES {
             self.log.pop_front();
         }
+        #[cfg(target_arch = "wasm32")]
+        bmcbl_plugin_api::log_info(&message);
         self.log.push_back(message);
     }
 

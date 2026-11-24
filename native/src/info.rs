@@ -51,7 +51,10 @@ pub fn world_info(path: &Path) -> Result<WorldInfo> {
 // the original Bedrock screenshot is a large JPEG.
 fn world_icon(path: &Path, edition: Edition) -> String {
     worldport_core::world_icon::preview(path, edition)
-        .map(|png| format!("data:image/png;base64,{}", worldport_core::map_item::preview::base64(&png)))
+        .map(|bytes| {
+            let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { "png" } else { "jpeg" };
+            format!("data:image/{mime};base64,{}", worldport_core::map_item::preview::base64(&bytes))
+        })
         .unwrap_or_default()
 }
 

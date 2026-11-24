@@ -194,7 +194,13 @@ fn info_card(info: &WorldInfo) -> View {
     let edition = if info.edition == "java" { "Java 版" } else { "基岩版" };
     // An empty source uses the same fixed thumbnail slot as a real icon.
     let icon = View::node(image_options(
-        info.map_preview.clone(),
+        // Old native modules may still return a large PNG. Keep the page
+        // usable even when the optional preview exceeds legacy host limits.
+        if info.map_preview.len() <= 8192 {
+            info.map_preview.clone()
+        } else {
+            String::new()
+        },
         "世界图标",
         ImageOptions::new()
             .height(56).min_height(56).max_height(56)
@@ -541,7 +547,7 @@ fn text(
     full_width: bool,
 ) -> View {
     View::node(ViewNode::Text(TextNode {
-        text: value.into(),
+        text: bounded_text(value.into()),
         style: ViewStyle {
             color: Some(color),
             emphasis,
@@ -549,6 +555,20 @@ fn text(
             ..default_style()
         },
     }))
+}
+
+// Bound diagnostic and world-provided text without splitting UTF-8.
+fn bounded_text(mut value: String) -> String {
+    const MAX_BYTES: usize = 8192;
+    if value.len() > MAX_BYTES {
+        let mut end = MAX_BYTES - '…'.len_utf8();
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+        value.push('…');
+    }
+    value
 }
 
 fn compact_action(label: &str, action: &str, color: ThemeToken) -> View {
