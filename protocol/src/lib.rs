@@ -182,10 +182,10 @@ pub struct WorldInfo {
     pub players: u64,
     /// Map items found in the world.
     pub maps: u64,
-    /// Preview of the world's first map, as an image `src`.
+    /// Original save icon as a bounded PNG/JPEG data URL.
     ///
-    /// Empty when the world has no map to draw, which is the common case for a
-    /// fresh world; the page then shows its placeholder instead of an empty box.
+    /// Empty when the world has no usable icon. The wire field name is retained
+    /// for compatibility with existing native event encoders.
     #[serde(default)]
     pub map_preview: String,
 }

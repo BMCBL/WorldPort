@@ -67,6 +67,8 @@ struct State {
     target: String,
     info: Option<WorldInfo>,
     detecting: bool,
+    last_probe: Option<String>,
+    detect_error: Option<String>,
     browse: Option<Browse>,
     /// Empty for "the other edition".
     direction: String,
@@ -86,6 +88,8 @@ struct State {
     elapsed_ms: u64,
     /// Estimated milliseconds left in the current stage; `0` when unknown.
     eta_ms: u64,
+    stage_rate: Option<f64>,
+    show_log: bool,
     warnings: Vec<WarningRow>,
     unmapped_total: u64,
     report: Option<ReportSummary>,
@@ -116,6 +120,8 @@ impl Default for State {
             target: String::new(),
             info: None,
             detecting: false,
+            last_probe: None,
+            detect_error: None,
             browse: None,
             direction: String::new(),
             version: String::new(),
@@ -130,6 +136,8 @@ impl Default for State {
             finished_stages: Vec::new(),
             elapsed_ms: 0,
             eta_ms: 0,
+            stage_rate: None,
+            show_log: false,
             warnings: Vec::new(),
             unmapped_total: 0,
             report: None,
@@ -292,19 +300,58 @@ impl State {
         Ok(())
     }
 
+    fn set_source(&mut self, value: String) {
+        if self.source == value {
+            return;
+        }
+        if let Some(info) = &self.info
+            && self.target == suggest_target(&source_directory(&self.source), info)
+        {
+            self.target.clear();
+        }
+        self.source = value;
+        self.info = None;
+        self.detect_error = None;
+        self.version.clear();
+        if !self.detecting {
+            self.last_probe = None;
+        }
+    }
+
+    // One detection in flight. Rapid edits collapse into the latest path;
+    // detection itself reads only metadata, never scans the world database.
+    fn try_detect(&mut self) -> PluginResult<bool> {
+        if !self.native_ready() || self.running || self.detecting
+            || self.browse.is_some() || self.submit.is_some() || self.pending.is_some()
+        {
+            return Ok(false);
+        }
+        let path = source_directory(&self.source);
+        if path.is_empty() || self.last_probe.as_deref() == Some(path.as_str()) {
+            return Ok(false);
+        }
+        self.last_probe = Some(path.clone());
+        self.detect_error = None;
+        self.dispatch(Command::Detect { path })?;
+        self.detecting = true;
+        Ok(true)
+    }
+
     fn start(&mut self) -> PluginResult<()> {
         if self.running {
             return Ok(());
         }
-        if self.source.trim().is_empty() || self.target.trim().is_empty() {
-            return Err(plugin_error("missing-path", "请先选择源世界和输出目录。"));
+        let source = source_directory(&self.source);
+        let target = unquote_path(&self.target);
+        if self.info.is_none() || self.detecting || source.is_empty() || target.is_empty() {
+            return Err(plugin_error("missing-path", "请先选择有效的源世界和输出目录。"));
         }
-        if self.source.trim() == self.target.trim() {
+        if source == target {
             return Err(plugin_error("same-path", "源存档与输出目录不能相同。"));
         }
         let request = ConversionRequest {
-            source: self.source.trim().to_string(),
-            target: self.target.trim().to_string(),
+            source,
+            target: target.to_string(),
             target_edition: match self.direction.as_str() {
                 "bedrock" => Some(Edition::Bedrock),
                 "java" => Some(Edition::Java),
@@ -323,6 +370,8 @@ impl State {
         self.finished_stages.clear();
         self.elapsed_ms = 0;
         self.eta_ms = 0;
+        self.stage_rate = None;
+        self.show_log = false;
         self.unmapped_total = 0;
         self.report = None;
         self.persist_paths();
@@ -368,12 +417,10 @@ impl State {
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Picked { path } => {
+                let browse = self.browse.take();
                 if !path.is_empty() {
-                    match self.browse.take() {
-                        Some(Browse::Source) => {
-                            self.source = path;
-                            self.info = None;
-                        }
+                    match browse {
+                        Some(Browse::Source) => self.set_source(path),
                         Some(Browse::Target) => self.target = path,
                         None => {}
                     }
@@ -381,21 +428,27 @@ impl State {
             }
             Event::Detected { info, path } => {
                 self.detecting = false;
+                if path != source_directory(&self.source) {
+                    return;
+                }
+                self.detect_error = None;
                 if self.target.trim().is_empty() {
                     self.target = suggest_target(&path, &info);
                 }
                 self.note(format!(
-                    "检测到 {} 世界「{}」（{}），共 {} 个区块",
+                    "已识别 {} 世界「{}」（{}）",
                     if info.edition == "java" { "Java" } else { "基岩" },
                     info.level_name,
-                    info.version,
-                    info.total_chunks()
+                    info.version
                 ));
                 self.info = Some(info);
             }
-            Event::DetectFailed { message, .. } => {
+            Event::DetectFailed { path, message } => {
                 self.detecting = false;
-                self.problem = Some(message);
+                if path == source_directory(&self.source) {
+                    self.info = None;
+                    self.detect_error = Some(message);
+                }
             }
             Event::Stage {
                 stage,
@@ -406,11 +459,24 @@ impl State {
                 eta_ms,
             } => {
                 self.running = true;
+                if self.message.as_deref() == Some("正在启动转换…") {
+                    self.message = None;
+                }
+                if self.stage == stage {
+                    let dt = elapsed_ms.saturating_sub(self.elapsed_ms);
+                    let count = done.saturating_sub(self.done);
+                    if dt >= 100 && count > 0 {
+                        let sample = count as f64 * 1000.0 / dt as f64;
+                        self.stage_rate = Some(self.stage_rate.map_or(sample, |old| old * 0.7 + sample * 0.3));
+                    }
+                } else {
+                    self.stage_rate = None;
+                }
                 if self.stage != stage {
                     // Keep the finished stages so the panel can show what has
                     // already been done instead of only the current step.
-                    if !self.stage.is_empty() {
-                        self.finished_stages.push(std::mem::take(&mut self.stage));
+                    if !self.stage.is_empty() && !self.finished_stages.contains(&self.stage) {
+                        self.finished_stages.push(self.stage.clone());
                     }
                     self.stage = stage;
                 }
@@ -444,6 +510,7 @@ impl State {
             Event::Failed { message } => {
                 self.running = false;
                 self.stage.clear();
+                self.message = None;
                 self.problem = Some(message);
             }
             Event::Cancelled => {
@@ -506,6 +573,7 @@ impl Plugin for WorldPort {
                 }
             }
             changed |= advance_jobs(state, &event)?;
+            changed |= state.try_detect()?;
             if state.native_ready() && state.read.is_none() {
                 if let Native::Ready(instance) = state.native {
                     state.read = Some(native::read_events(instance, EVENT_WAIT_MS)?);
@@ -529,18 +597,19 @@ fn handle_action(
     action: &bmcbl_plugin_api::ActionEvent,
 ) -> PluginResult<bool> {
     let value = action.value.clone().unwrap_or_default();
-    if state.running && action.action_id != "cancel" {
+    if state.running && !matches!(action.action_id.as_str(), "cancel" | "show-log") {
         return Ok(false);
     }
     match action.action_id.as_str() {
-        "source-input" => {
-            if state.source != value {
-                state.source = value;
-                state.info = None;
-                state.version.clear();
+        "source-input" => state.set_source(value),
+        "source-input-submit" => {
+            state.set_source(value);
+            if !state.detecting {
+                state.last_probe = None;
             }
         }
-        "target-input" => state.target = value,
+        "target-input" | "target-input-submit" => state.target = value,
+        "show-log" => state.show_log = !state.show_log,
         "browse-source" => {
             state.browse = Some(Browse::Source);
             state.dispatch(Command::BrowseSource)?;
@@ -553,11 +622,9 @@ fn handle_action(
             if state.source.trim().is_empty() {
                 return Err(plugin_error("missing-path", "请先填写源世界目录。"));
             }
-            state.problem = None;
-            state.dispatch(Command::Detect {
-                path: state.source.trim().to_string(),
-            })?;
-            state.detecting = true;
+            if !state.detecting {
+                state.last_probe = None;
+            }
         }
         "direction" => {
             state.direction = value;
@@ -659,6 +726,31 @@ mod tests {
     use super::{Event, PAGE_ID, ReportSummary, State, ViewNode, digest_for_platform, page};
 
     #[test]
+    fn source_paths_accept_quotes_and_level_dat() {
+        assert_eq!(source_directory(r#""C:\Saves\World\level.dat""#), r"C:\Saves\World\");
+        assert_eq!(source_directory("/home/test/world/level.dat"), "/home/test/world/");
+        assert_eq!(source_directory(r"C:\Saves\World"), r"C:\Saves\World");
+        assert_eq!(source_directory("/home/test/world"), "/home/test/world");
+    }
+
+    #[test]
+    fn outdated_detection_result_cannot_replace_new_source() {
+        let mut state = State::default();
+        state.source = "/world/old".into();
+        state.detecting = true;
+        state.set_source("/world/new".into());
+        state.apply_event(Event::Detected {
+            info: WorldInfo { level_name: "old".into(), ..WorldInfo::default() },
+            path: "/world/old".into(),
+        });
+        assert!(state.info.is_none());
+        assert!(!state.detecting);
+        assert!(state.target.is_empty());
+        state.apply_event(Event::DetectFailed { path: "/world/old".into(), message: "old error".into() });
+        assert!(state.detect_error.is_none());
+    }
+
+    #[test]
     fn selects_by_os_architecture_and_abi() {
         let components = "linux-x86_64-gnu=linux\nwindows-x86_64-msvc=windows\nwindows-aarch64-msvc=arm";
         assert_eq!(digest_for_platform(components, "windows-x86_64-msvc"), Some("windows"));
@@ -732,6 +824,7 @@ fn advance_jobs(state: &mut State, event: &PluginEvent) -> PluginResult<bool> {
                     state.stage.clear();
                 }
                 state.detecting = false;
+                state.browse = None;
                 state.problem = Some(format!("提交原生命令失败：{}", error.message));
             }
         }
@@ -934,6 +1027,22 @@ fn advance_lifecycle(state: &mut State, event: &PluginEvent) -> PluginResult<boo
             state.native = other;
             Ok(false)
         }
+    }
+}
+
+/// Accept paths copied from Explorer, including quoted paths and level.dat.
+fn unquote_path(value: &str) -> &str {
+    let value = value.trim();
+    value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).unwrap_or(value)
+}
+
+fn source_directory(value: &str) -> String {
+    let path = unquote_path(value);
+    let file = path.rsplit(['\\', '/']).next().unwrap_or_default();
+    if file.eq_ignore_ascii_case("level.dat") && path.len() > file.len() {
+        path[..path.len() - file.len()].to_owned()
+    } else {
+        path.to_owned()
     }
 }
 

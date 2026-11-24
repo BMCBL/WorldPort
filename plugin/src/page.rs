@@ -3,11 +3,6 @@
 use bmcbl_plugin_api::prelude::*;
 use bmcbl_plugin_api::{ButtonNode, Container, InputNode, TextNode, TextSizeToken};
 
-/// Drawn placeholder for a world with no map.
-///
-/// Inline SVG rather than a packaged PNG: the page must look deliberate whether
-/// or not the world has a map, and a missing image would read as a bug.
-const PLACEHOLDER_MAP: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjgiIGhlaWdodD0iMTI4IiB2aWV3Qm94PSIwIDAgMTI4IDEyOCI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIGZpbGw9IiMyYjJmMzMiLz48cGF0aCBkPSJNMzIgOTZsMjQtMzIgMjQgMjR6IiBmaWxsPSIjNDU0YjUxIi8+PGNpcmNsZSBjeD0iODYiIGN5PSI0MiIgcj0iOCIgZmlsbD0iIzQ1NGI1MSIvPjwvc3ZnPg==";
 use worldport_protocol::{ReportSummary, WorldInfo};
 
 use super::{Native, State, PAGE_ID};
@@ -34,11 +29,11 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
     // Conversion settings cannot change while a native job is active.
     // Keep the active task and cancellation visible instead of dead controls.
     if state.running {
-        page = page.child(progress_panel(state)).child(actions(state));
-        if let Some(feedback) = feedback(state) {
+        page = page.child(progress_panel(state));
+        if state.problem.is_some() && let Some(feedback) = feedback(state) {
             page = page.child(feedback);
         }
-        if !state.log.is_empty() {
+        if state.show_log && !state.log.is_empty() {
             page = page.child(log_panel(state));
         }
         return page.finish();
@@ -61,7 +56,13 @@ pub(super) fn render(state: &State, page_id: &str) -> ViewTree {
         page = page.child(feedback);
     }
     if !state.log.is_empty() {
-        page = page.child(log_panel(state));
+        page = page.child(compact_action(
+            if state.show_log { "收起日志" } else { "查看日志" },
+            "show-log", ThemeToken::SecondaryText,
+        ));
+        if state.show_log {
+            page = page.child(log_panel(state));
+        }
     }
     page.finish()
 }
@@ -107,13 +108,18 @@ fn source_panel(state: &State) -> View {
                     ..default_style()
                 },
             })))
-            .child(compact_action("浏览…", "browse-source", ThemeToken::Accent))
-            .child(compact_action("检测", "detect", ThemeToken::SecondaryText)),
+            .child(compact_action("浏览…", "browse-source", ThemeToken::Accent)),
     );
     if state.detecting {
         body = body.child(detail("正在读取世界信息…"));
     } else if let Some(info) = &state.info {
         body = body.child(info_card(info));
+    } else if state.detect_error.is_some() {
+        body = body.child(row().full_width()
+            .child(detail("未识别到有效存档"))
+            .child(compact_action("重试", "detect", ThemeToken::SecondaryText)));
+    } else {
+        body = body.child(detail("支持存档目录或 level.dat 文件路径，自动识别版本。"));
     }
     body.finish_view()
 }
@@ -183,64 +189,27 @@ fn version_options(java_target: bool) -> Vec<SelectOption> {
     }
 }
 
-/// The world's map, or a drawn placeholder when it has none.
-fn map_preview(info: &WorldInfo) -> View {
-    let (src, caption) = if info.map_preview.is_empty() {
-        (PLACEHOLDER_MAP.to_string(), "该世界没有地图".to_string())
-    } else {
-        (info.map_preview.clone(), "世界地图".to_string())
-    };
-    View::node(image_options(
-        src,
-        caption.clone(),
-        ImageOptions::new()
-            .caption(caption)
-            .fit(ImageFit::Cover)
-            // A square keeps a 128x128 map from stretching the card.
-            .aspect_ratio(1, 1)
-            .corner_radius(6),
-    ))
-}
-
+/// Compact list item: original world icon, display name and actual edition/version.
 fn info_card(info: &WorldInfo) -> View {
-    let edition = if info.edition == "java" {
-        "Java"
+    let edition = if info.edition == "java" { "Java 版" } else { "基岩版" };
+    let icon = if info.map_preview.is_empty() {
+        View::node(bmcbl_plugin_api::icon("folder"))
     } else {
-        "基岩版"
+        View::node(image_options(
+            info.map_preview.clone(),
+            "世界图标",
+            ImageOptions::new()
+                .height(56).min_height(56).max_height(56)
+                .aspect_ratio(1, 1).corner_radius(8)
+                .fallback("世界").fit(ImageFit::Cover),
+        ))
     };
-    let dimensions = info
-        .dimensions
-        .iter()
-        .filter(|(_, chunks)| *chunks > 0)
-        .map(|(dimension, chunks)| format!("{dimension} {chunks}"))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    panel()
+    row().full_width().gap(12).padding(8).corner_radius(8)
         .background(ThemeToken::Surface)
-        .child(
-            row()
-                .full_width()
-                .child(badge_styled(
-                    format!("{edition} · {}", info.version),
-                    default_style(),
-                ))
-                .child(title(info.level_name.clone())),
-        )
-        // The map preview is the one part of a world a person recognises at a
-        // glance, so it leads the card. A world without a map shows the
-        // placeholder instead of an empty frame.
-        .child(map_preview(info))
-        .child(detail(format!(
-            "区块 {}{} · 玩家 {} · 地图 {}",
-            info.total_chunks(),
-            if dimensions.is_empty() {
-                String::new()
-            } else {
-                format!("（{dimensions}）")
-            },
-            info.players,
-            info.maps
-        )))
+        .child(icon)
+        .child(View::column().full_width().gap(4)
+            .child(text(info.level_name.clone(), ThemeToken::PrimaryText, true, true))
+            .child(detail(format!("{edition} · {}", info.version))))
         .finish_view()
 }
 
@@ -335,7 +304,7 @@ fn actions(state: &State) -> View {
     if state.running {
         body = body.child(compact_action("取消转换", "cancel", ThemeToken::Danger));
     } else {
-        if state.source.trim().is_empty() || state.target.trim().is_empty() {
+        if state.info.is_none() || state.detecting || state.target.trim().is_empty() {
             body = body.child(detail("选择源存档和输出目录后即可开始转换。"));
         } else {
             body = body.child(View::node(button("开始转换", "start")));
@@ -361,45 +330,44 @@ fn progress_panel(state: &State) -> View {
     } else {
         None
     };
-    let mut body = panel().child(heading("activity", "转换进度"));
-    body = body.child(View::node(progress(
+    let mut body = panel().child(
+        row().full_width()
+            .child(text("转换进度", ThemeToken::PrimaryText, true, true))
+            .child(compact_action(
+                if state.message.as_deref() == Some("正在取消…") { "正在取消…" } else { "取消转换" },
+                "cancel", ThemeToken::Danger,
+            )),
+    );
+    let mut bar = progress(
         if let Some(total) = total {
             format!("{stage} · {} / {total}", state.done)
         } else {
             stage.to_string()
         },
-        state.done,
-        total,
-    )));
-    // A second line with the numbers a user actually asks about: how far along,
-    // how long it has taken, and how much longer.
-    let mut facts: Vec<String> = Vec::new();
+        state.done, total,
+    );
+    if let ViewNode::Progress(node) = &mut bar {
+        node.style.full_width = true;
+    }
+    body = body.child(View::node(bar));
     if let Some(percent) = percent {
-        facts.push(format!("{percent}%"));
+        body = body.child(text(format!("{percent}%"), ThemeToken::Accent, true, false));
     }
-    if state.elapsed_ms > 0 {
-        facts.push(format!("已用 {}", duration_text(state.elapsed_ms)));
+    let mut facts = Vec::new();
+    if state.stage == "terrain" && let Some(rate) = state.stage_rate {
+        facts.push(format!("{rate:.0} 区块/秒"));
     }
+    facts.push(format!("已用 {}", duration_text(state.elapsed_ms)));
     if state.eta_ms > 0 {
-        facts.push(format!("预计剩余 {}", duration_text(state.eta_ms)));
+        facts.push(format!("本阶段预计剩余 {}", duration_text(state.eta_ms)));
     }
-    if !facts.is_empty() {
-        body = body.child(detail(facts.join(" · ")));
-    }
-    if !state.finished_stages.is_empty() {
-        let done: Vec<String> = state
-            .finished_stages
-            .iter()
-            .map(|stage| format!("✓ {}", stage_label(stage)))
-            .collect();
-        body = body.child(detail(format!("已完成：{}", done.join("、"))));
-    }
-    body.child(detail(if state.running {
-        "转换期间可以离开本页，任务会继续；回来时进度会自动恢复。"
-    } else {
-        "等待开始"
-    }))
-    .finish_view()
+    body.child(detail(facts.join(" · ")))
+        .child(detail("转换期间可以离开本页，任务会继续。"))
+        .child(compact_action(
+            if state.show_log { "收起日志" } else { "查看日志" },
+            "show-log", ThemeToken::SecondaryText,
+        ))
+        .finish_view()
 }
 
 /// Renders milliseconds the way a person reads them.
