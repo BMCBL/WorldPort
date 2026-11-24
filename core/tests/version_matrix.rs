@@ -284,3 +284,79 @@ fn every_version_converts_java_to_bedrock_and_back_without_palette_differences()
         );
     }
 }
+
+
+#[test]
+fn local_player_coordinates_and_storage_follow_target_edition() {
+    const UUID: [i32; 4] = [1, 2, 3, 4];
+    const FILE: &str = "00000001-0000-0002-0000-000300000004.dat";
+    for (version, data_version) in [("1.20.6", 3839), ("1.21.8", 4440), ("26.4", 5128)] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let bedrock = dir.path().join("bedrock");
+        let restored = dir.path().join("restored");
+        make_world(&source, data_version);
+        let player = compound([
+            ("DataVersion", NbtTag::Int(data_version)),
+            ("UUID", NbtTag::IntArray(UUID.to_vec())),
+            ("Pos", tag_list(vec![NbtTag::Double(-524.5), NbtTag::Double(-61.0), NbtTag::Double(548.5)])),
+            ("Dimension", tag_string("minecraft:overworld")),
+            ("Rotation", tag_list(vec![NbtTag::Float(90.0), NbtTag::Float(0.0)])),
+            ("Health", NbtTag::Float(20.0)),
+        ]);
+        let mut level = nbt::read_gzip(&source.join("level.dat")).unwrap().tag;
+        let data = level.get_mut("Data").unwrap();
+        if data_version >= MODERN_LAYOUT {
+            data.set("singleplayer_uuid", NbtTag::IntArray(UUID.to_vec()));
+            nbt::write_gzip(&source.join("players/data").join(FILE), "", &player).unwrap();
+        } else {
+            data.set("Player", player);
+        }
+        nbt::write_gzip(&source.join("level.dat"), "", &level).unwrap();
+
+        let mut features = Features::none();
+        features.blocks = true;
+        features.biomes = true;
+        features.players = true;
+        features.level_dat = true;
+        let mut forward = ConversionPlan::new(&source, &bedrock);
+        forward.jobs = 1;
+        forward.compression_level = 1;
+        forward.features = features;
+        convert::run(&forward, &ConversionOptions::default()).unwrap();
+
+        {
+            let mut options = bedrock_world::world::OpenOptions::default();
+            options.read_only = true;
+            let world = bedrock_world::world::World::open(&bedrock, options).unwrap();
+            let local = world.player(&bedrock_world::PlayerId::Local).unwrap().expect("Bedrock local player");
+            let pos = local.nbt.get_list("Pos").expect("Bedrock position");
+            assert_eq!(pos[0], NbtTag::Float(-524.5));
+            assert_eq!(pos[2], NbtTag::Float(548.5));
+            let NbtTag::Float(y) = pos[1] else { panic!("Bedrock Pos Y must be float") };
+            assert!((y - (-59.37999)).abs() < 0.00002, "{version}: Bedrock eye Y");
+        }
+
+        let mut reverse = ConversionPlan::new(&bedrock, &restored);
+        reverse.jobs = 1;
+        reverse.compression_level = 1;
+        reverse.features = features;
+        reverse.target_version = Some(version.to_owned());
+        convert::run(&reverse, &ConversionOptions::default()).unwrap();
+        let world = JavaWorld::open(&restored).unwrap();
+        let java = if data_version >= MODERN_LAYOUT {
+            assert_eq!(world.data().get_i32_array("singleplayer_uuid"), Some(&UUID[..]));
+            assert!(world.data().get("Player").is_none());
+            nbt::read_gzip(&restored.join("players/data").join(FILE)).unwrap().tag
+        } else {
+            world.data().get("Player").expect("legacy embedded local player").clone()
+        };
+        let pos = java.get_list("Pos").unwrap();
+        assert_eq!(pos[0], NbtTag::Double(-524.5));
+        assert_eq!(pos[2], NbtTag::Double(548.5));
+        let NbtTag::Double(y) = pos[1] else { panic!("Java Pos Y must be double") };
+        assert!((y - (-61.0)).abs() < 0.00002, "{version}: Java feet Y");
+        assert_eq!(java.get_str("Dimension"), Some("minecraft:overworld"));
+        assert_eq!(java.get_i32_array("UUID"), Some(&UUID[..]));
+    }
+}
